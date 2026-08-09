@@ -246,9 +246,12 @@ class ExecutionEngine:
             logger.warning("ExecutionEngine: sin libro de órdenes para maker check. "
                            "Orden %s @ %.8g rechazada por seguridad.", side, price)
             return False
+        # §10: una orden maker NO cruza el spread. Un BUY es maker si queda
+        # estrictamente bajo el mejor ask (si price >= best_ask sería taker);
+        # un SELL es maker si queda estrictamente sobre el mejor bid.
         if side == "BUY":
-            return price <= best_bid + 1e-12
-        return price >= best_ask - 1e-12
+            return price < best_ask - 1e-12
+        return price > best_bid + 1e-12
 
     # ── Envío de órdenes ─────────────────────────────────────────────────
     def place_maker_order(self, side: str, qty: float, price: float,
@@ -464,9 +467,12 @@ class ExecutionEngine:
                     is_buyer_maker = bool(t.get("is_buyer_maker", False))
                     if abs(tprice - info["price"]) > tol:
                         continue
-                    if info["side"] == "BUY" and is_buyer_maker:
+                    # Semántica Binance de is_buyer_maker (ver market_state.update_trade):
+                    #   True  → el buyer era el maker, el SELLER agredió → llena nuestro BUY resting
+                    #   False → el BUYER agredió → llena nuestro SELL resting
+                    if info["side"] == "BUY" and not is_buyer_maker:
                         continue
-                    if info["side"] == "SELL" and not is_buyer_maker:
+                    if info["side"] == "SELL" and is_buyer_maker:
                         continue
                     self._register_fill_locked(oid, info, tprice, tqty)
                     filled.append(oid)

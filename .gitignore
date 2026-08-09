@@ -14,5 +14,7 @@ __pycache__/
 venv/
 
 # Herramientas / runtime (no son código del bot)
-.opencode/node_modules/
+.opencode/
+graphify-out/
+ruvector.db
 memory/
