@@ -3,15 +3,23 @@
 ## Contexto
 - Bot de **market making adaptativo** para **Binance Futures (USDS-M)** sobre **XRPUSDC**, en Python.
 - Especificación completa: `market_making_xrpusdc_futures.md` (§§0–24). La **Sección 0 son reglas no negociables** y tiene prioridad sobre el resto del documento.
-- Estado: infraestructura de API/WebSocket ya existe; aún NO existen `strategy/`, `logs/`, `reports/`, `STATUS.md`, `config.py`. Ese layout es el entregable objetivo (§23).
-- **Todavía no es un repo git** (el checklist §24 asume `git diff`/`git log`; inicializar git antes del primer commit).
+- Estado: infraestructura de API/WebSocket ya existe; `strategy/` implementado (módulos base + integrador), con `config.py`, `logs/`, `reports/` y `STATUS.md` en su lugar. Tests del Risk Engine y del execution engine: **27/27 OK**.
+- Repo git ya inicializado (el checklist §24 asume `git diff`/`git log`; ambos operativos). Mantener commits chicos y frecuentes (§0.3).
+- **GitHub**: repositorio remoto en `https://github.com/sebastiang2010/alpha-driven` (origin). NO hacer push a main sin autorización humana; los commits se hacen localmente salvo indicación contraria. Nunca pushear credenciales ni `.env` (§0.5).
 
 ## Reglas no negociables (§0)
 - **Testnet primero. Mainnet SOLO con autorización humana explícita** (§0.1). No llamar `init_client(real=True)` ni `set_testnet(False)` sin esa autorización; si el sistema queda listo para mainnet, detenerse y reportarlo.
 - **Credenciales** (§0.5): `API_binance_futuros.py` tiene claves hardcodeadas (testnet **y mainnet reales**). Nunca loguearlas, imprimirlas, commitearlas ni rotarlas sin preguntar (§0.2). Mantener `.env` en `.gitignore`.
 - **Detenerse y preguntar** (§0.2) ante: primera orden mainnet, subir de Nivel de exposición, kill switch activado, falta una función de API (no escribir implementación paralela), posición no reconciliable, credenciales nuevas.
 - **Presupuesto de riesgo** como constantes en `config.py`, no números improvisados (§0.4): `MAX_DAILY_LOSS_USDC`, `MAX_POSITION_NOTIONAL_USDC`, `MAX_DRAWDOWN_PCT`, `MAX_LEVERAGE_USED`. Si no están definidos: proponer valores conservadores, marcarlos "pendiente de confirmación" en `STATUS.md`, y no operar con fondos reales.
+- **Decisión de diseño aprobada — Nivel 0 / dry-run con simulación**: cuando `EXPOSURE_LEVEL=0`, el bot NO queda bloqueado en tamaño 0: puede simular órdenes usando una constante de simulación (`SIMULATION_QUOTE_MULTIPLIER` en `config.py`) en lugar del multiplicador `0.0` del nivel 0. Esto habilita la corrida integrada dry-run. Los niveles reales (>=1) NO se modifican y subirlos sigue requiriendo autorización humana (§0.2). En Nivel 0 jamás se envían órdenes reales (§0.1/§21).
 - Mantener **`STATUS.md`** actualizado cada 15–20 min y commits chicos y frecuentes (§0.3).
+
+## Autonomía del desarrollo
+Directiva aprobada por el usuario: dentro de **testnet/dry-run**, el orquestador TOMA decisiones operativas y de diseño sin preguntar:
+- Corregir bugs, agregar tests, refactorizar, elegir convenciones, commitear chico y frecuente (§0.3).
+- **SOLO se pide autorización humana para**: primera orden mainnet, `real=True` / salir de testnet, subir nivel de exposición real, rotar/agregar credenciales, operar con fondos reales, o cualquier acción irreversible sobre la cuenta.
+- Los presupuestos de riesgo propuestos siguen "pendiente de confirmación" hasta que el humano los confirme (§0.4), pero eso NO bloquea el desarrollo en testnet/dry-run.
 
 ## Arquitectura
 - `API_binance_futuros.py` es **la única interfaz** con Binance Futures (§1). Analizarlo completo antes de escribir código; no duplicar funciones que ya existan.
