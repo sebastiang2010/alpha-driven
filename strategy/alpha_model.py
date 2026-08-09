@@ -36,21 +36,41 @@ from . import config
 
 # ---------------------------------------------------------------------------
 # Pesos del alpha de corto plazo (§6) — PROPUESTA pendiente de confirmacion
+#
+# HALLazgo gate 2026-08-09: los pesos originales (0.30/0.20/0.30/0.20) con
+# ALPHA_MAX=0.01 producian saturación permanente: con imbalance tipico ~0.077,
+# IMBALANCE_WEIGHT*imbalance = 0.0154 ya superaba ALPHA_MAX=0.01 -> alpha
+# pinneado en ±1% SIEMPRE (señal degenerada). Se re-escala la señal a un
+# rango de ~2x el spread tipico de XRPUSDC (~0.0003) para que sea accionable:
+#   momentum (escala ~1e-3)  -> peso 0.30 da ~0.0002
+#   imbalance (escala 0..1)  -> peso 0.003 da ~0.0002 con imbalance 0.077
+#   microprice_term (~1e-4)  -> peso 0.30 da ~0.00003
+#   flow (escala 0..1)       -> peso 0.003 da ~0.0002 con flow 0.07
+# Combinados tipicos ~0.0004-0.0008 (4-8 ticks) sobre ALPHA_MAX=0.0005 (5
+# ticks en XRPUSDC). VALORES CONSERVADORES: recalibrar con mas datos (§0.4).
 # ---------------------------------------------------------------------------
 MOMENTUM_WEIGHT: float = 0.30      # momentum normalizado del snapshot
-IMBALANCE_WEIGHT: float = 0.20     # imbalance de volumen del depth
+IMBALANCE_WEIGHT: float = 0.003    # imbalance de volumen del depth (0..1)
 MICROPRICE_WEIGHT: float = 0.30    # (microprice - mid) / mid
-TRADE_FLOW_WEIGHT: float = 0.20    # (buy - sell) / (buy + sell)
+TRADE_FLOW_WEIGHT: float = 0.003   # (buy - sell) / (buy + sell) (0..1)
 
-# Limite de la señal: ±1% del mid como maximo.
-ALPHA_MAX: float = 0.01
+# Limite de la señal: ±0.0005 (~5 ticks / ~2x spread tipico de XRPUSDC).
+# Antes ±0.01 (±1%) = ~100x el spread -> saturación permanente (hallazgo
+# gate 2026-08-09). PENDIENTE DE CONFIRMACION (§0.4).
+ALPHA_MAX: float = 0.0005
 
 # ---------------------------------------------------------------------------
 # Parámetros de re-cotizacion (§8, §11) — PROPUESTA pendiente de confirmacion
 # ---------------------------------------------------------------------------
 GAMMA_INVENTORY_RISK: float = 0.5   # aversion al riesgo de inventario (f)
 K_QUOTE: float = 1.0                # multiplicador de sigma_efectiva en quotes
-ALPHA_QUOTE_FACTOR: float = 1.0     # cuanto ensancha |alpha| ambas puntas
+# ALPHA_QUOTE_FACTOR: §8 define r = S + alpha; el alpha ya desplaza la
+# reserva (reservation_price). Sumar |alpha| a la distancia (como hacia el
+# valor 1.0 anterior) aplicaba el alpha DOS veces: con alpha=±1% el lado
+# alejado quedaba a ±2% del mid y el cercano sin borde (gate 2026-08-09,
+# run 22:26 UTC: ask=1.0622 con mid=1.04215). Se fija en 0.0 para respetar
+# §8. PENDIENTE DE CONFIRMACION (§0.4).
+ALPHA_QUOTE_FACTOR: float = 0.0     # cuanto ensancha |alpha| ambas puntas
 INVENTORY_SKEW_MULTIPLIER: float = 0.5  # skew de precio por inventario normalizado
 MIN_QUOTE_DISTANCE: float = 1e-8    # piso para que (bid_dist, ask_dist) > 0
 

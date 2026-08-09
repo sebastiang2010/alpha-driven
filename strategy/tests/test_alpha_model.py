@@ -131,5 +131,47 @@ class TestComputeAlpha(unittest.TestCase):
         self.assertLessEqual(abs(alpha), alpha_model.ALPHA_MAX)
 
 
+class TestAlphaSinDobleConteoEnQuotes(unittest.TestCase):
+    """Regresión del hallazgo gate 2026-08-09 (bug §8).
+
+    §8 define r = S + alpha: el alpha ya desplaza el precio de reserva
+    (reservation_price). Con ALPHA_QUOTE_FACTOR=1.0 (bug corregido a 0.0) el
+    |alpha| se SUMABA ademas a la distancia de quotes -> con alpha=±0.01 el
+    lado alejado quedaba a ±2% del mid y el cercano sin borde (NetPnL≤0,
+    gate falló en vivo: run 22:26 UTC, ask=1.0622 con mid=1.04215).
+
+    Estos tests fallan si alguien vuelve a ensanchar las distancias con alpha.
+    """
+
+    def setUp(self):
+        self.am = alpha_model.AlphaModel()
+        self.snap = _snapshot(mid=2.5, spread=0.002, volatility=0.001,
+                              imbalance=0.0, momentum=0.0, microprice=0.0)
+
+    def test_alpha_no_ensancha_las_distancias(self):
+        """Las distancias de quote deben ser independientes de alpha (§8)."""
+        d0_bid, d0_ask = self.am.quote_distances(self.snap, 0.0, 0.0, 0.001)
+        dmax_bid, dmax_ask = self.am.quote_distances(
+            self.snap, alpha_model.ALPHA_MAX, 0.0, 0.001
+        )
+        self.assertAlmostEqual(d0_bid, dmax_bid, places=12)
+        self.assertAlmostEqual(d0_ask, dmax_ask, places=12)
+
+    def test_ask_se_desplaza_solo_por_reservacion(self):
+        """La única influencia de alpha en el ask es via reservation_price (§8).
+
+        ask(alpha) - ask(0) debe ser exactamente 'alpha' (desplazamiento de la
+        reserva). Con el bug viejo (ALPHA_QUOTE_FACTOR=1.0) el |alpha| ademas
+        ensanchaba la distancia -> el delta era 2*alpha.
+        """
+        alpha = alpha_model.ALPHA_MAX
+        r_alpha = self.am.reservation_price(self.snap, alpha, 0.0, 0.001)
+        _, ask_dist_alpha = self.am.quote_distances(self.snap, alpha, 0.0, 0.001)
+        r_cero = self.am.reservation_price(self.snap, 0.0, 0.0, 0.001)
+        _, ask_dist_cero = self.am.quote_distances(self.snap, 0.0, 0.0, 0.001)
+        delta = (r_alpha + ask_dist_alpha) - (r_cero + ask_dist_cero)
+        self.assertAlmostEqual(delta, alpha, places=9)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,7 @@
 | `strategy/market_maker.py` | ✅ Creado | Orquestador que integra todos los módulos. |
 | Tests Risk Engine (§12) | ✅ **13/13 OK** | `python -m unittest strategy.tests.test_risk_engine -v`. Incluye kill switch (§13). |
 | Tests Execution Engine (§9-§10) | ✅ **14/14 OK** | `python -m unittest strategy.tests.test_execution_engine -v`. Maker check §10 + fills is_buyer_maker. |
-| Tests AlphaModel (§6/§9) | ✅ **10/10 OK** | `python -m unittest strategy.tests.test_alpha_model -v`. Convención de side + NetPnL + alpha acotada. |
+| Tests AlphaModel (§6/§9) | ✅ **14/14 OK** | `python -m unittest strategy.tests.test_alpha_model -v`. Convención de side + NetPnL + alpha acotada + regresión §8 (sin doble conteo). |
 | Kill switch (§13) | ✅ Cubierto | 4 tests: daily loss, price anomaly, ws disconnect, no disparo normal. |
 | `logs/` | ✅ Creado | `decisions/`, `fills/`, `market_data/`, `orders/`, `pnl/`. |
 | `reports/` | ⚠️ Vacío | Sin reportes generados todavía. |
@@ -69,6 +69,12 @@ Estos valores en `config.py` son **propuestas conservadoras**; **NO operar con f
   - Corrección del resumen: `_summary` ahora filtra orders/fills/kill_switch por `ts`
     epoch float (no ISO) y acepta `canceled` como evento esperado (el `GATE FAIL: canceled`
     previo era falso positivo del propio resumen).
+- **CORRIDA POST-FIX `python run_dry_run.py --cycles 5` (2026-08-09 19:41 local, ~31 s)**:
+  tras corregir el doble conteo de alpha (§8) y recalibrar la escala de la señal,
+  **GATE OK en vivo**: 4/4 decisiones `reason=ok` (antes 0/4), `bid_size`/`ask_size`=20.0,
+  0 fills, 0 kill switch, exit code 0. Quotes sanos: con alpha=−0.0005, bid≈mid−0.0063 y
+  ask≈mid+0.0052 (spread 0.0005 + sigma efectiva) — ya NO hay ask a mid+2%.
+- `python -m unittest discover -s strategy/tests -v` → **50/50 OK** (2026-08-09, post-fix).
 
 ## Hallazgos de auditoría (2026-08-09)
 
@@ -77,6 +83,8 @@ Corregidos en esta sesión:
 - **Fills** (`execution_engine.process_fills_from_trades`): condiciones de `is_buyer_maker` invertidas; un BUY resting nunca se marcaba filled. Ahora usa la semántica de Binance (documentada en `market_state.update_trade`).
 - **Decisión Nivel 0 con simulación IMPLEMENTADA** (§0.2): `SIMULATION_QUOTE_MULTIPLIER` en `config.py` (antes solo documentada en AGENTS.md, nunca existió en el código). Nuevo helper `config.effective_exposure_multiplier()` usado por `risk_engine` y `market_maker._compute_quotes` (fuente única, §0.4). Con esto el Nivel 0 ya no queda bloqueado en tamaño 0.
 - **Bug de convención de side (§0.6)**: `expected_net_pnl_estimate` solo reconocía `"bid"/"ask"` pero `_compute_quotes` le pasaba `"BUY"/"SELL"` → devolvía 0.0 siempre → `quote_*_ok=False` → el bot NUNCA cotizaba (ni en dry-run simulado). Ahora acepta ambas convenciones. Cubierto con `test_alpha_model.py` (10 tests).
+- **Doble conteo de alpha (bug §8, encontrado por el gate en vivo 2026-08-09)**: `reservation_price` pone `r = mid + alpha` (§8) PERO `quote_distances` SUMABA además `ALPHA_QUOTE_FACTOR × |alpha|` (=1.0) a la distancia base → con alpha=±0.01 el lado alejado quedaba a ±2% del mid y el cercano sin borde (NetPnL≤0). En la corrida 22:26 UTC: mid=1.04215, ask=1.0622, reason=`expected_net_pnl_non_positive:bid` → el gate rechazó todo (0/4 ok) y solo se colocó una SELL que luego se canceló. Corregido: `ALPHA_QUOTE_FACTOR = 0.0` (§8: el alpha ya desplaza la reserva). Regresión cubierta con 2 tests nuevos (§0.6).
+- **Saturación de alpha (hallazgo 2026-08-09)**: `ALPHA_MAX=0.01` (±1%) es ~100× el spread real de XRPUSDC (p50≈0.0003); con `IMBALANCE_WEIGHT=0.20`, un imbalance típico (0.077) ya da 0.0154 > 0.01 → alpha pinneado en ±1% SIEMPRE (señal degenerada). Recalibrado conservador (§0.4, "pendiente de confirmación"): `IMBALANCE_WEIGHT=0.003`, `TRADE_FLOW_WEIGHT=0.003`, `ALPHA_MAX=0.0005` (~5 ticks, ~2× spread p50). Mantener bajo monitoreo y recalibrar con más datos.
 - **Test de Risk Engine actualizado**: Nivel 0 con simulación ya NO tiene `max_order_size == 0.0`; ahora es `BASE_ORDER_SIZE_XRP * SIMULATION_QUOTE_MULTIPLIER` (= 20.0 XRP). Nuevo test verifica que una orden dentro del tamaño simulado es admitida.
 
 **Suite completa: 37/37 OK** (`python -m unittest discover -s strategy/tests`).
@@ -99,14 +107,16 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - [x] Commit de los fixes de esta sesión (§0.3, §24) — `1e5432f`.
 - [x] Wire `init_client(real=config.REAL)` en `run()` (testnet) — implementado en `db4a115`: `exec.init_client(real=False)` (testnet, seguro §0.1) + método `ExecutionEngine.init_client()` que degrada con gracia si la API no está (offline). Si `config.REAL=True` NUNCA inicializa mainnet sin autorización humana (§0.1). Filtros reales del símbolo ahora se cargan en testnet (§3).
 - [ ] Confirmación humana del presupuesto de riesgo (§0.4).
+- [ ] Confirmación humana de la recalibración de alpha (pesos + `ALPHA_MAX=0.0005`, §0.4).
+- [ ] Investigar el modelo de costos (§18): con `MAKER_FEE_RATE+FUNDING_RATE+SLIPPAGE_RATE = 0.0004` y spread p50≈0.0003, el edge mínimo exigido (≈0.00042) es MAYOR que el spread típico → ninguna quote maker puede ser NetPnL-positiva salvo `reduce_only`. Sospecha: `FUNDING_RATE` aplicado como costo por-trade plano, pero el funding real se cobra periódico (cada 8 h) sobre notional, no por fill. Revisar `expected_net_pnl_estimate` y cómo se aplica.
 - [ ] Autorización para subir de nivel de exposición (§0.2).
 - [ ] Endurecer `cancel_order_by_id` (no purgar local si la API falla) (§0.6).
 - [ ] Implementar reduce/close en kill switch (§13).
 - [ ] NetPnL con funding + slippage; unificar fee en config (§18).
 - [ ] Reescalar sigma a intervalo fijo (§0.6).
 - [ ] Generación de reportes en `reports/` (§22).
-- [ ] Investigar alpha pinned en −0.01 (clamp) en dry-run: trade flow vendedor vs bug de convención (§0.6).
-- [ ] Verificación final en vivo: re-ejecutar `run_dry_run.py` y ver `GATE OK` (opcional, ya validado offline).
+- [ ] Investigar alpha pinned en −0.01 (clamp) en dry-run: trade flow vendedor vs bug de convención (§0.6). — **Resuelto (2026-08-09)**: era saturación por `ALPHA_MAX=0.01` con `IMBALANCE_WEIGHT=0.20` (imbalance típico 0.077 → 0.0154 > cap). Recalibrado a `ALPHA_MAX=0.0005` y pesos 0.003.
+- [ ] Verificación final en vivo: re-ejecutar `run_dry_run.py` y ver `GATE OK` (opcional, ya validado offline). — **Hecho (2026-08-09 19:41)**: GATE OK 4/4 en vivo tras el fix §8.
 - [ ] Commit de los fixes de esta sesión (§0.3, §24).
 
 ## Log de actualizaciones
@@ -116,3 +126,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **2026-08-09**: implementada la decisión Nivel 0 con simulación (`SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()`), corregido bug de convención de side en NetPnL (bot nunca cotizaba), nuevo `test_alpha_model.py`. **Suite 37/37 OK.** Commit `1e5432f`.
 - **2026-08-09**: conectado `init_client(real=False)` en `run()` (testnet, §0.1) con método `ExecutionEngine.init_client()` que degrada offline. Filtros reales del símbolo cargados en testnet (§3). Commit `db4a115`.
 - **2026-08-09**: **corrida integrada dry-run exitosa** (`run_dry_run.py`, 20 ciclos, ~107 s). 3 WS testnet, 19 decisiones, 8 órdenes simuladas, sizes=20.0, 0 kill switch, gate OK. Creado `run_dry_run.py` (watchdog 125 s, resumen con quality gate, exit codes 0/1/2); corregido el resumen (filtro por `ts` float + eventos `canceled` aceptados). `STATUS.md` actualizado. Pendiente commit.
+- **2026-08-09**: **corregido doble conteo de alpha (§8)** — el gate en vivo lo detectó (ask a mid+2%, 0/4 decisiones `ok`). `ALPHA_QUOTE_FACTOR` 1.0 → 0.0; recalibrada la señal a escala de spread (`ALPHA_MAX` 0.01 → 0.0005, `IMBALANCE_WEIGHT`/`TRADE_FLOW_WEIGHT` → 0.003, conservador "pendiente de confirmación" §0.4). 2 tests de regresión nuevos. **GATE OK en vivo post-fix (4/4)**, suite 50/50 OK.
