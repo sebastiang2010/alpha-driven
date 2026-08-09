@@ -78,6 +78,11 @@ Estos valores en `config.py` son **propuestas conservadoras**; **NO operar con f
   **GATE OK en vivo**: 4/4 decisiones `reason=ok` (antes 0/4), `bid_size`/`ask_size`=20.0,
   0 fills, 0 kill switch, exit code 0. Quotes sanos: con alpha=−0.0005, bid≈mid−0.0063 y
   ask≈mid+0.0052 (spread 0.0005 + sigma efectiva) — ya NO hay ask a mid+2%.
+- **CORRIDA POST-FIX §18 `python run_dry_run.py --cycles 5` (2026-08-09 19:48 local, ~31 s)**:
+  **GATE OK en vivo**: 4/4 decisiones `reason=ok`, `bid_size`/`ask_size`=20.0, 0 fills,
+  0 kill switch, exit code 0. Confirma el efecto del modelo de costos §18: las quotes
+  con edge real dentro del spread ya NO son rechazadas por `expected_net_pnl_non_positive`
+  (antes 13/19 decisiones rechazadas con costos fijos 0.0004 > spread p50≈0.0003).
 - `python -m unittest discover -s strategy/tests -v` → **54/54 OK** (2026-08-09, post-fix modelo de costos §18).
 
 ## Hallazgos de auditoría (2026-08-09)
@@ -94,7 +99,7 @@ Corregidos en esta sesión:
   - `FUNDING_RATE` → `FUNDING_RATE_PER_8H` (0.0001) + `FUNDING_INTERVAL_SEC` (28,800 s) + `EXPECTED_HOLD_SEC` (300 s): funding por trade = `tasa * (hold / intervalo)` ≈ 0.00000104 (antes 0.0001 fijo — sobreestimaba ~1000×).
   - `SLIPPAGE_RATE` → `SLIPPAGE_MAKER_BPS = 0.0` (maker post-only no paga cruce).
   - Nuevos tests `TestModeloDeCostos` (4): hold=0 → funding 0; proporcionalidad al hold (verificada numéricamente); default slippage maker = 0; **quote con edge real dentro del spread (3 ticks, mid=1.0) ahora es operable** (NetPnL>0) donde el modelo viejo daba NetPnL<0.
-  - Efecto esperado en vivo: el gate `expected_net_pnl_non_positive` deja de rechazar sistemáticamente; **pendiente re-correr `run_dry_run.py` para confirmar**.
+  - Efecto esperado en vivo: el gate `expected_net_pnl_non_positive` deja de rechazar sistemáticamente; **CONFIRMADO (2026-08-09 19:48)**: corrida post-fix GATE OK 4/4 `reason=ok` (antes 13/19 rechazadas).
   - Parámetros marcados ⏳ "pendiente de confirmación" (§0.4).
 
 **Suite completa: 37/37 OK** (`python -m unittest discover -s strategy/tests`).
@@ -138,3 +143,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **2026-08-09**: **corrida integrada dry-run exitosa** (`run_dry_run.py`, 20 ciclos, ~107 s). 3 WS testnet, 19 decisiones, 8 órdenes simuladas, sizes=20.0, 0 kill switch, gate OK. Creado `run_dry_run.py` (watchdog 125 s, resumen con quality gate, exit codes 0/1/2); corregido el resumen (filtro por `ts` float + eventos `canceled` aceptados). `STATUS.md` actualizado. Pendiente commit.
 - **2026-08-09**: **corregido doble conteo de alpha (§8)** — el gate en vivo lo detectó (ask a mid+2%, 0/4 decisiones `ok`). `ALPHA_QUOTE_FACTOR` 1.0 → 0.0; recalibrada la señal a escala de spread (`ALPHA_MAX` 0.01 → 0.0005, `IMBALANCE_WEIGHT`/`TRADE_FLOW_WEIGHT` → 0.003, conservador "pendiente de confirmación" §0.4). 2 tests de regresión nuevos. **GATE OK en vivo post-fix (4/4)**, suite 50/50 OK.
 - **2026-08-09**: **corregido modelo de costos §18** — funding era costo fijo por fill (0.0001) pero Binance lo cobra cada 8 h sobre notional; slippage 0.0001 por fill sobrestimaba un maker GTX que nunca cruza. Ahora: `FUNDING_RATE_PER_8H` × `EXPECTED_HOLD_SEC`/`FUNDING_INTERVAL_SEC` (≈0.00000104/trade) + `SLIPPAGE_MAKER_BPS=0.0` + fee único de config. 4 tests nuevos (`TestModeloDeCostos`): quote con edge de 3 ticks dentro del spread ahora operable donde antes NetPnL<0. Suite **54/54 OK**.
+- **2026-08-09**: **verificación en vivo del fix §18** — `run_dry_run.py --cycles 5`: GATE OK 4/4 `reason=ok` (antes 13/19 rechazadas por `expected_net_pnl_non_positive`). Commit `f2e4081`.
