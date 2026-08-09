@@ -82,7 +82,7 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - [x] Corrida integrada dry-run — **desbloqueada**: multiplicador de simulación implementado (§0.2). Falta solo la corrida misma con WS.
 - [x] Decidir multiplicador de simulación para dry-run — **resuelto**: `SIMULATION_QUOTE_MULTIPLIER = 1.0` en `config.py` (propuesta §0.4, confirmar con humano antes de fondos reales).
 - [x] Commit de los fixes de esta sesión (§0.3, §24) — `1e5432f`.
-- [ ] Wire `init_client(real=config.REAL)` en `run()` (testnet) — hoy `run()` arranca WS pero nunca inicializa `api.client`.
+- [x] Wire `init_client(real=config.REAL)` en `run()` (testnet) — implementado en `db4a115`: `exec.init_client(real=False)` (testnet, seguro §0.1) + método `ExecutionEngine.init_client()` que degrada con gracia si la API no está (offline). Si `config.REAL=True` NUNCA inicializa mainnet sin autorización humana (§0.1). Filtros reales del símbolo ahora se cargan en testnet (§3).
 - [ ] Confirmación humana del presupuesto de riesgo (§0.4).
 - [ ] Autorización para subir de nivel de exposición (§0.2).
 - [ ] Endurecer `cancel_order_by_id` (no purgar local si la API falla) (§0.6).
@@ -97,3 +97,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **2026-08-09**: creado este archivo. Módulos `strategy/` completos, `market_maker.py` orquestador creado, tests Risk Engine 13/13 OK, kill switch cubierto.
 - **2026-08-09**: corregidos maker check §10 y semántica de fills `is_buyer_maker`. Nuevo `test_execution_engine.py` (14/14 OK). Auditados bugs pendientes (Nivel 0/dry-run, init_client, cancel purga local, kill switch reduce/close, NetPnL, sigma).
 - **2026-08-09**: implementada la decisión Nivel 0 con simulación (`SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()`), corregido bug de convención de side en NetPnL (bot nunca cotizaba), nuevo `test_alpha_model.py`. **Suite 37/37 OK.** Commit `1e5432f`.
+- **2026-08-09**: conectado `init_client(real=False)` en `run()` (testnet, §0.1) con método `ExecutionEngine.init_client()` que degrada offline. Filtros reales del símbolo cargados en testnet (§3). Commit `db4a115`.

@@ -148,6 +148,31 @@ class ExecutionEngine:
         self._log_event_jsonl(self._fills_log_path, fill)
 
     # ── Filtros del símbolo (§3) ─────────────────────────────────────────
+    def init_client(self, real: bool = False):
+        """Inicializa el cliente API de Binance Futures (§1).
+
+        Es la ÚNICA vía por la que el orquestador inicializa el cliente:
+        API_binance_futuros es la única interfaz con Binance (§1). Seguridad
+        §0.1/§0.5: `real=True` (mainnet) requiere autorización humana; en
+        Nivel 0/dry-run solo se conecta testnet (real=False) y jamás se
+        envían órdenes reales (§0.1/§21).
+
+        Si la API no está disponible (offline), degrada con gracia: el motor
+        queda en modo simulación sin romper el run.
+        """
+        if api is None:
+            logger.warning("ExecutionEngine: API no disponible (offline). "
+                           "Modo simulación sin cliente.")
+            return False
+        try:
+            api.init_client(real=real)
+            logger.info("ExecutionEngine: cliente API inicializado (real=%s, dry_run=%s)",
+                        real, self.dry_run)
+            return True
+        except Exception as e:
+            logger.error("ExecutionEngine: error en init_client(real=%s): %s", real, e)
+            return False
+
     def init_symbol_info(self):
         """Consulta api.get_symbol y extrae los filtros reales. Nunca asume valores."""
         if api is None:

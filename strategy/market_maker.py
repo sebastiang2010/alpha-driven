@@ -439,6 +439,19 @@ class MarketMaker:
     # ── 9. Loop principal (§8, §13, §15, §16) ────────────────────────────
     def run(self, max_cycles: int | None = None) -> None:
         """Arranca WS, inicializa el exchange y ejecuta el ciclo de cotización."""
+        # §0.1/§21: en Nivel 0 (dry-run) el cliente se inicializa SOLO en
+        # testnet (real=config.REAL=False por defecto). Si config.REAL=True
+        # (mainnet), NUNCA se inicializa aquí: requiere autorización humana
+        # explícita (§0.1) y no existe sin ella.
+        if config.REAL:
+            logger.warning(
+                "MarketMaker: config.REAL=True detectado. NO se inicializa el "
+                "cliente mainnet sin autorización humana (§0.1). Continúa en "
+                "dry-run/testnet según EXPOSURE_LEVEL."
+            )
+        else:
+            self.exec.init_client(real=False)  # testnet (seguro §0.1/§0.5)
+
         self.state.start_ws()
         self.exec.init_symbol_info()
         self.exec.set_leverage(config.MAX_LEVERAGE_USED)  # dry-run: no-op
