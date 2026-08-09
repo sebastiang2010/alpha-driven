@@ -54,6 +54,21 @@ Estos valores en `config.py` son **propuestas conservadoras**; **NO operar con f
   Maker check §10 (BUY < best_ask, SELL > best_bid, sin libro → rechazo) y
   `process_fills_from_trades` con semántica correcta de `is_buyer_maker`.
 - `MarketMaker(dry_run=True)` instancia offline sin errores (API no inicializa `client` en el import).
+- **CORRIDA INTEGRADA DRY-RUN** `python run_dry_run.py --cycles 20` (2026-08-09 19:19 local, ~107 s):
+  3 WS testnet conectados (`bookTicker`, `depth5@100ms`, `trade`), 19 decisiones nuevas,
+  8 órdenes simuladas, 0 fills, 0 kill switch, `ws_connected=True`, sin excepciones,
+  shutdown limpio con `cancel_all_orders()`. Filtros reales de símbolo cargados (§3):
+  `price_precision=4`, `quantity_precision=1`, `tick_size=0.0001`, `step_size=0.1`,
+  `min_qty=0.1`, `min_notional=5.0`.
+  - **Sizes > 0 confirmado**: `bid_size`/`ask_size` = 20.0 XRP (bug `sizes=0.0` superado).
+  - **Quality gate OK** (post-fix del resumen): 6/19 decisiones `reason=ok`; 13/19
+    `expected_net_pnl_non_positive:ask` (comportamiento por diseño §18: no cotizar lado
+    con NetPnL esperado ≤ 0, NO es falla). Eventos de órdenes solo `placed`/`canceled`
+    (esperados). Alpha pinned en −0.01 (clamp) por trade flow vendedor en ventana de 60 s
+    con mid plano; a monitorear, no confirmado como bug.
+  - Corrección del resumen: `_summary` ahora filtra orders/fills/kill_switch por `ts`
+    epoch float (no ISO) y acepta `canceled` como evento esperado (el `GATE FAIL: canceled`
+    previo era falso positivo del propio resumen).
 
 ## Hallazgos de auditoría (2026-08-09)
 
@@ -90,6 +105,8 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - [ ] NetPnL con funding + slippage; unificar fee en config (§18).
 - [ ] Reescalar sigma a intervalo fijo (§0.6).
 - [ ] Generación de reportes en `reports/` (§22).
+- [ ] Investigar alpha pinned en −0.01 (clamp) en dry-run: trade flow vendedor vs bug de convención (§0.6).
+- [ ] Verificación final en vivo: re-ejecutar `run_dry_run.py` y ver `GATE OK` (opcional, ya validado offline).
 - [ ] Commit de los fixes de esta sesión (§0.3, §24).
 
 ## Log de actualizaciones
@@ -98,3 +115,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **2026-08-09**: corregidos maker check §10 y semántica de fills `is_buyer_maker`. Nuevo `test_execution_engine.py` (14/14 OK). Auditados bugs pendientes (Nivel 0/dry-run, init_client, cancel purga local, kill switch reduce/close, NetPnL, sigma).
 - **2026-08-09**: implementada la decisión Nivel 0 con simulación (`SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()`), corregido bug de convención de side en NetPnL (bot nunca cotizaba), nuevo `test_alpha_model.py`. **Suite 37/37 OK.** Commit `1e5432f`.
 - **2026-08-09**: conectado `init_client(real=False)` en `run()` (testnet, §0.1) con método `ExecutionEngine.init_client()` que degrada offline. Filtros reales del símbolo cargados en testnet (§3). Commit `db4a115`.
+- **2026-08-09**: **corrida integrada dry-run exitosa** (`run_dry_run.py`, 20 ciclos, ~107 s). 3 WS testnet, 19 decisiones, 8 órdenes simuladas, sizes=20.0, 0 kill switch, gate OK. Creado `run_dry_run.py` (watchdog 125 s, resumen con quality gate, exit codes 0/1/2); corregido el resumen (filtro por `ts` float + eventos `canceled` aceptados). `STATUS.md` actualizado. Pendiente commit.
