@@ -152,18 +152,27 @@ KILL_SWITCH_FEE_LIMIT_USDC: float = 1.0
 
 # Fee maker de referencia (proporción del nocional). Fuente única (§0.4):
 # market_maker y alpha_model lo importan de acá, NO lo redefinen.
+# Fee maker real de Binance Futures (VIP0): 0.0002 por lado.
 MAKER_FEE_RATE: float = 0.0002
 
-# Funding estimado por operación (proporción del nocional). El funding real
-# de Binance se cobra cada 8 h sobre la posición; acá se estima un costo
-# proporcional por trade para el NetPnL esperado (§18).
+# Funding de Binance Futures: se cobra PERIODICAMENTE, cada 8 h, sobre el
+# nocional de la posición (no por fill). Para el NetPnL esperado (§18) se
+# modela proporcional al tiempo de tenencia esperado:
+#     funding_por_trade = FUNDING_RATE_PER_8H * (EXPECTED_HOLD_SEC / FUNDING_INTERVAL_SEC)
+# Referencia: Binance USDⓈ-M Futures funding (tasa por intervalo de 8 h).
+# Con los defaults: 0.0001 * (300 / 28800) ≈ 0.00000104 por trade
+# (antes se aplicaba 0.0001 fijo por fill — sobreestimaba ~1000x el costo).
 # PROPUESTA pendiente de confirmación (§0.4).
-FUNDING_RATE: float = 0.0001
+FUNDING_RATE_PER_8H: float = 0.0001
+FUNDING_INTERVAL_SEC: float = 8.0 * 3600.0   # 28,800 s (cobro periódico Binance)
+EXPECTED_HOLD_SEC: float = 300.0             # tenencia esperada por posición (maker)
 
-# Slippage estimado por operación (proporción del nocional). Cubre el costo
-# de adverse selection / ejecución parcial fuera del precio exacto (§18).
+# Slippage para órdenes MAKER (post-only GTX): 0 por definición — una orden
+# maker nunca se ejecuta como taker, así que no paga half-spread de cruce.
+# Referencia: Binance order types, timeInForce=GTX (post-only).
+# Mantener > 0 solo si se quiere un colchón conservador de adverse selection.
 # PROPUESTA pendiente de confirmación (§0.4).
-SLIPPAGE_RATE: float = 0.0001
+SLIPPAGE_MAKER_BPS: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Paths de logging (§15) — relativos al directorio del proyecto

@@ -73,17 +73,20 @@ class TestExpectedNetPnlEstimate(unittest.TestCase):
         self.assertGreater(sin_fee, con_fee)
 
     def test_funding_reduce_pnl(self):
-        """§18: el funding resta del NetPnL (fix auditoría 2026-08-09)."""
+        """§18: el funding resta del NetPnL, proporcional al hold time."""
+        # hold = 28,800 s (1 intervalo de 8 h) => funding = tasa completa.
         sin_funding = self.am.expected_net_pnl_estimate(
-            self.snap, "bid", 2.49, 20.0, maker_fee=0.0, funding_rate=0.0
+            self.snap, "bid", 2.49, 20.0, maker_fee=0.0,
+            funding_rate_per_8h=0.0001, expected_hold_sec=0.0,
         )
         con_funding = self.am.expected_net_pnl_estimate(
-            self.snap, "bid", 2.49, 20.0, maker_fee=0.0, funding_rate=0.0001
+            self.snap, "bid", 2.49, 20.0, maker_fee=0.0,
+            funding_rate_per_8h=0.0001, expected_hold_sec=28800.0,
         )
         self.assertGreater(sin_funding, con_funding)
 
     def test_slippage_reduce_pnl(self):
-        """§18: el slippage resta del NetPnL (fix auditoría 2026-08-09)."""
+        """§18: el slippage resta del NetPnL (solo si se configura > 0)."""
         sin_slip = self.am.expected_net_pnl_estimate(
             self.snap, "bid", 2.49, 20.0, maker_fee=0.0, slippage_rate=0.0
         )
@@ -93,19 +96,96 @@ class TestExpectedNetPnlEstimate(unittest.TestCase):
         self.assertGreater(sin_slip, con_slip)
 
     def test_costos_combinados_netpnl_menor(self):
-        """§18: NetPnL = GrossPnL - fees - funding - slippage (los tres restan)."""
+        """§18: NetPnL = GrossPnL - fees - funding - slippage (los tres restan).
+
+        Funding proporcional: con hold=28,800 s (1 intervalo de 8 h) la tasa
+        completa entra en el cálculo. Fórmula verificada numéricamente:
+        costos = price*qty*(fee + funding_rate_per_8h*(hold/28800) + slippage).
+        """
         gross = self.am.expected_net_pnl_estimate(
             self.snap, "bid", 2.49, 20.0,
-            maker_fee=0.0, funding_rate=0.0, slippage_rate=0.0,
+            maker_fee=0.0, funding_rate_per_8h=0.0, slippage_rate=0.0,
         )
         net = self.am.expected_net_pnl_estimate(
             self.snap, "bid", 2.49, 20.0,
-            maker_fee=0.0002, funding_rate=0.0001, slippage_rate=0.0001,
+            maker_fee=0.0002, funding_rate_per_8h=0.0001,
+            expected_hold_sec=28800.0, slippage_rate=0.0001,
         )
         self.assertGreater(gross, net)
-        # Verificación numérica exacta: costos = price*qty*(fee+funding+slippage).
-        expected_costs = 2.49 * 20.0 * (0.0002 + 0.0001 + 0.0001)
+        expected_costs = 2.49 * 20.0 * (0.0002 + 0.0001 * (28800.0 / 28800.0) + 0.0001)
         self.assertAlmostEqual(gross - net, expected_costs, places=12)
+
+
+class TestModeloDeCostos(unittest.TestCase):
+    """Modelo de costos §18 (decisión 2026-08-09, pendiente de confirmación).
+
+    - funding: proporcional al hold time (Binance cobra cada 8 h sobre notional,
+      NO por fill) — antes 0.0001 fijo por trade sobreestimaba ~1000x.
+    - slippage: 0 para maker (GTX post-only nunca cruza el spread).
+    - Una quote con edge real dentro del spread es operables en mercado tranquilo.
+    """
+
+    def setUp(self):
+        self.am = alpha_model.AlphaModel()
+
+    def test_funding_hold_cero_es_cero(self):
+        """hold=0 => sin exposición al funding: no debe restar nada."""
+        base = self.am.expected_net_pnl_estimate(
+            _snapshot(mid=1.0), "bid", 0.9997, 20.0, maker_fee=0.0,
+            funding_rate_per_8h=0.0001, expected_hold_sec=0.0,
+        )
+        self.assertGreater(base, 0.0)
+
+    def test_funding_proporcional_al_hold(self):
+        """A mayor hold time, mayor costo de funding (proporcionalidad §18)."""
+        snap = _snapshot(mid=1.0)
+        hold_300 = self.am.expected_net_pnl_estimate(
+            snap, "bid", 0.9997, 20.0, maker_fee=0.0,
+            funding_rate_per_8h=0.0001, expected_hold_sec=300.0,
+        )
+        hold_28800 = self.am.expected_net_pnl_estimate(
+            snap, "bid", 0.9997, 20.0, maker_fee=0.0,
+            funding_rate_per_8h=0.0001, expected_hold_sec=28800.0,
+        )
+        self.assertGreater(hold_300, hold_28800)
+        # Con hold=0 el funding no existe: la diferencia hold_0 - hold_300 es
+        # exactamente price*qty*tasa*(300/28800) (única diferencia: funding).
+        hold_0 = self.am.expected_net_pnl_estimate(
+            snap, "bid", 0.9997, 20.0, maker_fee=0.0,
+            funding_rate_per_8h=0.0001, expected_hold_sec=0.0,
+        )
+        delta = hold_0 - hold_300
+        self.assertAlmostEqual(delta, 0.9997 * 20.0 * 0.0001 * (300.0 / 28800.0), places=12)
+
+    def test_slippage_maker_cero_por_defecto(self):
+        """El default de slippage maker es 0 (GTX post-only nunca cruza)."""
+        self.assertEqual(alpha_model.config.SLIPPAGE_MAKER_BPS, 0.0)
+        con_default = self.am.expected_net_pnl_estimate(
+            _snapshot(mid=1.0), "bid", 0.9997, 20.0, maker_fee=0.0,
+        )
+        con_cero = self.am.expected_net_pnl_estimate(
+            _snapshot(mid=1.0), "bid", 0.9997, 20.0, maker_fee=0.0, slippage_rate=0.0,
+        )
+        self.assertAlmostEqual(con_default, con_cero, places=12)
+
+    def test_quote_dentro_del_spread_operable_mercado_tranquilo(self):
+        """Gate pasa en mercado tranquilo: quote con edge > costos maker.
+
+        mid=1.0, spread=0.0006, bid a 3 ticks del mid: gross=0.0003*20=0.006;
+        fees=1.0*20*0.0002=0.004; funding≈20*0.0001*(300/28800)≈0.00002;
+        slippage=0 => NetPnL>0. Con el modelo viejo (fee+funding+slippage=0.0004
+        fijos) el mismo quote daba NetPnL<0 y el gate lo rechazaba.
+        """
+        snap = _snapshot(mid=1.0, spread=0.0006)
+        pnl_bid = self.am.expected_net_pnl_estimate(snap, "bid", 0.9997, 20.0)
+        self.assertGreater(pnl_bid, 0.0)
+        # Contraste con el modelo viejo: costos fijos 0.0004 => NetPnL negativo.
+        pnl_viejo = self.am.expected_net_pnl_estimate(
+            snap, "bid", 0.9997, 20.0,
+            maker_fee=0.0002, funding_rate_per_8h=0.0001,
+            expected_hold_sec=28800.0, slippage_rate=0.0001,
+        )
+        self.assertLess(pnl_viejo, 0.0)
 
 
 class TestComputeAlpha(unittest.TestCase):

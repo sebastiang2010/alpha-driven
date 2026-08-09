@@ -20,7 +20,7 @@
 | `strategy/market_maker.py` | ✅ Creado | Orquestador que integra todos los módulos. |
 | Tests Risk Engine (§12) | ✅ **13/13 OK** | `python -m unittest strategy.tests.test_risk_engine -v`. Incluye kill switch (§13). |
 | Tests Execution Engine (§9-§10) | ✅ **14/14 OK** | `python -m unittest strategy.tests.test_execution_engine -v`. Maker check §10 + fills is_buyer_maker. |
-| Tests AlphaModel (§6/§9) | ✅ **14/14 OK** | `python -m unittest strategy.tests.test_alpha_model -v`. Convención de side + NetPnL + alpha acotada + regresión §8 (sin doble conteo). |
+| Tests AlphaModel (§6/§9) | ✅ **18/18 OK** | `python -m unittest strategy.tests.test_alpha_model -v`. Convención de side + NetPnL + alpha acotada + regresión §8 + modelo de costos §18. |
 | Kill switch (§13) | ✅ Cubierto | 4 tests: daily loss, price anomaly, ws disconnect, no disparo normal. |
 | `logs/` | ✅ Creado | `decisions/`, `fills/`, `market_data/`, `orders/`, `pnl/`. |
 | `reports/` | ⚠️ Vacío | Sin reportes generados todavía. |
@@ -41,6 +41,10 @@ Estos valores en `config.py` son **propuestas conservadoras**; **NO operar con f
 | `MAX_DRAWDOWN_PCT` | 0.05 | ⏳ Pendiente de confirmación |
 | `MAX_LEVERAGE_USED` | 5 | ⏳ Pendiente de confirmación |
 | `EXPOSURE_LEVEL` | 0 (dry-run) | ✅ Simulación — subir requiere autorización (§0.2) |
+| `MAKER_FEE_RATE` | 0.0002 | ⏳ Pendiente de confirmación (fee maker real VIP0 Binance) |
+| `FUNDING_RATE_PER_8H` | 0.0001 | ⏳ Pendiente de confirmación (tasa por intervalo de 8 h) |
+| `EXPECTED_HOLD_SEC` | 300.0 | ⏳ Pendiente de confirmación (tenencia esperada por posición) |
+| `SLIPPAGE_MAKER_BPS` | 0.0 | ⏳ Pendiente de confirmación (GTX post-only no cruza; >0 solo como colchón) |
 
 ---
 
@@ -74,7 +78,7 @@ Estos valores en `config.py` son **propuestas conservadoras**; **NO operar con f
   **GATE OK en vivo**: 4/4 decisiones `reason=ok` (antes 0/4), `bid_size`/`ask_size`=20.0,
   0 fills, 0 kill switch, exit code 0. Quotes sanos: con alpha=−0.0005, bid≈mid−0.0063 y
   ask≈mid+0.0052 (spread 0.0005 + sigma efectiva) — ya NO hay ask a mid+2%.
-- `python -m unittest discover -s strategy/tests -v` → **50/50 OK** (2026-08-09, post-fix).
+- `python -m unittest discover -s strategy/tests -v` → **54/54 OK** (2026-08-09, post-fix modelo de costos §18).
 
 ## Hallazgos de auditoría (2026-08-09)
 
@@ -86,6 +90,12 @@ Corregidos en esta sesión:
 - **Doble conteo de alpha (bug §8, encontrado por el gate en vivo 2026-08-09)**: `reservation_price` pone `r = mid + alpha` (§8) PERO `quote_distances` SUMABA además `ALPHA_QUOTE_FACTOR × |alpha|` (=1.0) a la distancia base → con alpha=±0.01 el lado alejado quedaba a ±2% del mid y el cercano sin borde (NetPnL≤0). En la corrida 22:26 UTC: mid=1.04215, ask=1.0622, reason=`expected_net_pnl_non_positive:bid` → el gate rechazó todo (0/4 ok) y solo se colocó una SELL que luego se canceló. Corregido: `ALPHA_QUOTE_FACTOR = 0.0` (§8: el alpha ya desplaza la reserva). Regresión cubierta con 2 tests nuevos (§0.6).
 - **Saturación de alpha (hallazgo 2026-08-09)**: `ALPHA_MAX=0.01` (±1%) es ~100× el spread real de XRPUSDC (p50≈0.0003); con `IMBALANCE_WEIGHT=0.20`, un imbalance típico (0.077) ya da 0.0154 > 0.01 → alpha pinneado en ±1% SIEMPRE (señal degenerada). Recalibrado conservador (§0.4, "pendiente de confirmación"): `IMBALANCE_WEIGHT=0.003`, `TRADE_FLOW_WEIGHT=0.003`, `ALPHA_MAX=0.0005` (~5 ticks, ~2× spread p50). Mantener bajo monitoreo y recalibrar con más datos.
 - **Test de Risk Engine actualizado**: Nivel 0 con simulación ya NO tiene `max_order_size == 0.0`; ahora es `BASE_ORDER_SIZE_XRP * SIMULATION_QUOTE_MULTIPLIER` (= 20.0 XRP). Nuevo test verifica que una orden dentro del tamaño simulado es admitida.
+- **Modelo de costos §18 (hallazgo auditoría 2026-08-09, implementado)**: `expected_net_pnl_estimate` aplicaba funding (0.0001) y slippage (0.0001) como costos fijos **por fill**, pero el funding de Binance se cobra **cada 8 h sobre el notional de la posición** (no por trade), y una orden maker GTX post-only **nunca cruza el spread** (slippage 0). Con `fee+funding+slippage = 0.0004` fijos y spread p50≈0.0003, el edge mínimo exigido (≈0.00042) superaba el spread típico → ninguna quote maker podía ser NetPnL-positiva (gate siempre rechazaba, salvo reduce-only). Corregido en `config.py` + `alpha_model.expected_net_pnl_estimate`:
+  - `FUNDING_RATE` → `FUNDING_RATE_PER_8H` (0.0001) + `FUNDING_INTERVAL_SEC` (28,800 s) + `EXPECTED_HOLD_SEC` (300 s): funding por trade = `tasa * (hold / intervalo)` ≈ 0.00000104 (antes 0.0001 fijo — sobreestimaba ~1000×).
+  - `SLIPPAGE_RATE` → `SLIPPAGE_MAKER_BPS = 0.0` (maker post-only no paga cruce).
+  - Nuevos tests `TestModeloDeCostos` (4): hold=0 → funding 0; proporcionalidad al hold (verificada numéricamente); default slippage maker = 0; **quote con edge real dentro del spread (3 ticks, mid=1.0) ahora es operable** (NetPnL>0) donde el modelo viejo daba NetPnL<0.
+  - Efecto esperado en vivo: el gate `expected_net_pnl_non_positive` deja de rechazar sistemáticamente; **pendiente re-correr `run_dry_run.py` para confirmar**.
+  - Parámetros marcados ⏳ "pendiente de confirmación" (§0.4).
 
 **Suite completa: 37/37 OK** (`python -m unittest discover -s strategy/tests`).
 
@@ -108,11 +118,11 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - [x] Wire `init_client(real=config.REAL)` en `run()` (testnet) — implementado en `db4a115`: `exec.init_client(real=False)` (testnet, seguro §0.1) + método `ExecutionEngine.init_client()` que degrada con gracia si la API no está (offline). Si `config.REAL=True` NUNCA inicializa mainnet sin autorización humana (§0.1). Filtros reales del símbolo ahora se cargan en testnet (§3).
 - [ ] Confirmación humana del presupuesto de riesgo (§0.4).
 - [ ] Confirmación humana de la recalibración de alpha (pesos + `ALPHA_MAX=0.0005`, §0.4).
-- [ ] Investigar el modelo de costos (§18): con `MAKER_FEE_RATE+FUNDING_RATE+SLIPPAGE_RATE = 0.0004` y spread p50≈0.0003, el edge mínimo exigido (≈0.00042) es MAYOR que el spread típico → ninguna quote maker puede ser NetPnL-positiva salvo `reduce_only`. Sospecha: `FUNDING_RATE` aplicado como costo por-trade plano, pero el funding real se cobra periódico (cada 8 h) sobre notional, no por fill. Revisar `expected_net_pnl_estimate` y cómo se aplica.
+- [ ] Investigar el modelo de costos (§18): con `MAKER_FEE_RATE+FUNDING_RATE+SLIPPAGE_RATE = 0.0004` y spread p50≈0.0003, el edge mínimo exigido (≈0.00042) es MAYOR que el spread típico → ninguna quote maker puede ser NetPnL-positiva salvo `reduce_only`. Sospecha: `FUNDING_RATE` aplicado como costo por-trade plano, pero el funding real se cobra periódico (cada 8 h) sobre notional, no por fill. Revisar `expected_net_pnl_estimate` y cómo se aplica. — **Resuelto (2026-08-09)**: funding ahora proporcional al hold time (`FUNDING_RATE_PER_8H` × hold/28800) y slippage maker 0 (`SLIPPAGE_MAKER_BPS`). Quotes con edge real dentro del spread son operables. Ver "Modelo de costos §18" en auditoría.
 - [ ] Autorización para subir de nivel de exposición (§0.2).
 - [ ] Endurecer `cancel_order_by_id` (no purgar local si la API falla) (§0.6).
 - [ ] Implementar reduce/close en kill switch (§13).
-- [ ] NetPnL con funding + slippage; unificar fee en config (§18).
+- [ ] NetPnL con funding + slippage; unificar fee en config (§18). — **Implementado (2026-08-09)**: funding proporcional al hold time, slippage maker 0, fee único `MAKER_FEE_RATE` en config (fuente única §0.4). Confirmar parámetros con humano (§0.4).
 - [ ] Reescalar sigma a intervalo fijo (§0.6).
 - [ ] Generación de reportes en `reports/` (§22).
 - [ ] Investigar alpha pinned en −0.01 (clamp) en dry-run: trade flow vendedor vs bug de convención (§0.6). — **Resuelto (2026-08-09)**: era saturación por `ALPHA_MAX=0.01` con `IMBALANCE_WEIGHT=0.20` (imbalance típico 0.077 → 0.0154 > cap). Recalibrado a `ALPHA_MAX=0.0005` y pesos 0.003.
@@ -127,3 +137,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **2026-08-09**: conectado `init_client(real=False)` en `run()` (testnet, §0.1) con método `ExecutionEngine.init_client()` que degrada offline. Filtros reales del símbolo cargados en testnet (§3). Commit `db4a115`.
 - **2026-08-09**: **corrida integrada dry-run exitosa** (`run_dry_run.py`, 20 ciclos, ~107 s). 3 WS testnet, 19 decisiones, 8 órdenes simuladas, sizes=20.0, 0 kill switch, gate OK. Creado `run_dry_run.py` (watchdog 125 s, resumen con quality gate, exit codes 0/1/2); corregido el resumen (filtro por `ts` float + eventos `canceled` aceptados). `STATUS.md` actualizado. Pendiente commit.
 - **2026-08-09**: **corregido doble conteo de alpha (§8)** — el gate en vivo lo detectó (ask a mid+2%, 0/4 decisiones `ok`). `ALPHA_QUOTE_FACTOR` 1.0 → 0.0; recalibrada la señal a escala de spread (`ALPHA_MAX` 0.01 → 0.0005, `IMBALANCE_WEIGHT`/`TRADE_FLOW_WEIGHT` → 0.003, conservador "pendiente de confirmación" §0.4). 2 tests de regresión nuevos. **GATE OK en vivo post-fix (4/4)**, suite 50/50 OK.
+- **2026-08-09**: **corregido modelo de costos §18** — funding era costo fijo por fill (0.0001) pero Binance lo cobra cada 8 h sobre notional; slippage 0.0001 por fill sobrestimaba un maker GTX que nunca cruza. Ahora: `FUNDING_RATE_PER_8H` × `EXPECTED_HOLD_SEC`/`FUNDING_INTERVAL_SEC` (≈0.00000104/trade) + `SLIPPAGE_MAKER_BPS=0.0` + fee único de config. 4 tests nuevos (`TestModeloDeCostos`): quote con edge de 3 ticks dentro del spread ahora operable donde antes NetPnL<0. Suite **54/54 OK**.

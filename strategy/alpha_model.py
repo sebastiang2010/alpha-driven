@@ -221,7 +221,8 @@ class AlphaModel:
         price: float,
         qty: float,
         maker_fee: float | None = None,
-        funding_rate: float | None = None,
+        funding_rate_per_8h: float | None = None,
+        expected_hold_sec: float | None = None,
         slippage_rate: float | None = None,
     ) -> float:
         """
@@ -231,8 +232,20 @@ class AlphaModel:
         bid: (mid - price) * qty - price*qty*(fee + funding + slippage)
         ask: (price - mid) * qty - price*qty*(fee + funding + slippage)
 
+        Modelo de costos (decisión 2026-08-09, pendiente de confirmación §0.4):
+          - fees: MAKER_FEE_RATE por lado (fee maker real Binance VIP0, 0.0002).
+          - funding: PROPORCIONAL al tiempo de tenencia esperado. Binance cobra
+            funding cada 8 h sobre el nocional (no por fill):
+                funding = FUNDING_RATE_PER_8H * (EXPECTED_HOLD_SEC / FUNDING_INTERVAL_SEC)
+            Con defaults (0.0001, 300 s, 28,800 s): funding ≈ 0.00000104 por
+            trade (antes era 0.0001 fijo por fill — sobreestimaba ~1000x).
+          - slippage: 0 para órdenes MAKER (post-only GTX nunca cruzan el
+            spread). SLIPPAGE_MAKER_BPS = 0.0 en config; > 0 solo si se quiere
+            un colchón conservador de adverse selection.
+
         Los costos por defecto salen de config (fuente única §0.4):
-            MAKER_FEE_RATE, FUNDING_RATE, SLIPPAGE_RATE.
+            MAKER_FEE_RATE, FUNDING_RATE_PER_8H, EXPECTED_HOLD_SEC,
+            FUNDING_INTERVAL_SEC, SLIPPAGE_MAKER_BPS.
         Se pueden anular por parámetro (tests).
 
         Acepta side en cualquiera de las dos convenciones usadas en el repo:
@@ -245,10 +258,16 @@ class AlphaModel:
 
         fee_rate = max(float(maker_fee if maker_fee is not None
                               else getattr(config, "MAKER_FEE_RATE", 0.0002)), 0.0)
-        funding = max(float(funding_rate if funding_rate is not None
-                            else getattr(config, "FUNDING_RATE", 0.0)), 0.0)
+        funding_rate = max(float(
+            funding_rate_per_8h if funding_rate_per_8h is not None
+            else getattr(config, "FUNDING_RATE_PER_8H", 0.0)), 0.0)
+        hold_sec = max(float(
+            expected_hold_sec if expected_hold_sec is not None
+            else getattr(config, "EXPECTED_HOLD_SEC", 0.0)), 0.0)
+        interval_sec = float(getattr(config, "FUNDING_INTERVAL_SEC", 8.0 * 3600.0))
+        funding = funding_rate * (hold_sec / interval_sec) if interval_sec > 0 else 0.0
         slippage = max(float(slippage_rate if slippage_rate is not None
-                             else getattr(config, "SLIPPAGE_RATE", 0.0)), 0.0)
+                             else getattr(config, "SLIPPAGE_MAKER_BPS", 0.0)), 0.0)
         cost_rate = fee_rate + funding + slippage
         costs = float(price) * float(qty) * cost_rate
 
