@@ -72,6 +72,41 @@ class TestExpectedNetPnlEstimate(unittest.TestCase):
         )
         self.assertGreater(sin_fee, con_fee)
 
+    def test_funding_reduce_pnl(self):
+        """§18: el funding resta del NetPnL (fix auditoría 2026-08-09)."""
+        sin_funding = self.am.expected_net_pnl_estimate(
+            self.snap, "bid", 2.49, 20.0, maker_fee=0.0, funding_rate=0.0
+        )
+        con_funding = self.am.expected_net_pnl_estimate(
+            self.snap, "bid", 2.49, 20.0, maker_fee=0.0, funding_rate=0.0001
+        )
+        self.assertGreater(sin_funding, con_funding)
+
+    def test_slippage_reduce_pnl(self):
+        """§18: el slippage resta del NetPnL (fix auditoría 2026-08-09)."""
+        sin_slip = self.am.expected_net_pnl_estimate(
+            self.snap, "bid", 2.49, 20.0, maker_fee=0.0, slippage_rate=0.0
+        )
+        con_slip = self.am.expected_net_pnl_estimate(
+            self.snap, "bid", 2.49, 20.0, maker_fee=0.0, slippage_rate=0.0001
+        )
+        self.assertGreater(sin_slip, con_slip)
+
+    def test_costos_combinados_netpnl_menor(self):
+        """§18: NetPnL = GrossPnL - fees - funding - slippage (los tres restan)."""
+        gross = self.am.expected_net_pnl_estimate(
+            self.snap, "bid", 2.49, 20.0,
+            maker_fee=0.0, funding_rate=0.0, slippage_rate=0.0,
+        )
+        net = self.am.expected_net_pnl_estimate(
+            self.snap, "bid", 2.49, 20.0,
+            maker_fee=0.0002, funding_rate=0.0001, slippage_rate=0.0001,
+        )
+        self.assertGreater(gross, net)
+        # Verificación numérica exacta: costos = price*qty*(fee+funding+slippage).
+        expected_costs = 2.49 * 20.0 * (0.0002 + 0.0001 + 0.0001)
+        self.assertAlmostEqual(gross - net, expected_costs, places=12)
+
 
 class TestComputeAlpha(unittest.TestCase):
     """§6: señal acotada y con términos nulos bien manejados."""

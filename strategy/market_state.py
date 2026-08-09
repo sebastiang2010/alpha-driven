@@ -18,6 +18,11 @@ Convención de volatilidad (declarada, consistente, sin √T doble §0.6):
             ln(p_t / p_{t-1}) entre muestras consecutivas de mid price
             dentro de VOLATILITY_WINDOW_SEC.
     Unidades: retorno por intervalo de muestreo del WS (NO anualizado).
+    Reescala a intervalo fijo: sigma_ref = sigma_evento *
+            sqrt(SAMPLING_INTERVAL_SEC / avg_interval), donde
+            SAMPLING_INTERVAL_SEC = 5.0 (config) es la referencia que usa
+            alpha_model. Así el WS puede actualizar más rápido que 5 s sin
+            romper la consistencia de escala (§0.6).
     Es la volatilidad "efectiva" del período; NO se multiplica por √T en
     ningún punto de este módulo (√T solo se aplica donde el consumidor
     anualiza, nunca dos veces).
@@ -39,6 +44,13 @@ if PROJ_ROOT not in sys.path:
 from websocket_bookticker import BookTickerWebSocket
 from websocket_depth import DepthWebSocket
 from websocket_trades import TradeWebSocket
+
+# Config central (§0.4): SAMPLING_INTERVAL_SEC define el intervalo de
+# referencia al que se reescala sigma (§0.6).
+try:
+    from strategy import config
+except ImportError:
+    import config
 
 logger = logging.getLogger("MarketState")
 
@@ -184,24 +196,39 @@ class MarketState:
         Se usan muestras de mid tomadas en cada actualización del
         bookTicker/depth dentro de VOLATILITY_WINDOW_SEC. Retorno log:
         r_i = ln(p_i / p_{i-1}). El std muestral (n-1) de esos retornos es
-        el sigma reportado. Convención: por intervalo de muestreo (NO
-        anualizado, sin √T).
+        el sigma por evento del WS.
+
+        Reescala a intervalo fijo (§0.6): el WS puede actualizar más rápido
+        que SAMPLING_INTERVAL_SEC; para que sigma sea consistente con la
+        referencia de alpha_model (5 s), se multiplica por
+        sqrt(SAMPLING_INTERVAL_SEC / avg_interval). Si no hay suficientes
+        muestras o el intervalo medio no es positivo, devuelve 0.0.
         """
         self._prune_deque(self._mid_samples, now_sec, VOLATILITY_WINDOW_SEC)
         if len(self._mid_samples) < 3:
             return 0.0
         returns = []
         prev_price = self._mid_samples[0][1]
-        for _, price in list(self._mid_samples)[1:]:
+        prev_ts = self._mid_samples[0][0]
+        intervals = []
+        for ts, price in list(self._mid_samples)[1:]:
             if prev_price > _MIN_PRICE and price > _MIN_PRICE:
                 returns.append(math.log(price / prev_price))
+                if ts > prev_ts:
+                    intervals.append(ts - prev_ts)
             prev_price = price
-        if len(returns) < 2:
+            prev_ts = ts
+        if len(returns) < 2 or not intervals:
             return 0.0
         try:
-            return statistics.stdev(returns)
+            sigma_event = statistics.stdev(returns)
         except statistics.StatisticsError:
             return 0.0
+        avg_interval = sum(intervals) / len(intervals)
+        if avg_interval <= 0.0:
+            return 0.0
+        ref_interval = float(getattr(config, "SAMPLING_INTERVAL_SEC", 5.0))
+        return sigma_event * math.sqrt(ref_interval / avg_interval)
 
     def _compute_momentum(self, now_sec):
         """

@@ -131,6 +131,11 @@ VOLATILITY_WINDOW_SEC: int = 60
 # Ventana para el cálculo de alfa (segundos).
 ALPHA_WINDOW_SEC: int = 30
 
+# Intervalo de muestreo de referencia para sigma (§0.6). market_state.py
+# reescala la volatilidad por evento del WS a este intervalo fijo; alpha_model
+# lo usa como base de sus conversiones de escala (nunca √T doble).
+SAMPLING_INTERVAL_SEC: float = 5.0
+
 # Si el mid se mueve más que este porcentaje, re-cotizar (≈1 tick).
 QUOTE_UPDATE_THRESHOLD_PCT: float = 0.001
 
@@ -140,6 +145,25 @@ QUOTE_UPDATE_THRESHOLD_PCT: float = 0.001
 
 # Límite acumulado de fees (USDC) que activa el kill switch.
 KILL_SWITCH_FEE_LIMIT_USDC: float = 1.0
+
+# ---------------------------------------------------------------------------
+# Costos de transacción para NetPnL (§18) — PROPUESTA pendiente de confirmacion
+# ---------------------------------------------------------------------------
+
+# Fee maker de referencia (proporción del nocional). Fuente única (§0.4):
+# market_maker y alpha_model lo importan de acá, NO lo redefinen.
+MAKER_FEE_RATE: float = 0.0002
+
+# Funding estimado por operación (proporción del nocional). El funding real
+# de Binance se cobra cada 8 h sobre la posición; acá se estima un costo
+# proporcional por trade para el NetPnL esperado (§18).
+# PROPUESTA pendiente de confirmación (§0.4).
+FUNDING_RATE: float = 0.0001
+
+# Slippage estimado por operación (proporción del nocional). Cubre el costo
+# de adverse selection / ejecución parcial fuera del precio exacto (§18).
+# PROPUESTA pendiente de confirmación (§0.4).
+SLIPPAGE_RATE: float = 0.0001
 
 # ---------------------------------------------------------------------------
 # Paths de logging (§15) — relativos al directorio del proyecto

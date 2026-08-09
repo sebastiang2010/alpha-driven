@@ -48,6 +48,18 @@ class FakeBookAPI:
             ],
         }
 
+    def cancel_order(self, symbol, orig_client_id=None, **kwargs):
+        """Cancelación stub: devuelve un dict de éxito (los tests lo parchean)."""
+        return {"orderId": 999, "clientOrderId": orig_client_id}
+
+    def buy_limit(self, symbol, quantity, price, **kwargs):
+        """Colocación stub: devuelve un dict de éxito (los tests lo parchean)."""
+        return {"orderId": 1001, "clientOrderId": kwargs.get("new_client_order_id")}
+
+    def sell_limit(self, symbol, quantity, price, **kwargs):
+        """Colocación stub: devuelve un dict de éxito (los tests lo parchean)."""
+        return {"orderId": 1002, "clientOrderId": kwargs.get("new_client_order_id")}
+
 
 class TestMakerCheck(unittest.TestCase):
     """§10: la orden maker no cruza el spread (bug corregido)."""
@@ -166,6 +178,60 @@ class TestProcessFillsFromTrades(unittest.TestCase):
         ])
         self.assertNotIn(oid, filled)
         self.assertIn(oid, self.engine.open_orders)
+
+
+class _FakeBinanceError(Exception):
+    """Sentinel para simular BinanceAPIException sin depender de su firma.
+
+    Se parchea sobre execution_engine.BinanceAPIException en el test: el motor
+    usa isinstance(result, BinanceAPIException) en tiempo de llamada, así que
+    cualquier clase que parcheemos ahí funciona (robusto a versiones de binance).
+    """
+
+
+class TestCancelOrderById(unittest.TestCase):
+    """§0.6: cancel_order_by_id es API-first en modo real (evita órdenes fantasma)."""
+
+    def setUp(self):
+        self.api = FakeBookAPI(best_bid=0.45, best_ask=0.55)
+        self.cancel_mock = mock.patch.object(
+            self.api, "cancel_order", return_value={"orderId": 123}
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+        patcher = mock.patch.object(execution_engine, "api", self.api)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.engine = ExecutionEngine("XRPUSDC", real=True, dry_run=False)
+
+    def _place(self, side="BUY", price=0.50, qty=12.0):
+        oid, ok, reason = self.engine.place_maker_order(side, qty, price)
+        self.assertTrue(ok, reason)
+        return oid
+
+    def test_real_cancel_ok_purga_local(self):
+        """Cancel exitoso en la API → la orden se purga localmente."""
+        oid = self._place()
+        self.assertTrue(self.engine.cancel_order_by_id(oid))
+        self.assertNotIn(oid, self.engine.open_orders)
+        self.cancel_mock.assert_called_once()
+
+    def test_real_cancel_falla_no_purga_local(self):
+        """Si la API falla, la orden NO se purga (evita orden fantasma §0.6)."""
+        with mock.patch.object(execution_engine, "BinanceAPIException",
+                               _FakeBinanceError):
+            with mock.patch.object(self.api, "cancel_order",
+                                   return_value=_FakeBinanceError("Unknown order sent.")):
+                oid = self._place()
+                self.assertFalse(self.engine.cancel_order_by_id(oid))
+                self.assertIn(oid, self.engine.open_orders)
+
+    def test_dry_run_purga_sin_api(self):
+        """En dry-run no hay API: se purga directamente."""
+        engine = ExecutionEngine("XRPUSDC", real=False, dry_run=True)
+        oid, ok, reason = engine.place_maker_order("BUY", 12.0, 0.50)
+        self.assertTrue(ok, reason)
+        self.assertTrue(engine.cancel_order_by_id(oid))
+        self.assertNotIn(oid, engine.open_orders)
 
 
 if __name__ == "__main__":

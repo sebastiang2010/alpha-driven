@@ -351,31 +351,48 @@ class ExecutionEngine:
 
     # ── Cancelación ──────────────────────────────────────────────────────
     def cancel_order_by_id(self, order_id):
-        """Cancela la orden (si existe) y la purga de los dicts. No-op si no existe."""
+        """Cancela la orden (si existe) y la purga de los dicts. No-op si no existe.
+
+        §0.6 (órdenes fantasma): en modo real se cancela PRIMERO en la API y
+        solo se purga el estado local si el cancel tuvo éxito. Si la API
+        falla, la orden queda en open_orders (se reintentará o la limpiará
+        refresh_open_orders). En dry-run no hay API: se purga directamente.
+        """
         with self._lock:
             info = self.open_orders.get(order_id)
             if info is None:
                 return False
             side, price, qty = info["side"], info["price"], info["qty"]
-            self._remove_order(order_id)
 
         if not self.dry_run and api is not None:
             result = api.cancel_order(self.symbol, orig_client_id=order_id)
             if isinstance(result, BinanceAPIException):
-                logger.warning("ExecutionEngine: error cancelando %s (se purga local igualmente): %s",
-                               order_id, result)
+                logger.warning(
+                    "ExecutionEngine: error cancelando %s en la API. "
+                    "NO se purga localmente (evita orden fantasma §0.6): %s",
+                    order_id, result,
+                )
+                return False
 
+        with self._lock:
+            self._remove_order(order_id)
         self._log_order_event("canceled", order_id, side, price, qty,
                               "canceled (purgado §0.6)")
         return True
 
     def cancel_all_orders(self):
-        """Cancela todas las órdenes abiertas y limpia los dicts. Devuelve cuántas canceló."""
+        """Cancela todas las órdenes abiertas y limpia los dicts. Devuelve cuántas canceló.
+
+        Solo cuenta las cancelaciones exitosas (en real, las que la API
+        confirmó; en dry-run, todas las que existían).
+        """
         with self._lock:
             ids = list(self.open_orders.keys())
+        canceled = 0
         for oid in ids:
-            self.cancel_order_by_id(oid)
-        return len(ids)
+            if self.cancel_order_by_id(oid):
+                canceled += 1
+        return canceled
 
     # ── Sincronización con el exchange (§0.6 frecuencia) ─────────────────
     def refresh_open_orders(self):

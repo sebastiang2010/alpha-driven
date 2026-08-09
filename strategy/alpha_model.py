@@ -52,7 +52,6 @@ GAMMA_INVENTORY_RISK: float = 0.5   # aversion al riesgo de inventario (f)
 K_QUOTE: float = 1.0                # multiplicador de sigma_efectiva en quotes
 ALPHA_QUOTE_FACTOR: float = 1.0     # cuanto ensancha |alpha| ambas puntas
 INVENTORY_SKEW_MULTIPLIER: float = 0.5  # skew de precio por inventario normalizado
-SKEW_SIZE: float = 0.6              # factor de reduccion del lado que aumenta inventario
 MIN_QUOTE_DISTANCE: float = 1e-8    # piso para que (bid_dist, ask_dist) > 0
 
 # ---------------------------------------------------------------------------
@@ -194,39 +193,27 @@ class AlphaModel:
         ask_dist = max(base - inventory_skew, MIN_QUOTE_DISTANCE)
         return bid_dist, ask_dist
 
-    # ── 4. Tamanos de orden con skew de inventario (§11) ────────────
-    def choose_order_sizes(
-        self, snapshot: dict, inventory: float, base_size: float
-    ) -> Tuple[float, float]:
-        """
-        (bid_size, ask_size) con skew de tamaño: el lado que REDUCE
-        inventario recibe el tamaño completo; el que lo aumenta recibe
-        base_size * SKEW_SIZE. Nunca cero (SKEW_SIZE > 0).
-        """
-        if base_size <= 0:
-            return 0.0, 0.0
-
-        inv = float(inventory)
-        if inv > 0:      # long -> reducir en ask (vender)
-            return base_size * SKEW_SIZE, base_size
-        if inv < 0:      # short -> reducir en bid (comprar)
-            return base_size, base_size * SKEW_SIZE
-        return base_size, base_size
-
-    # ── 5. Estimacion de NetPnL esperado (§9/§18) ───────────────────
+    # ── 4. Estimacion de NetPnL esperado (§9/§18) ───────────────────
     def expected_net_pnl_estimate(
         self,
         snapshot: dict,
         side: str,
         price: float,
         qty: float,
-        maker_fee: float = 0.0002,
+        maker_fee: float | None = None,
+        funding_rate: float | None = None,
+        slippage_rate: float | None = None,
     ) -> float:
         """
-        Spread capturado esperado menos fees maker (sobre nocional).
+        Spread capturado esperado menos costos (§18):
+            NetPnL = GrossPnL - fees - funding - slippage
 
-        bid: (mid - price) * qty - price * qty * maker_fee
-        ask: (price - mid) * qty - price * qty * maker_fee
+        bid: (mid - price) * qty - price*qty*(fee + funding + slippage)
+        ask: (price - mid) * qty - price*qty*(fee + funding + slippage)
+
+        Los costos por defecto salen de config (fuente única §0.4):
+            MAKER_FEE_RATE, FUNDING_RATE, SLIPPAGE_RATE.
+        Se pueden anular por parámetro (tests).
 
         Acepta side en cualquiera de las dos convenciones usadas en el repo:
         "bid"/"ask" (risk_engine) o "BUY"/"SELL" (execution_engine). Evita
@@ -236,12 +223,18 @@ class AlphaModel:
         if mid is None or mid <= 0:
             return 0.0
 
-        fee_rate = max(float(maker_fee), 0.0)
-        fees = float(price) * float(qty) * fee_rate
+        fee_rate = max(float(maker_fee if maker_fee is not None
+                              else getattr(config, "MAKER_FEE_RATE", 0.0002)), 0.0)
+        funding = max(float(funding_rate if funding_rate is not None
+                            else getattr(config, "FUNDING_RATE", 0.0)), 0.0)
+        slippage = max(float(slippage_rate if slippage_rate is not None
+                             else getattr(config, "SLIPPAGE_RATE", 0.0)), 0.0)
+        cost_rate = fee_rate + funding + slippage
+        costs = float(price) * float(qty) * cost_rate
 
         side_norm = str(side).upper()
         if side_norm in ("BID", "BUY"):
-            return (float(mid) - float(price)) * float(qty) - fees
+            return (float(mid) - float(price)) * float(qty) - costs
         if side_norm in ("ASK", "SELL"):
-            return (float(price) - float(mid)) * float(qty) - fees
+            return (float(price) - float(mid)) * float(qty) - costs
         return 0.0

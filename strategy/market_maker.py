@@ -37,9 +37,6 @@ from .risk_engine import RiskEngine, MAX_ERROR_COUNT, MAX_VOLATILITY
 # Constantes propias del orquestador (propuestas, §0.4)
 # ---------------------------------------------------------------------------
 
-# Fee maker de referencia para estimar NetPnL esperado (§9/§18).
-MAKER_FEE_RATE: float = 0.0002
-
 # Frescura del snapshot de WS: por encima de esto se considera desconectado (§13).
 WS_STALE_SEC: float = 15.0
 
@@ -106,6 +103,10 @@ class MarketMaker:
         self._stop = threading.Event()
         self._journal_lock = threading.Lock()
 
+        # Kill switch (§13): una vez disparado, se bloquean nuevas entradas
+        # (disable_new_entries) además de cancelar/reducir lo existente.
+        self.disable_new_entries: bool = False
+
         # Contexto de ciclo para el risk engine / re-cotización.
         self._last_snapshot: dict | None = None
         self._last_mid: float | None = None
@@ -167,7 +168,7 @@ class MarketMaker:
                 continue
             self.quote_age.pop(oid, None)
 
-            fee = MAKER_FEE_RATE * price * qty  # fee maker estimada (§9/§18)
+            fee = config.MAKER_FEE_RATE * price * qty  # fee maker estimada (§9/§18)
             self.inventory.record_fill(side, qty, price, fee)
             self.daily_pnl = self.inventory.realized_pnl - self.inventory.total_fees
             self.risk.update_daily_pnl(self.daily_pnl)
@@ -209,12 +210,11 @@ class MarketMaker:
         base_size = (
             config.BASE_ORDER_SIZE_XRP * config.effective_exposure_multiplier()
         )
-        bid_size, ask_size = self.alpha.choose_order_sizes(
-            snapshot, inventory, base_size
-        )
         # Agresión por inventario (§11): el lado que reduce recibe más tamaño.
-        bid_size *= self.inventory.order_side_aggression("BUY")
-        ask_size *= self.inventory.order_side_aggression("SELL")
+        # Fuente ÚNICA de skew de tamaño (decisión auditoría 2026-08-09: se
+        # eliminó choose_order_sizes/SKEW_SIZE que componían doble skew §0.6).
+        bid_size = base_size * self.inventory.order_side_aggression("BUY")
+        ask_size = base_size * self.inventory.order_side_aggression("SELL")
 
         bid_price = r - bid_dist
         ask_price = r + ask_dist
@@ -331,9 +331,6 @@ class MarketMaker:
         mid = snapshot.get("mid")
         orders = self.exec.get_orders()
 
-        has_bid = any(o["side"] == "BUY" for o in orders.values())
-        has_ask = any(o["side"] == "SELL" for o in orders.values())
-
         # Re-cotizar si el mid se movió más que el umbral (§8).
         requote = False
         if mid and self._last_mid and self._last_mid > 0:
@@ -363,7 +360,17 @@ class MarketMaker:
             if requote and age >= config.MIN_ORDER_LIFETIME_SEC:
                 self._replace_order(oid, side, new_qty, new_price, mid)
 
-        # Colocar lados faltantes (solo si el lado cotiza y hay tamaño).
+        # has_bid/has_ask se calculan DESPUÉS del loop de expire/replace:
+        # si un lado se canceló/reemplazó arriba, la reposición de este ciclo
+        # ya lo ve (sin 1 ciclo de latencia, auditoría 2026-08-09 §0.6).
+        orders = self.exec.get_orders()
+        has_bid = any(o["side"] == "BUY" for o in orders.values())
+        has_ask = any(o["side"] == "SELL" for o in orders.values())
+
+        # Colocar lados faltantes (solo si el lado cotiza, hay tamaño y el
+        # kill switch no bloqueó nuevas entradas §13).
+        if self.disable_new_entries:
+            return
         if quotes["quote_bid_ok"] and not has_bid and quotes["bid_size"] > 0:
             self._place_order("BUY", quotes["bid_size"], quotes["bid_price"], mid)
         if quotes["quote_ask_ok"] and not has_ask and quotes["ask_size"] > 0:
@@ -413,7 +420,8 @@ class MarketMaker:
 
     # ── 8. Kill switch (§13) ─────────────────────────────────────────────
     def _kill_switch_check(self, snapshot) -> bool:
-        """Evalúa el kill switch y, si se dispara, cancela todo y detiene el loop."""
+        """Evalúa el kill switch y, si se dispara, cancela todo, reduce/cierra
+        la posición y bloquea nuevas entradas (§13)."""
         state = self._risk_state_snapshot(snapshot.get("mid"))
         error_count = int(self.risk.get_state().get("error_count", 0))
         triggered, reasons = self.risk.check_kill_switch(
@@ -427,14 +435,62 @@ class MarketMaker:
             if actions.get("cancel_all"):
                 n = self.exec.cancel_all_orders()
                 logger.info("MarketMaker: canceladas %d órdenes por kill switch", n)
+            if actions.get("reduce_or_close"):
+                self._reduce_or_close(snapshot)
+            if actions.get("disable_new_entries"):
+                self.disable_new_entries = True
+                logger.info("MarketMaker: nuevas entradas bloqueadas (§13)")
             self._log_event_jsonl(config.LOG_PNL / "kill_switch.jsonl", {
                 "ts": time.time(),
                 "reasons": reasons,
                 "mid": float(snapshot.get("mid") or 0.0),
                 "ws_connected": self.ws_connected,
+                "disable_new_entries": self.disable_new_entries,
             })
             self._stop.set()
         return triggered
+
+    def _reduce_or_close(self, snapshot) -> None:
+        """Reduce o cierra la posición tras el kill switch (§13).
+
+        En dry-run (Nivel 0) no hay API: se simula el cierre marcando el
+        inventario como cerrado al mid actual (no se envían órdenes reales,
+        §0.1/§21). En modo real se coloca una orden reduce_only al mid para
+        cerrar la posición; si la API no está disponible, se registra la
+        acción manual pendiente en el journal.
+        """
+        inventory = self.inventory.inventory
+        mid = snapshot.get("mid")
+        if inventory == 0.0:
+            return
+        if mid is None or mid <= 0:
+            logger.warning("MarketMaker: sin mid válido para reduce/close (§13)")
+            return
+
+        if self.exec.dry_run:
+            # Simulación de cierre: el inventario se aclara al mid actual.
+            qty = abs(inventory)
+            side = "SELL" if inventory > 0 else "BUY"
+            fee = config.MAKER_FEE_RATE * float(mid) * qty
+            self.inventory.record_fill(side, qty, float(mid), fee)
+            self.daily_pnl = self.inventory.realized_pnl - self.inventory.total_fees
+            self.risk.update_daily_pnl(self.daily_pnl)
+            logger.info(
+                "MarketMaker: reduce/close simulado %s %.6g @ %.8g (§13)",
+                side, qty, mid,
+            )
+            return
+
+        # Modo real: orden reduce_only al mid para cerrar la posición.
+        # place_maker_order ya degrada con gracia si la API no está (offline).
+        side = "SELL" if inventory > 0 else "BUY"
+        oid, ok, reason = self.exec.place_maker_order(
+            side, abs(inventory), float(mid), reduce_only=True
+        )
+        if ok and oid:
+            logger.info("MarketMaker: reduce/close %s %s @ %.8g (§13)", side, oid, mid)
+        else:
+            logger.warning("MarketMaker: reduce/close falló: %s (§13)", reason)
 
     # ── 9. Loop principal (§8, §13, §15, §16) ────────────────────────────
     def run(self, max_cycles: int | None = None) -> None:
