@@ -1,0 +1,18 @@
+# Credenciales — NUNCA commitear (Seccion 0.5)
+.env
+API_binance_futuros.py
+
+# Datos de runtime
+logs/
+agent_decisions.jsonl
+reports/*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Herramientas / runtime (no son código del bot)
+.opencode/node_modules/
+memory/
