@@ -81,6 +81,7 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 - [x] Corrida integrada dry-run — **desbloqueada**: multiplicador de simulación implementado (§0.2). Falta solo la corrida misma con WS.
 - [x] Decidir multiplicador de simulación para dry-run — **resuelto**: `SIMULATION_QUOTE_MULTIPLIER = 1.0` en `config.py` (propuesta §0.4, confirmar con humano antes de fondos reales).
+- [x] Commit de los fixes de esta sesión (§0.3, §24) — `1e5432f`.
 - [ ] Wire `init_client(real=config.REAL)` en `run()` (testnet) — hoy `run()` arranca WS pero nunca inicializa `api.client`.
 - [ ] Confirmación humana del presupuesto de riesgo (§0.4).
 - [ ] Autorización para subir de nivel de exposición (§0.2).
@@ -95,4 +96,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 - **2026-08-09**: creado este archivo. Módulos `strategy/` completos, `market_maker.py` orquestador creado, tests Risk Engine 13/13 OK, kill switch cubierto.
 - **2026-08-09**: corregidos maker check §10 y semántica de fills `is_buyer_maker`. Nuevo `test_execution_engine.py` (14/14 OK). Auditados bugs pendientes (Nivel 0/dry-run, init_client, cancel purga local, kill switch reduce/close, NetPnL, sigma).
-- **2026-08-09**: implementada la decisión Nivel 0 con simulación (`SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()`), corregido bug de convención de side en NetPnL (bot nunca cotizaba), nuevo `test_alpha_model.py`. **Suite 37/37 OK.**
+- **2026-08-09**: implementada la decisión Nivel 0 con simulación (`SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()`), corregido bug de convención de side en NetPnL (bot nunca cotizaba), nuevo `test_alpha_model.py`. **Suite 37/37 OK.** Commit `1e5432f`.
