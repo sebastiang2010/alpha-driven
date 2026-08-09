@@ -49,14 +49,31 @@ class TestRiskEngine(unittest.TestCase):
         self.assertIn(risk_engine.REASON_POSITION_NOTIONAL, reasons)
 
     def test_rejects_order_exceeding_max_size(self):
-        # Nivel 0 (multiplicador 0.0): max order size = 0.0 => toda qty>0 rechazada.
+        # Nivel 0 (dry-run con simulación §0.2): max order size =
+        # BASE_ORDER_SIZE_XRP * SIMULATION_QUOTE_MULTIPLIER = 20.0 XRP.
+        # Una qty mayor al tamaño máximo se rechaza.
         eng = risk_engine.RiskEngine()
-        self.assertEqual(eng.max_order_size, 0.0)
+        self.assertEqual(
+            eng.max_order_size,
+            config.BASE_ORDER_SIZE_XRP * config.SIMULATION_QUOTE_MULTIPLIER,
+        )
         allowed, reasons = eng.check_order(
-            config.SYMBOL, "bid", 1.0, 0.5, 0.5, 0, _snapshot()
+            config.SYMBOL, "bid", eng.max_order_size + 1.0, 0.5,
+            (eng.max_order_size + 1.0) * 0.5, 0, _snapshot(),
         )
         self.assertFalse(allowed)
         self.assertIn(risk_engine.REASON_ORDER_SIZE, reasons)
+
+    def test_level0_simulation_allows_simulated_order(self):
+        # Nivel 0 con simulación habilitada: una orden dentro del tamaño
+        # simulado SÍ es admitida (antes el multiplicador 0.0 rechazaba toda
+        # qty>0, bloqueando la corrida integrada dry-run).
+        eng = risk_engine.RiskEngine()
+        qty = config.BASE_ORDER_SIZE_XRP * config.SIMULATION_QUOTE_MULTIPLIER / 2.0
+        allowed, reasons = eng.check_order(
+            config.SYMBOL, "bid", qty, 0.5, qty * 0.5, 0, _snapshot()
+        )
+        self.assertTrue(allowed, reasons)
 
     def test_rejects_when_max_open_orders_reached(self):
         allowed, reasons = self.engine.check_order(

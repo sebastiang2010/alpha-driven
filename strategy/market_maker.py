@@ -203,10 +203,11 @@ class MarketMaker:
             snapshot, alpha, inventory, sigma
         )  # §11
 
-        # Tamaño efectivo por nivel de exposición (§21). Nivel 0 => 0 XRP.
+        # Tamaño efectivo por nivel de exposición (§21). Nivel 0 (dry-run)
+        # simula órdenes con SIMULATION_QUOTE_MULTIPLIER (decisión aprobada
+        # §0.2); los niveles >=1 usan EXPOSURE_MULTIPLIERS sin modificar.
         base_size = (
-            config.BASE_ORDER_SIZE_XRP
-            * float(config.EXPOSURE_MULTIPLIERS.get(config.EXPOSURE_LEVEL, 0.0))
+            config.BASE_ORDER_SIZE_XRP * config.effective_exposure_multiplier()
         )
         bid_size, ask_size = self.alpha.choose_order_sizes(
             snapshot, inventory, base_size

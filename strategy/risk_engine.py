@@ -118,10 +118,13 @@ class RiskEngine:
         self.max_volatility = float(getattr(config, "MAX_VOLATILITY", MAX_VOLATILITY))
 
         # Tamaño máximo de orden por nivel de exposición. Nivel 0 (dry-run)
-        # tiene multiplicador 0.0 => ninguna orden qty>0 es admitida.
-        level = int(config.EXPOSURE_LEVEL)
-        multiplier = float(config.EXPOSURE_MULTIPLIERS.get(level, 0.0))
-        config_max_order_size = float(config.BASE_ORDER_SIZE_XRP) * multiplier
+        # usa SIMULATION_QUOTE_MULTIPLIER (decisión aprobada §0.2: simula
+        # órdenes en vez del multiplicador 0.0 del nivel 0). Los niveles
+        # reales (>=1) usan EXPOSURE_MULTIPLIERS y NO se modifican.
+        config_max_order_size = (
+            float(config.BASE_ORDER_SIZE_XRP)
+            * config.effective_exposure_multiplier()
+        )
         # override SOLO para tests (§12): permite anular el tamaño máximo.
         if max_order_size_override is not None:
             self.max_order_size = float(max_order_size_override)

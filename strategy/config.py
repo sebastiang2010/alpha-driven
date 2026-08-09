@@ -58,6 +58,28 @@ EXPOSURE_LEVEL: int = 0
 # multiplicando el tamaño base por este multiplicador.
 EXPOSURE_MULTIPLIERS: dict = {0: 0.0, 1: 1.0, 2: 2.0, 3: 4.0}
 
+# Multiplicador de simulación para el Nivel 0 (dry-run) (§0.1/§21).
+# Decisión aprobada (§0.2): en EXPOSURE_LEVEL=0 el bot NO queda bloqueado en
+# tamaño 0: simula órdenes usando este multiplicador en lugar del 0.0 del
+# nivel 0. Esto habilita la corrida integrada dry-run. Jamás se envían
+# órdenes reales en Nivel 0 (§0.1/§21).
+# PROPUESTA pendiente de confirmación (§0.4).
+SIMULATION_QUOTE_MULTIPLIER: float = 1.0
+
+
+def effective_exposure_multiplier() -> float:
+    """Multiplicador efectivo según el nivel de exposición actual.
+
+    Nivel 0 (dry-run): usa SIMULATION_QUOTE_MULTIPLIER (decisión aprobada
+    §0.2 — simula órdenes en vez de bloquear a tamaño 0).
+    Niveles >= 1: usa EXPOSURE_MULTIPLIERS[level] (sin cambios, subir de
+    nivel requiere autorización humana §0.2).
+    """
+    level = int(EXPOSURE_LEVEL)
+    if level == 0:
+        return float(SIMULATION_QUOTE_MULTIPLIER)
+    return float(EXPOSURE_MULTIPLIERS.get(level, 0.0))
+
 # ---------------------------------------------------------------------------
 # Tamaños de orden (§3)
 # ---------------------------------------------------------------------------

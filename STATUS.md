@@ -20,6 +20,7 @@
 | `strategy/market_maker.py` | ✅ Creado | Orquestador que integra todos los módulos. |
 | Tests Risk Engine (§12) | ✅ **13/13 OK** | `python -m unittest strategy.tests.test_risk_engine -v`. Incluye kill switch (§13). |
 | Tests Execution Engine (§9-§10) | ✅ **14/14 OK** | `python -m unittest strategy.tests.test_execution_engine -v`. Maker check §10 + fills is_buyer_maker. |
+| Tests AlphaModel (§6/§9) | ✅ **10/10 OK** | `python -m unittest strategy.tests.test_alpha_model -v`. Convención de side + NetPnL + alpha acotada. |
 | Kill switch (§13) | ✅ Cubierto | 4 tests: daily loss, price anomaly, ws disconnect, no disparo normal. |
 | `logs/` | ✅ Creado | `decisions/`, `fills/`, `market_data/`, `orders/`, `pnl/`. |
 | `reports/` | ⚠️ Vacío | Sin reportes generados todavía. |
@@ -59,6 +60,11 @@ Estos valores en `config.py` son **propuestas conservadoras**; **NO operar con f
 Corregidos en esta sesión:
 - **Maker check §10** (`execution_engine._maker_check_ok`): exigía `price <= best_bid` (BUY) / `price >= best_ask` (SELL), rechazando cotizaciones válidas dentro del spread. Ahora: BUY es maker si `price < best_ask`, SELL si `price > best_bid`.
 - **Fills** (`execution_engine.process_fills_from_trades`): condiciones de `is_buyer_maker` invertidas; un BUY resting nunca se marcaba filled. Ahora usa la semántica de Binance (documentada en `market_state.update_trade`).
+- **Decisión Nivel 0 con simulación IMPLEMENTADA** (§0.2): `SIMULATION_QUOTE_MULTIPLIER` en `config.py` (antes solo documentada en AGENTS.md, nunca existió en el código). Nuevo helper `config.effective_exposure_multiplier()` usado por `risk_engine` y `market_maker._compute_quotes` (fuente única, §0.4). Con esto el Nivel 0 ya no queda bloqueado en tamaño 0.
+- **Bug de convención de side (§0.6)**: `expected_net_pnl_estimate` solo reconocía `"bid"/"ask"` pero `_compute_quotes` le pasaba `"BUY"/"SELL"` → devolvía 0.0 siempre → `quote_*_ok=False` → el bot NUNCA cotizaba (ni en dry-run simulado). Ahora acepta ambas convenciones. Cubierto con `test_alpha_model.py` (10 tests).
+- **Test de Risk Engine actualizado**: Nivel 0 con simulación ya NO tiene `max_order_size == 0.0`; ahora es `BASE_ORDER_SIZE_XRP * SIMULATION_QUOTE_MULTIPLIER` (= 20.0 XRP). Nuevo test verifica que una orden dentro del tamaño simulado es admitida.
+
+**Suite completa: 37/37 OK** (`python -m unittest discover -s strategy/tests`).
 
 Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **Nivel 0 y dry-run**: con `EXPOSURE_MULTIPLIERS[0] = 0.0`, `base_size = 0` → `quote_bid_ok/ask_ok = False` → el dry-run no coloca (ni simula) ninguna orden. Bloquea la primera corrida integrada (§0.4 — decidir multiplicador de simulación o subir nivel con autorización).
@@ -73,12 +79,12 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 ## Pendiente
 
-- [ ] Corrida integrada dry-run — bloqueada por el multiplicador de Nivel 0 (ver Hallazgos).
-- [ ] Decidir multiplicador de simulación para dry-run o autorizar subida de nivel (§0.2).
+- [x] Corrida integrada dry-run — **desbloqueada**: multiplicador de simulación implementado (§0.2). Falta solo la corrida misma con WS.
+- [x] Decidir multiplicador de simulación para dry-run — **resuelto**: `SIMULATION_QUOTE_MULTIPLIER = 1.0` en `config.py` (propuesta §0.4, confirmar con humano antes de fondos reales).
+- [ ] Wire `init_client(real=config.REAL)` en `run()` (testnet) — hoy `run()` arranca WS pero nunca inicializa `api.client`.
 - [ ] Confirmación humana del presupuesto de riesgo (§0.4).
 - [ ] Autorización para subir de nivel de exposición (§0.2).
-- [ ] Wire `init_client(real=config.REAL)` en `run()` (testnet).
-- [ ] Endurecer `cancel_order_by_id` (no purgar si la API falla).
+- [ ] Endurecer `cancel_order_by_id` (no purgar local si la API falla) (§0.6).
 - [ ] Implementar reduce/close en kill switch (§13).
 - [ ] NetPnL con funding + slippage; unificar fee en config (§18).
 - [ ] Reescalar sigma a intervalo fijo (§0.6).
@@ -89,3 +95,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 - **2026-08-09**: creado este archivo. Módulos `strategy/` completos, `market_maker.py` orquestador creado, tests Risk Engine 13/13 OK, kill switch cubierto.
 - **2026-08-09**: corregidos maker check §10 y semántica de fills `is_buyer_maker`. Nuevo `test_execution_engine.py` (14/14 OK). Auditados bugs pendientes (Nivel 0/dry-run, init_client, cancel purga local, kill switch reduce/close, NetPnL, sigma).
+- **2026-08-09**: implementada la decisión Nivel 0 con simulación (`SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()`), corregido bug de convención de side en NetPnL (bot nunca cotizaba), nuevo `test_alpha_model.py`. **Suite 37/37 OK.**

@@ -227,6 +227,10 @@ class AlphaModel:
 
         bid: (mid - price) * qty - price * qty * maker_fee
         ask: (price - mid) * qty - price * qty * maker_fee
+
+        Acepta side en cualquiera de las dos convenciones usadas en el repo:
+        "bid"/"ask" (risk_engine) o "BUY"/"SELL" (execution_engine). Evita
+        el bug de convención inconsistente (§0.6) que devolvía 0.0 siempre.
         """
         mid = snapshot.get("mid")
         if mid is None or mid <= 0:
@@ -235,8 +239,9 @@ class AlphaModel:
         fee_rate = max(float(maker_fee), 0.0)
         fees = float(price) * float(qty) * fee_rate
 
-        if side == "bid":
+        side_norm = str(side).upper()
+        if side_norm in ("BID", "BUY"):
             return (float(mid) - float(price)) * float(qty) - fees
-        if side == "ask":
+        if side_norm in ("ASK", "SELL"):
             return (float(price) - float(mid)) * float(qty) - fees
         return 0.0
