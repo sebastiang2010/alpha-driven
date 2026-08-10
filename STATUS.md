@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-09.
+> Última actualización: 2026-08-10.
 
 ---
 
@@ -26,7 +26,7 @@
 | `reports/` | ⚠️ Vacío | Sin reportes generados todavía. |
 | Git | ✅ Inicializado | 1 commit (`4bf0ae7`, módulos base + tests). `.gitignore` protege credenciales. |
 
-**Regla §0.1**: testnet primero, mainnet SOLO con autorización humana explícita. El bot está en **dry-run / testnet** (`EXPOSURE_LEVEL=0`, `REAL=False`).
+**Regla §0.1**: testnet primero, mainnet SOLO con autorización humana explícita. **Mainnet OPERADA por primera vez el 2026-08-10** (`REAL=True`, `EXPOSURE_LEVEL=1`, autorización explícita §0.2 + confirmación interactiva `CONFIRMAR`).
 
 ---
 
@@ -105,8 +105,8 @@ Corregidos en esta sesión:
 **Suite completa: 37/37 OK** (`python -m unittest discover -s strategy/tests`).
 
 Pendientes de decisión (NO corregidos aún — ver Pendiente):
-- **Nivel 0 y dry-run**: con `EXPOSURE_MULTIPLIERS[0] = 0.0`, `base_size = 0` → `quote_bid_ok/ask_ok = False` → el dry-run no coloca (ni simula) ninguna orden. Bloquea la primera corrida integrada (§0.4 — decidir multiplicador de simulación o subir nivel con autorización).
-- **`init_client` nunca se llama**: en modo real (aun testnet) `api.client` es `None` y todo REST falla. `run()` debería llamar `api.init_client(real=config.REAL)` (testnet permitido por §0.1).
+- ~~**Nivel 0 y dry-run**: con `EXPOSURE_MULTIPLIERS[0] = 0.0`, `base_size = 0` → `quote_bid_ok/ask_ok = False` → el dry-run no coloca (ni simula) ninguna orden. Bloquea la primera corrida integrada (§0.4 — decidir multiplicador de simulación o subir nivel con autorización).~~ **RESUELTO 2026-08-09**: `SIMULATION_QUOTE_MULTIPLIER` + `effective_exposure_multiplier()` (ver historial).
+- ~~**`init_client` nunca se llama**: en modo real (aun testnet) `api.client` es `None` y todo REST falla. `run()` debería llamar `api.init_client(real=config.REAL)` (testnet permitido por §0.1).~~ **RESUELTO 2026-08-09** (commit `db4a115`): `init_client()` conectado en `run()`, degrada offline; en mainnet `REAL=True` lo inicializa con credenciales reales.
 - **`cancel_order_by_id` purga local aunque el cancel falle en la API** → orden fantasma del lado del exchange (§0.6).
 - **Kill switch**: `reduce_or_close`/`disable_new_entries` declarados pero `market_maker` solo ejecuta `cancel_all` (§13).
 - **NetPnL** omite funding y slippage en `expected_net_pnl_estimate` (§18); `MAKER_FEE_RATE` duplicada en 2 módulos (§0.4).
@@ -119,7 +119,7 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 - [x] Confirmación humana del presupuesto de riesgo (§0.4). — **CONFIRMADO (2026-08-09)**: `MAX_DAILY_LOSS_USDC=10.0`, `MAX_POSITION_NOTIONAL_USDC=25.0`, `MAX_DRAWDOWN_PCT=0.05`, `MAX_LEVERAGE_USED=20` (=máximo real: requiredMarginPercent 5.0%→20x, verificado en exchangeInfo), `BASE_ORDER_SIZE_XRP=5.0` (≈$5.17 > minNotional $5). Flag `BUDGETS_CONFIRMED=True` en config; `run_mainnet.py` aborta si es False.
 - [x] Autorización para subir de nivel de exposición (§0.2). — **CONFIRMADO (2026-08-09)**: `EXPOSURE_LEVEL=1` (mainnet mínimo). Mainnet queda BLOQUEADO hasta: correr `run_mainnet.py` con confirmación interactiva `CONFIRMAR` (§0.2) y pre-flight OK (posición 0, leverage ≤ 20x real, PERCENT_PRICE, mark price).
-- [ ] Decidir si `config.REAL=True` se fija al momento de la corrida mainnet (hoy False; el gate de `market_maker.run()` exige `REAL=True and EXPOSURE_LEVEL>=1`).
+- [x] Decidir si `config.REAL=True` se fija al momento de la corrida mainnet (hoy False; el gate de `market_maker.run()` exige `REAL=True and EXPOSURE_LEVEL>=1`). — **HECHO (2026-08-10)**: `REAL=True` aplicado en commit `13c38bf` (autorización §0.2), `BASE_ORDER_SIZE_XRP` ajustado de 5.0 a **4.9** (=mínimo exacto: 5 USDC ÷ precio ÷ stepSize 0.1 → 4.9 XRP ≈ $5.05 ≥ minNotional $5; cumple mientras precio > $1.0204).
 - [ ] Confirmación humana de la recalibración de alpha (pesos + `ALPHA_MAX=0.0005`, §0.4).
 - [ ] Investigar el modelo de costos (§18): con `MAKER_FEE_RATE+FUNDING_RATE+SLIPPAGE_RATE = 0.0004` y spread p50≈0.0003, el edge mínimo exigido (≈0.00042) es MAYOR que el spread típico → ninguna quote maker puede ser NetPnL-positiva salvo `reduce_only`. Sospecha: `FUNDING_RATE` aplicado como costo por-trade plano, pero el funding real se cobra periódico (cada 8 h) sobre notional, no por fill. Revisar `expected_net_pnl_estimate` y cómo se aplica. — **Resuelto (2026-08-09)**: funding ahora proporcional al hold time (`FUNDING_RATE_PER_8H` × hold/28800) y slippage maker 0 (`SLIPPAGE_MAKER_BPS`). Quotes con edge real dentro del spread son operables. Ver "Modelo de costos §18" en auditoría.
 - [ ] Endurecer `cancel_order_by_id` (no purgar local si la API falla) (§0.6).
@@ -141,4 +141,4 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 - **2026-08-09**: **corregido doble conteo de alpha (§8)** — el gate en vivo lo detectó (ask a mid+2%, 0/4 decisiones `ok`). `ALPHA_QUOTE_FACTOR` 1.0 → 0.0; recalibrada la señal a escala de spread (`ALPHA_MAX` 0.01 → 0.0005, `IMBALANCE_WEIGHT`/`TRADE_FLOW_WEIGHT` → 0.003, conservador "pendiente de confirmación" §0.4). 2 tests de regresión nuevos. **GATE OK en vivo post-fix (4/4)**, suite 50/50 OK.
 - **2026-08-09**: **corregido modelo de costos §18** — funding era costo fijo por fill (0.0001) pero Binance lo cobra cada 8 h sobre notional; slippage 0.0001 por fill sobrestimaba un maker GTX que nunca cruza. Ahora: `FUNDING_RATE_PER_8H` × `EXPECTED_HOLD_SEC`/`FUNDING_INTERVAL_SEC` (≈0.00000104/trade) + `SLIPPAGE_MAKER_BPS=0.0` + fee único de config. 4 tests nuevos (`TestModeloDeCostos`): quote con edge de 3 ticks dentro del spread ahora operable donde antes NetPnL<0. Suite **54/54 OK**.
 - **2026-08-09**: **verificación en vivo del fix §18** — `run_dry_run.py --cycles 5`: GATE OK 4/4 `reason=ok` (antes 13/19 rechazadas por `expected_net_pnl_non_positive`). Commit `f2e4081`.
-- **2026-08-10**: **autorización humana §0.2/§0.4 aplicada — preparación mainnet Nivel 1**. `EXPOSURE_LEVEL=1`, `MAX_LEVERAGE_USED=20` (=máximo real 20x, 75x imposible: IM 1.33% < MM 2.5%), `BASE_ORDER_SIZE_XRP=5.0` (≈$5.17 > minNotional $5), `BUDGETS_CONFIRMED=True`. Gate de `market_maker.run()` refactorizado: `REAL=True and EXPOSURE_LEVEL>=1` → `init_client(real=True)`; cualquier otra combinación queda en testnet. Creado `run_mainnet.py` (confirmación interactiva CONFIRMAR §0.2 + pre-flight: posición=0, leverage vs real, PERCENT_PRICE, mark price; exit codes 0/1/2/3). Adaptaciones §0.2 reportadas: no existe `get_funding_rate` (omiso; modelo usa `FUNDING_RATE_PER_8H`), `requiredMarginPercent`/PERCENT_PRICE vía `api.get_symbol` (función real existente, sin duplicar API). Suite 54/54 OK. **Mainnet NO operada**: requiere `config.REAL=True` + correr `run_mainnet.py` con confirmación.
+- **2026-08-10**: **PRIMERA CORRIDA MAINNET OPERADA** (exit 0, 123.8 s, 20 ciclos). Fix previo `345c7a7`: `reconcile_position` distinguía posición vacía (dict `positionAmt=0`) de error API (`None`) — el pre-flight abortaba con cuenta limpia (exit 3) en el primer intento. Lanzamiento: `echo CONFIRMAR | python run_mainnet.py --cycles 20` → pre-flight OK (posición 0, filtros reales: min_notional 5.0, step 0.1, tick 0.0001; leverage 20x; PERCENT_PRICE ±5%; mark 1.0273), **8 órdenes reales colocadas** (bid/ask size **4.9000** = mínima exacta), 0 fills, kill_switch 0, GATE OK (sin simuladas). 8/19 decisiones reason==ok; resto `expected_net_pnl_non_positive:bid` (filtro §18 correcto: spread ~0.0001 no cubre fees en el lado bid). Pendientes menores: DeprecationWarning `utcnow()` (`run_mainnet.py:284`), UnicodeEncodeError cp1252 al loguear `→` (cosmético), error transitorio `get_symbol` antes de `init_client` (no fatal). Corrida extendida 500 ciclos lanzada en monitoreo.
