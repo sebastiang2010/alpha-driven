@@ -1,0 +1,590 @@
+% =====================================================================
+%  estrategia_market_making.tex
+%  Documentación técnica — Bot de Market Making adaptativo
+%  Instrumento: XRPUSDC — Binance Futures (USDS-M)
+%  Compilar: pdflatex -interaction=nonstopmode -output-directory=doc
+%            doc/estrategia_market_making.tex  (ejecutar 2 veces)
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage{amsmath,amssymb}
+\usepackage[margin=2.4cm]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\parskip}{0.4em}
+\setlength{\parindent}{0pt}
+
+\newcommand{\codigo}[1]{\texttt{#1}}
+\newcommand{\symbolname}[1]{\textsc{#1}}
+
+\title{\bfseries Bot de \emph{Market Making} Adaptativo\\[0.5em]
+{\large XRPUSDC — Binance Futures (USDS-M)}\\[1.2em]
+{\normalsize Documentación técnica de la estrategia v1.0}}
+\author{Proyecto \emph{alpha-driven}}
+\date{10 de agosto de 2026}
+
+\begin{document}
+
+\maketitle
+
+% =====================================================================
+% RESUMEN EJECUTIVO
+% =====================================================================
+\section*{Resumen ejecutivo}
+\addcontentsline{toc}{section}{Resumen ejecutivo}
+
+Este documento describe la estrategia de \emph{market making} adaptativo
+implementada en el repositorio \codigo{alpha-driven}: un bot que cotiza
+simultáneamente un precio de compra (bid) y uno de venta (ask) alrededor
+del precio medio del libro de órdenes del par \codigo{XRPUSDC} en
+Binance Futures (USDS-M), con tamaño y \emph{spread} ajustados por la
+volatilidad observada y el inventario acumulado. El objetivo es capturar
+el \emph{spread} como ingreso neto de comisiones, \emph{funding} y
+deslizamiento (NetPnL $> 0$, véase §6).
+
+La implementación cumple las reglas no negociables de la Sección 0 de la
+especificación (§1): testnet primero, presupuestos de riesgo definidos
+como constantes, kill switch probado explícitamente y detención ante
+situaciones irreconciliables. La decisión de diseño aprobada habilita la
+corrida integrada \emph{dry-run} en Nivel de exposición 0 sin enviar
+órdenes reales. A la fecha de este documento la estrategia operó su
+primera corrida en mainnet (autorización humana explícita, §0.2) con
+resultados de reconciliación exitosos; los presupuestos de riesgo siguen
+marcados como propuestas pendientes de confirmación (§0.4).
+
+\subsection*{Tablero de estado (al 10/08/2026)}
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Componente} & \textbf{Estado} \\
+\midrule
+Risk Engine (tests unitarios) & 13/13 OK \\
+Execution Engine (tests unitarios) & 14/14 OK \\
+Alpha Model (tests unitarios) & 18/18 OK \\
+Kill switch (prueba explícita) & 4/4 OK \\
+Primera corrida mainnet & Operada: 8 órdenes reales, 4.9 XRP, exit 0 \\
+Presupuestos de riesgo & Propuestos, pendientes de confirmación (§0.4) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+% 1. OBJETIVO Y REGLAS NO NEGOCIABLES
+% =====================================================================
+\section{Objetivo y reglas no negociables (§0)}
+
+\subsection{Objetivo}
+El sistema debe generar ganancia neta consistente operando como
+\emph{market maker} en el par \codigo{XRPUSDC} de Binance Futures,
+adaptando su comportamiento a la volatilidad del mercado y al inventario
+acumulado, sin superar nunca los límites de riesgo definidos en
+\codigo{config.py}.
+
+\subsection{Reglas no negociables (§0)}
+Las siguientes reglas tienen prioridad sobre el resto de la
+especificación y sobre cualquier decisión operativa:
+
+\begin{enumerate}
+  \item \textbf{Testnet primero.} Mainnet SOLO con autorización humana
+  explícita. No se llama \codigo{init\_client(real=True)} ni
+  \codigo{set\_testnet(False)} sin esa autorización (§0.1).
+  \item \textbf{Detenerse y preguntar} ante: primera orden en mainnet,
+  subir el Nivel de exposición, kill switch activado, falta de una
+  función de API (no escribir implementación paralela), posición no
+  reconciliable o credenciales nuevas (§0.2).
+  \item \textbf{Presupuesto de riesgo} como constantes en
+  \codigo{config.py}, nunca números improvisados (§0.4):
+  \begin{equation*}
+    \codigo{MAX\_DAILY\_LOSS\_USDC} \qquad
+    \codigo{MAX\_POSITION\_NOTIONAL\_USDC} \qquad
+    \codigo{MAX\_DRAWDOWN\_PCT} \qquad
+    \codigo{MAX\_LEVERAGE\_USED}
+  \end{equation*}
+  Si no están definidos: proponer valores conservadores, marcarlos
+  ``pendiente de confirmación'' y no operar con fondos reales.
+  \item \textbf{Credenciales} (§0.5): nunca loguearlas, imprimirlas,
+  commitearlas ni rotarlas sin preguntar. \codigo{.env} está en
+  \codigo{.gitignore}.
+  \item \textbf{Commits chicos y frecuentes} (§0.3) y \codigo{STATUS.md}
+  actualizado cada 15--20 minutos.
+\end{enumerate}
+
+\subsection{Decisión de diseño aprobada: Nivel 0 / dry-run}
+Cuando $\codigo{EXPOSURE\_LEVEL}=0$ el bot NO queda bloqueado en tamaño
+cero: puede simular órdenes usando la constante de simulación
+$\codigo{SIMULATION\_QUOTE\_MULTIPLIER}$ de \codigo{config.py} en lugar
+del multiplicador $0.0$ del nivel 0. Esto habilita la corrida integrada
+\emph{dry-run}. Los niveles reales ($\geq 1$) NO se modifican y subirlos
+sigue requiriendo autorización humana (§0.2). En Nivel 0 jamás se envían
+órdenes reales (§0.1/§21).
+
+% =====================================================================
+% 2. ARQUITECTURA
+% =====================================================================
+\section{Arquitectura}
+
+\subsection{Interfaz única con Binance}
+\codigo{API\_binance\_futuros.py} es la única interfaz con Binance
+Futures (§1). No se duplican funciones que ya existen; ante una función
+faltante se debe detener y preguntar (§0.2). Sus características:
+
+\begin{itemize}
+  \item Inicialización: \codigo{init\_client(real: bool = False)}.
+  Testnet usa el modo nativo de \codigo{python-binance}; mainnet fuerza
+  URLs reales.
+  \item Los métodos devuelven \codigo{BinanceAPIException} como
+  resultado en vez de lanzarla: el llamador debe chequear el tipo de
+  retorno.
+  \item \codigo{\_call\_with\_retry(func, retries=2, delay=0.5, ...)}
+  envuelve las llamadas críticas.
+  \item Sincronización de tiempo: \codigo{adjust\_client\_time()} más un
+  hilo daemon cada 300~s que fija \codigo{client.timestamp\_offset}.
+\end{itemize}
+
+\subsection{WebSocket para datos en tiempo real}
+El flujo de datos es por WebSocket; REST se usa solo para configuración,
+estado, órdenes, recuperación y reconciliación (§2). URLs: real
+\codigo{wss://fstream.binance.com/public/ws}, testnet
+\codigo{wss://stream.binancefuture.com/public/ws}. Reintento cada 5~s
+con \codigo{ping\_interval=20}. Si se superan los reintentos, se activa
+el kill switch (§13).
+
+Los módulos expuestos y sus callbacks:
+\begin{itemize}
+  \item \codigo{websocket\_bookticker.py} $\rightarrow$
+  \codigo{BookTickerWebSocket(symbol, on\_bookticker, real=False)},
+  stream $\{\text{symbol}\}$@bookTicker. Callback:
+  \codigo{on\_bookticker(bid\_price, bid\_qty, ask\_price, ask\_qty, timestamp)}.
+  \item \codigo{websocket\_depth.py} $\rightarrow$
+  \codigo{DepthWebSocket(symbol, on\_depth, real=False, depth\_levels=5)},
+  stream $\{\text{symbol}\}$@depth\{levels\}@100ms. Callback:
+  \codigo{on\_depth(bids, asks, depth, timestamp)} con \codigo{bids} y
+  \codigo{asks} como listas $[\text{precio},\,\text{qty}]$.
+  \item \codigo{websocket\_trades.py} $\rightarrow$
+  \codigo{TradeWebSocket(symbol, on\_trade, real=False)}, stream
+  $\{\text{symbol}\}$@trade. Callback:
+  \codigo{on\_trade(price, qty, is\_buyer\_maker, timestamp)}.
+\end{itemize}
+
+\subsection{Flujo de datos}
+El estado de mercado (\codigo{market\_state.py}) consume los tres
+streams, mantiene libro, últimos precios y régimen de volatilidad con
+\codigo{threading.Lock}. El \codigo{market\_maker.py} es el orquestador:
+cada ciclo calcula cotizaciones, consulta el Risk Engine y delega el
+envío al \codigo{execution\_engine.py}. El
+\codigo{inventory\_manager.py} lleva el inventario y el PnL realizado.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Capas} & \textbf{Módulos} \\
+\midrule
+Datos & \codigo{websocket\_bookticker/depth/trades.py}, \codigo{market\_state.py} \\
+Lógica & \codigo{alpha\_model.py} (cotizaciones), \codigo{inventory\_manager.py} \\
+Riesgo & \codigo{risk\_engine.py} (rechazos y kill switch) \\
+Ejecución & \codigo{execution\_engine.py} \\
+Orquestación & \codigo{market\_maker.py}, \codigo{run\_dry\_run.py}, \codigo{run\_mainnet.py} \\
+Configuración & \codigo{config.py} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Instrumento}
+El instrumento es \codigo{XRPUSDC}, con el símbolo como parámetro de
+configuración (no hardcodeado). Las specs reales del símbolo
+(precisiones, tick/step size, min quantity/notional) se consultan
+dinámicamente — nunca se asumen (§3).
+
+% =====================================================================
+% 3. ESTRATEGIA DE COTIZACIÓN
+% =====================================================================
+\section{Estrategia de cotización}
+
+\subsection{Régimen de volatilidad}
+La volatilidad se estima como el desvío estándar muestral de los
+retornos logarítmicos del precio medio del libro:
+
+\begin{equation}
+  r_t = \ln\!\left(\frac{P_t^{\mathrm{mid}}}{P_{t-1}^{\mathrm{mid}}}\right),
+  \qquad
+  \hat{\sigma} = \sqrt{\frac{1}{n-1}\sum_{t=1}^{n}\left(r_t - \bar{r}\right)^2}
+\end{equation}
+
+donde $n$ es el número de retornos en la ventana
+(\codigo{VOLATILITY\_WINDOW\_SEC}) y cada retorno corresponde al
+intervalo de muestreo \codigo{SAMPLING\_INTERVAL\_SEC} (5~s). La
+volatilidad NO se anualiza (§0.6). Como la ventana puede tener huecos,
+el régimen se reescala a un intervalo de referencia
+\codigo{INTERVALS\_PER\_MINUTE} $= 12$:
+
+\begin{equation}
+  \hat{\sigma}_{\min} = \hat{\sigma}\cdot\sqrt{12},
+  \qquad
+  \hat{\sigma}_{\mathrm{ref}}
+  = \hat{\sigma}\cdot\sqrt{\frac{\codigo{SAMPLING\_INTERVAL\_SEC}}
+  {\text{intervalo medio observado}}}
+\end{equation}
+
+\emph{Convención crítica (§0.6):} cada factor $\sqrt{T}$ se aplica
+exactamente una vez. La volatilidad \emph{efectiva} que escala las
+distancias de cotización es:
+
+\begin{equation}
+  \sigma_{\mathrm{efectiva}}
+  = \hat{\sigma}_{\min}\cdot\sqrt{\codigo{CYCLE\_INTERVAL\_SEC}}
+  = \hat{\sigma}\cdot\sqrt{12}\cdot\sqrt{\codigo{CYCLE\_INTERVAL\_SEC}}
+\end{equation}
+
+Aplicar $\sqrt{T}$ dos veces (volatilidad anualizada y luego reescalada
+por el ciclo) es un error conocido del proyecto (§0.6) y está cubierto
+por tests del alpha model.
+
+\subsection{Precio medio y spread objetivo}
+El precio medio del libro (mid) se calcula con el mejor bid y el mejor
+ask:
+
+\begin{equation}
+  P_{\mathrm{mid}} = \frac{P_{\mathrm{bid}} + P_{\mathrm{ask}}}{2}
+\end{equation}
+
+El \emph{spread} objetivo es proporcional a la volatilidad efectiva:
+
+\begin{equation}
+  S = k\cdot\sigma_{\mathrm{efectiva}}
+\end{equation}
+
+donde $k$ es un factor de escala de \codigo{config.py}. A mayor
+volatilidad, mayor spread para compensar el riesgo de inventario.
+
+\subsection{Precios de cotización (bid/ask) con skew}
+El modelo ajusta los precios alrededor del mid con un sesgo
+(\emph{skew}) dependiente del inventario: si se tiene inventario largo
+(comprado), la cotización de venta se acerca al mid (incentivo a
+desacumular) y la de compra se aleja; simétricamente para inventario
+corto:
+
+\begin{equation}
+  P_{\mathrm{bid}} = P_{\mathrm{mid}} - \frac{S}{2} + \delta_{\mathrm{inv}},
+  \qquad
+  P_{\mathrm{ask}} = P_{\mathrm{mid}} + \frac{S}{2} + \delta_{\mathrm{inv}}
+\end{equation}
+
+con el sesgo $\delta_{\mathrm{inv}}$ calculado por
+\codigo{alpha\_model.py} en función del inventario normalizado
+(convención de signo: inventario $> 0$ es LARGO, $< 0$ es CORTO; en el
+libro, \codigo{BUY} suma cantidad e \codigo{SELL} resta). Los precios se
+redondean al \emph{tick size} del símbolo consultado dinámicamente (§3).
+
+\subsection{Tamaños de orden y clamp}
+El tamaño base de cada lado es \codigo{BASE\_ORDER\_SIZE\_XRP}. Cuando
+ya existe inventario, el tamaño del lado que reduce inventario
+(\emph{reduce}) se calcula como:
+
+\begin{equation}
+  q_{\mathrm{reduce}}
+  = \min\!\bigl(\codigo{MAX\_ORDER\_SIZE\_XRP},\;
+    |\text{inventario}| + \codigo{BASE\_ORDER\_SIZE\_XRP}\bigr)
+\end{equation}
+
+El clamp contra \codigo{MAX\_ORDER\_SIZE\_XRP} es necesario porque una
+orden de reducción no debe superar el tamaño máximo de orden del
+símbolo: durante la primera corrida mainnet se observó el error de
+Binance \codigo{order\_size\_exceeded} con inventario de 4.9~XRP, que
+bloqueaba la reducción de posición. Con el clamp, el lado reduce queda
+acotado a \codigo{MAX\_ORDER\_SIZE\_XRP} y la posición se puede
+desacumular sin error (fix 632f9c3).
+
+El tamaño total expuesto por lado queda limitado por el Risk Engine
+(§4); en Nivel 0 el multiplicador de cotización es
+$\codigo{SIMULATION\_QUOTE\_MULTIPLIER}$ (decisión de diseño aprobada,
+§1.3).
+
+% =====================================================================
+% 4. RISK ENGINE
+% =====================================================================
+\section{Risk Engine}
+
+\subsection{Rol}
+El Risk Engine (\codigo{risk\_engine.py}) es un módulo independiente que
+lee los límites de \codigo{config.py} y decide si una operación es
+admisible. Toda orden propuesta pasa por él antes de enviarse; ante un
+rechazo (\codigo{allowed=False}) la orden no se envía. Debe ser probado
+con tests unitarios que verifiquen los rechazos (§12) — actualmente
+13/13 OK.
+
+\subsection{Presupuestos como desigualdades}
+Los límites son constantes en \codigo{config.py} (§0.4), propuestas
+conservadoras pendientes de confirmación humana:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Límite} & \textbf{Desigualdad} \\
+\midrule
+Pérdida diaria & $\text{pérdida del día} \leq \codigo{MAX\_DAILY\_LOSS\_USDC}$ \\
+Nocional de posición & $|q\cdot P| \leq \codigo{MAX\_POSITION\_NOTIONAL\_USDC}$ \\
+Drawdown & $\text{drawdown} \leq \codigo{MAX\_DRAWDOWN\_PCT}$ \\
+Apalancamiento & $\text{apalancamiento} \leq \codigo{MAX\_LEVERAGE\_USED}$ \\
+Tamaño de orden & $q \leq \codigo{MAX\_ORDER\_SIZE\_XRP}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Si no estuvieran definidos, el bot no operaría con fondos reales.
+
+\subsection{Niveles de exposición}
+El multiplicador de tamaño se controla con
+$\codigo{EXPOSURE\_LEVEL} \in \{0,1,2,3\}$:
+
+\begin{center}
+\begin{longtable}{cll}
+\toprule
+\textbf{Nivel} & \textbf{Modo} & \textbf{Comportamiento} \\
+\midrule
+\endhead
+$0$ & Dry-run & Simulación en memoria con
+$\codigo{SIMULATION\_QUOTE\_MULTIPLIER}$. Jamás envía órdenes reales. \\
+$1$ & Testnet real & Tamaño reducido; operación real solo en testnet. \\
+$2$ & Testnet completo & Tamaño nominal con los límites de config. \\
+$3$ & Mainnet & Operación real con fondos. Exige autorización humana explícita (§0.1/§0.2). \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+Subir de nivel de exposición real requiere autorización humana (§0.2).
+
+\subsection{Kill switch (§13)}
+El kill switch se activa ante cualquiera de estas condiciones:
+pérdida excesiva, comportamiento anómalo, WebSocket desconectado, estado
+inconsistente, órdenes desconocidas, posición no reconciliada, error de
+API repetitivo, precio anómalo, pérdida de sincronización o exposición
+inesperada.
+
+Procedimiento de emergencia:
+\begin{enumerate}
+  \item Cancelar TODAS las órdenes abiertas
+  (\emph{cancel all open orders}).
+  \item Reconciliar la posición real contra el estado interno.
+  \item Nunca asumir que cancelar órdenes implica no tener posición:
+  el inventario se verifica contra la cuenta.
+\end{enumerate}
+
+El kill switch debe probarse explícitamente antes de confiar en él
+(§13) — cubierto por 4 tests OK. En Nivel 0, su activación es análoga
+pero no toca la cuenta real.
+
+% =====================================================================
+% 5. EJECUCIÓN Y RECONCILIACIÓN
+% =====================================================================
+\section{Ejecución y reconciliación}
+
+\subsection{Órdenes maker}
+Todas las órdenes son \emph{maker} (post-only) para capturar el spread
+sin pagar comisiones de taker:
+
+\begin{itemize}
+  \item \codigo{timeInForce='GTX'} (post-only) en cada orden.
+  \item \codigo{positionSide='BOTH'} (modo one-way).
+  \item \codigo{reduceOnly=True} cuando corresponde (lado que reduce
+  inventario).
+  \item Tamaño y precio validados contra \emph{min quantity}, \emph{min
+  notional}, \emph{tick size} y \codigo{PERCENT\_PRICE} del símbolo.
+\end{itemize}
+
+La verificación de que el precio cotizado es realmente \emph{maker}
+(no cruza el libro, §10) se hace antes de cada envío.
+
+\subsection{Identificación idempotente de órdenes}
+Cada orden lleva un \codigo{client\_order\_id} único por lado:
+
+\begin{verbatim}
+MM-<lado>-<timestamp>-<contador>   # ej.: MM-BUY-1723300000123-1
+\end{verbatim}
+
+Los IDs de bid y ask son independientes y se purgan al confirmar la
+muerte de la orden (§0.6: compartir IDs bid/ask sin purgar genera
+``órdenes fantasma'' acumuladas). El contador garantiza idempotencia
+ante reinicios: al reenviar, el mismo ID no duplica la orden.
+
+\subsection{Detección de fills y reconciliación}
+La detección de \emph{fills} ocurre en el \emph{refresh} de órdenes
+abiertas: si una orden desaparece del libro (vía
+\codigo{sync\_removed}) y la posición de la cuenta creció en el mismo
+sentido, se registra un \emph{fill} real y se actualiza el inventario
+(en modo \emph{dry-run}, el fill es simulado en memoria).
+
+La reconciliación distingue dos casos que antes se confundían:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Caso} & \textbf{Tratamiento} \\
+\midrule
+Posición vacía (\codigo{0}) & Posición legítima; pre-flight continúa \\
+Error de API (\codigo{None}) & Falla de consulta; detenerse y reintentar \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Este fix (345c7a7) destrabó el pre-flight de mainnet con cuenta limpia.
+Ante una posición que no se puede reconciliar, la regla §0.2 ordena
+detenerse y preguntar.
+
+\subsection{Concurrencia y rate-limit}
+El \codigo{execution\_engine.py} protege el estado compartido con un
+\codigo{threading.Lock} y no sincroniza estado/inventario en cada ciclo
+sin control de frecuencia (rate-limit, §0.6). Los envíos críticos pasan
+por \codigo{\_call\_with\_retry}.
+
+% =====================================================================
+% 6. MÉTRICAS DE RENDIMIENTO
+% =====================================================================
+\section{Métricas de rendimiento}
+
+\subsection{NetPnL}
+El criterio de éxito es ganancia neta:
+
+\begin{equation}
+  \text{NetPnL} = \text{GrossPnL} - \text{fees} - \text{funding} - \text{slippage}
+\end{equation}
+
+($\S$18 de la especificación). Los componentes:
+\begin{itemize}
+  \item \textbf{GrossPnL}: diferencia de precios de las operaciones
+  cerradas, con PnL realizado por media móvil en
+  \codigo{inventory\_manager.py}.
+  \item \textbf{Fees}: comisiones de \emph{maker}/\emph{taker}
+  acumuladas por separado (\codigo{total\_fees}) y neteadas aquí.
+  \item \textbf{Funding}: tasa por 8~h tomada de
+  \codigo{FUNDING\_RATE\_PER\_8H} de \codigo{config.py} (el bot no
+  consulta \codigo{get\_funding\_rate}).
+  \item \textbf{Slippage}: deslizamiento estimado entre el precio
+  cotizado y el precio de ejecución.
+\end{itemize}
+
+\subsection{Una operación ganadora NO es evidencia (§19)}
+La rentabilidad se evalúa con \codigo{NetPnL > 0} acumulado, no con
+operaciones individuales. Una operación ganadora puede ser ruido o
+compensar pérdidas previas; solo el PnL neto agregado valida la
+estrategia.
+
+% =====================================================================
+% 7. OPERACIONES
+% =====================================================================
+\section{Operaciones}
+
+\subsection{Watchdog}
+El bot corre un watchdog que vigila la actividad del ciclo de
+cotización. El timeout depende del número de ciclos configurado
+(\codigo{--cycles}) con un piso:
+
+\begin{equation}
+  W_{\mathrm{watchdog}}
+  = \max\!\bigl(125~\text{s},\; 6\cdot\codigo{cycles} + 30~\text{s}\bigr)
+\end{equation}
+
+Si el ciclo no reporta actividad dentro de $W_{\mathrm{watchdog}}$, el
+proceso termina con error (y, en niveles reales, se activa el kill
+switch si corresponde).
+
+\subsection{Pre-flight en mainnet}
+Antes de operar, \codigo{run\_mainnet.py} valida condiciones y
+credenciales y tolera una posición pre-existente como \emph{round trip}
+si se mantiene dentro de los límites:
+
+\begin{equation}
+  |q_{\mathrm{pos}}\cdot P_{\mathrm{mark}}|
+  \leq \codigo{MAX\_POSITION\_NOTIONAL\_USDC}
+  \quad\text{y}\quad
+  |q_{\mathrm{pos}}|
+  \leq 2\cdot\codigo{BASE\_ORDER\_SIZE\_XRP}
+\end{equation}
+
+Fuera de esos límites la posición se considera no reconciliable y el bot
+se detiene y pregunta (§0.2). Además: valida
+\codigo{PERCENT\_PRICE} y \codigo{requiredMarginPercent}, consulta el
+\emph{mark price}, fija \codigo{set\_leverage(MAX\_LEVERAGE\_USED)} y
+exige confirmación interactiva (\codigo{CONFIRMAR}); la bandera
+\codigo{--yes} solo se usa bajo supervisión directa o CI. Operar exige
+\codigo{config.REAL=True}, \codigo{EXPOSURE\_LEVEL $\geq$ 1} y
+\codigo{BUDGETS\_CONFIRMED=True}.
+
+\subsection{Aislamiento en la VPS}
+En la misma VPS corren otros bots en producción (grid bot, bot A-S en
+BTC/USDC). El proceso nuevo corre aislado: venv propio, logs propios,
+sin compartir puertos, archivos ni el límite de rate-limit (§0.3). No
+tocar ni reiniciar los procesos de los otros bots.
+
+% =====================================================================
+% APÉNDICE A — GLOSARIO
+% =====================================================================
+\appendix
+\section{Glosario}
+
+\begin{description}
+  \item[Ask / Bid] Mejor precio de venta / de compra del libro.
+  \item[Futures USDS-M] Contratos de futuros liquidados en stablecoin
+  (USDC en este caso).
+  \item[GTX] \emph{Good 'til cancelled, post-only}: orden maker que se
+  cancela si ejecutaría como taker.
+  \item[Inventario] Cantidad de XRP acumulada por el bot; positiva =
+  larga, negativa = corta.
+  \item[Kill switch] Mecanismo de emergencia que cancela todas las
+  órdenes y reconcilia la posición ante condiciones anómalas (§13).
+  \item[Largo / Corto] Posición de compra / de venta.
+  \item[Mark price] Precio de referencia usado para liquidaciones y
+  cálculo de nocional.
+  \item[Post-only] Ver \emph{GTX}.
+  \item[Round trip] Posición pre-existente considerada válida si
+  cumple los límites de pre-flight (§7.2).
+  \item[Skew] Sesgo aplicado a los precios de cotización según
+  inventario (§3.3).
+  \item[Testnet] Red de pruebas de Binance con fondos simulados.
+  \item[Tick size / Step size] Incremento mínimo de precio / de
+  cantidad de un símbolo.
+\end{description}
+
+% =====================================================================
+% APÉNDICE B — CONSTANTES CLAVE
+% =====================================================================
+\section{Constantes clave de configuración}
+
+\begin{center}
+\begin{longtable}{lll}
+\toprule
+\textbf{Constante} & \textbf{Valor} & \textbf{Rol} \\
+\midrule
+\endhead
+\codigo{SYMBOL} & \codigo{"XRPUSDC"} & Instrumento (parámetro, no hardcodeado) \\
+\codigo{REAL} & \codigo{True} & Mainnet autorizada 10/08/2026 (§0.2) \\
+\codigo{EXPOSURE\_LEVEL} & $0$--$3$ & Nivel de exposición (tabla §4.3) \\
+\codigo{SAMPLING\_INTERVAL\_SEC} & $5.0$ & Intervalo de muestreo de retornos \\
+\codigo{INTERVALS\_PER\_MINUTE} & $12$ & Reescala de volatilidad (§3.1) \\
+\codigo{VOLATILITY\_WINDOW\_SEC} & — & Ventana de estimación de vol \\
+\codigo{CYCLE\_INTERVAL\_SEC} & — & Duración del ciclo de cotización \\
+\codigo{MAX\_DAILY\_LOSS\_USDC} & $10.0$ & Límite diario de pérdida (§0.4) \\
+\codigo{MAX\_POSITION\_NOTIONAL\_USDC} & — & Límite de nocional \\
+\codigo{MAX\_DRAWDOWN\_PCT} & — & Límite de drawdown \\
+\codigo{MAX\_LEVERAGE\_USED} & — & Apalancamiento máximo \\
+\codigo{BASE\_ORDER\_SIZE\_XRP} & — & Tamaño base por lado \\
+\codigo{MAX\_ORDER\_SIZE\_XRP} & — & Tamaño máximo de orden (clamp §3.4) \\
+\codigo{SIMULATION\_QUOTE\_MULTIPLIER} & — & Multiplicador de simulación (Nivel 0) \\
+\codigo{FUNDING\_RATE\_PER\_8H} & — & Tasa de funding usada en NetPnL \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+Nota: los valores marcados con ``—'' corresponden a la configuración
+vigente en \codigo{strategy/config.py}; consultar ese archivo como
+fuente de verdad antes de modificar cualquier límite (§0.4).
+
+\end{document}
