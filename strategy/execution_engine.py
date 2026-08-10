@@ -95,6 +95,11 @@ class ExecutionEngine:
         self._orders_log_path = str(orders_dir / f"orders_{today}.jsonl")
         self._fills_log_path = str(fills_dir / f"fills_{today}.jsonl")
 
+        # IDs de fills ya registrados hoy (idempotencia §0.6): si el proceso
+        # reinicia, refresh_open_orders no debe volver a registrar un fill que
+        # ya quedó en el log del día (evita doble conteo en fill_count/PnL).
+        self._recorded_fill_ids: set = self._load_recorded_fill_ids()
+
         self.init_symbol_info()
 
     # ── Helpers internos de estado (asumen self._lock tomado) ────────────
@@ -146,6 +151,34 @@ class ExecutionEngine:
 
     def _log_fill_event(self, fill):
         self._log_event_jsonl(self._fills_log_path, fill)
+
+    def _load_recorded_fill_ids(self) -> set:
+        """Carga los client_order_id de fills ya registrados HOY (idempotencia).
+
+        §0.6/§15: el fills log es el audit trail del día. Si el proceso
+        reinicia, refresh_open_orders volvería a ver como "desaparecida" una
+        orden cuyo fill ya quedó registrado; este set evita duplicar el fill.
+        """
+        ids = set()
+        try:
+            if os.path.exists(self._fills_log_path):
+                with open(self._fills_log_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            oid = json.loads(line).get("client_order_id")
+                        except (ValueError, TypeError):
+                            continue
+                        if oid:
+                            ids.add(oid)
+        except Exception as e:
+            logger.warning("ExecutionEngine: no se pudieron cargar fills previos "
+                           "(idempotencia degradada): %s", e)
+        if ids:
+            logger.info("ExecutionEngine: %d fills previos cargados (idempotencia)", len(ids))
+        return ids
 
     # ── Filtros del símbolo (§3) ─────────────────────────────────────────
     def init_client(self, real: bool = False):
@@ -429,7 +462,30 @@ class ExecutionEngine:
             self._log_order_event("sync_removed", oid, info["side"],
                                   info["price"], info["qty"],
                                   "no existe en exchange (refresh)")
+            # En real, una maker GTX solo sale del book llenándose: registrar
+            # el fill (idempotente ante reinicios §0.6, audit trail §15).
+            self._detect_real_fill(oid, info)
         return True
+
+    def _detect_real_fill(self, order_id, info):
+        """Registra como fill una orden que desapareció del exchange (modo real).
+
+        refresh_open_orders ya purgó la orden localmente; aquí queda constancia
+        en self.fills y en el fills log (§15) con source="refresh". El fill se
+        registra al PRECIO DE LA ORDEN: una maker GTX se llena a precio límite
+        y el PnL exacto se reconcilia por posición (§18), no por este registro.
+
+        Idempotencia (§0.6): si el fill ya estaba en el log del día (proceso
+        anterior), se ignora. NO hace llamadas API extra (rate-limit §0.6).
+        """
+        with self._lock:
+            if order_id in self._recorded_fill_ids:
+                return
+            self._recorded_fill_ids.add(order_id)
+            # La orden ya fue removida por refresh_open_orders; el remove
+            # interno es un no-op seguro (pop de key inexistente).
+            self._register_fill_locked(order_id, info, info["price"], info["qty"],
+                                       source="refresh")
 
     # ── Reemplazo ────────────────────────────────────────────────────────
     def replace_order(self, old_id, side, new_qty, new_price):
@@ -544,11 +600,18 @@ class ExecutionEngine:
             info = self.open_orders.get(order_id)
             if info is None:
                 return False
-            self._register_fill_locked(order_id, info, info["price"], info["qty"])
+            self._register_fill_locked(order_id, info, info["price"], info["qty"],
+                                       source="simulated")
         return True
 
-    def _register_fill_locked(self, order_id, info, fill_price, fill_qty):
-        """Registra un fill y purga la orden (asume self._lock tomado)."""
+    def _register_fill_locked(self, order_id, info, fill_price, fill_qty,
+                              source="trades"):
+        """Registra un fill y purga la orden (asume self._lock tomado).
+
+        source indica el origen del fill para el audit trail (§15):
+        "trades" (WS/trades), "simulated" (dry-run) o "refresh" (detectado
+        por refresh_open_orders en modo real).
+        """
         fill = {
             "client_order_id": order_id,
             "side": info["side"],
@@ -559,6 +622,7 @@ class ExecutionEngine:
             "ts": time.time(),
             "status": "FILLED",
             "simulated": self.dry_run,
+            "source": source,
         }
         self.fills.append(fill)
         self._remove_order(order_id)
