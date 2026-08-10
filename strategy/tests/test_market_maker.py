@@ -27,7 +27,7 @@ from strategy.market_maker import MarketMaker
 
 
 def _quotes(bid_ok=True, ask_ok=True, bid_price=2.49, ask_price=2.51,
-            bid_size=5.0, ask_size=5.0):
+            bid_size=config.BASE_ORDER_SIZE_XRP, ask_size=config.BASE_ORDER_SIZE_XRP):
     """Dict de quotes con la forma que consume _manage_orders."""
     return {
         "quote_bid_ok": bid_ok,
@@ -63,7 +63,7 @@ class TestManageOrdersExpireReplace(_MarketMakerTestCase):
     """§0.6: el reemplazo por expiración ocurre en el mismo ciclo (sin duplicado)."""
 
     def test_orden_expirada_se_reemplaza_sin_duplicar(self):
-        oid, ok, reason = self.mm.exec.place_maker_order("BUY", 5.0, 2.49)
+        oid, ok, reason = self.mm.exec.place_maker_order("BUY", config.BASE_ORDER_SIZE_XRP, 2.49)
         self.assertTrue(ok, reason)
         # Forzar expiración: edad > MAX_ORDER_LIFETIME_SEC.
         self.mm.quote_age[oid] = time.time() - (config.MAX_ORDER_LIFETIME_SEC + 1)

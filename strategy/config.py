@@ -25,10 +25,10 @@ import pathlib
 # Símbolo como parámetro de config, nunca hardcodeado en otro módulo (§3).
 SYMBOL: str = "XRPUSDC"
 
-# Testnet por defecto (§0.1). NUNCA cambiar a True sin autorizacion humana
-# explicita (§0.1). No llamar init_client(real=True) ni set_testnet(False)
-# en ningun modulo sin esa autorizacion.
-REAL: bool = False
+# MAINNET autorizada por humano §0.2 (2026-08-10). No llamar
+# init_client(real=True) ni set_testnet(False) en ningun modulo sin esa
+# autorizacion explicita (§0.1).
+REAL: bool = True
 
 # ---------------------------------------------------------------------------
 # Presupuesto de riesgo (§0.4) — PROPUESTA pendiente de confirmacion
@@ -51,7 +51,7 @@ MAX_LEVERAGE_USED: int = 20
 
 # Presupuestos de riesgo §0.4 CONFIRMADOS por humano (2026-08-09):
 # MAX_DAILY_LOSS_USDC=10.0, MAX_POSITION_NOTIONAL_USDC=25.0,
-# MAX_DRAWDOWN_PCT=0.05, MAX_LEVERAGE_USED=20, BASE_ORDER_SIZE_XRP=5.0.
+# MAX_DRAWDOWN_PCT=0.05, MAX_LEVERAGE_USED=20, BASE_ORDER_SIZE_XRP=4.9.
 # run_mainnet.py aborta si esto es False (§0.4: no operar con fondos reales
 # con presupuestos "pendiente de confirmación").
 BUDGETS_CONFIRMED: bool = True
@@ -95,11 +95,13 @@ def effective_exposure_multiplier() -> float:
 # Tamaños de orden (§3)
 # ---------------------------------------------------------------------------
 
-# Cantidad mínima típica para XRPUSDC futures. El execution_engine la valida
-# contra los filtros reales del símbolo consultados dinámicamente (§3).
-# 5.0 XRP ≈ $5.17 a $1.0330: mínimo seguro sobre minNotional $5 (el mínimo
-# viable exacto es 4.9 XRP = $5.0617). Autorizado por humano §0.4 (2026-08-09).
-BASE_ORDER_SIZE_XRP: float = 5.0
+# Cantidad mínima para XRPUSDC futures. El execution_engine la valida contra
+# los filtros reales del símbolo consultados dinámicamente (§3).
+# Mínimo exacto (autorizado por humano §0.2, 2026-08-10): minNotional $5 ÷
+# precio $1.0314 = 4.8478 XRP → redondeado al step 0.1 = 4.9 XRP ≈ $5.05
+# (4.8 XRP = $4.95 < $5 sería rechazado). Cumple minNotional mientras
+# precio > $1.0204.
+BASE_ORDER_SIZE_XRP: float = 4.9
 
 # ---------------------------------------------------------------------------
 # Ciclo principal
