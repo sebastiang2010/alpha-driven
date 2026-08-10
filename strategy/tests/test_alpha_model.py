@@ -6,6 +6,7 @@ el cálculo de NetPnL esperado (§9/§18).
 Corren con unittest puro (NO pytest):
     python -m unittest strategy.tests.test_alpha_model -v
 """
+import math
 import sys
 import unittest
 
@@ -251,6 +252,73 @@ class TestAlphaSinDobleConteoEnQuotes(unittest.TestCase):
         _, ask_dist_cero = self.am.quote_distances(self.snap, 0.0, 0.0, 0.001)
         delta = (r_alpha + ask_dist_alpha) - (r_cero + ask_dist_cero)
         self.assertAlmostEqual(delta, alpha, places=9)
+
+
+class TestPisoDeSpread(unittest.TestCase):
+    """Piso de spread MIN_SPREAD_TICKS=8 (§11, aprobado §0.2 2026-08-10).
+
+    Breakeven contra fees maker: N = 2*f_maker*P/tick = 2*0.0002*1.026/0.0001
+    = 4.1 ticks -> piso de 8 ticks = 1.95x las fees (decisión tras round
+    trip mainnet con adverse selection -0.0113 USDC: no existía piso).
+
+    Verifica:
+    (a) sigma->0            => spread resultante == 8 ticks exacto.
+    (b) sigma alto          => spread ya supera el piso: comportamiento
+                               previo intacto (sin cambios).
+    (c) skew de inventario  => el piso se mantiene y el skew se aplica
+                               encima (bid - ask == 2*skew esperado).
+    """
+
+    def setUp(self):
+        self.am = alpha_model.AlphaModel()
+        self.tick = alpha_model.config.TICK_SIZE_XRPUSDC
+        self.floor = alpha_model.config.MIN_SPREAD_TICKS * self.tick
+
+    def _snap_quieta(self, mid=2.5, **overrides):
+        base = {"spread": 0.0, "volatility": 0.0, "imbalance": 0.0,
+                "momentum": 0.0, "microprice": 0.0, "inventory": 0.0}
+        base.update(overrides)
+        return _snapshot(mid=mid, **base)
+
+    def test_sigma_cero_spread_igual_piso_exacto(self):
+        """(a) sigma->0: el piso domina -> bid_dist + ask_dist == 8 ticks."""
+        snap = self._snap_quieta()
+        bid, ask = self.am.quote_distances(snap, 0.0, 0.0, 0.0)
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+        # Ensanche simétrico desde el mid: ambos lados iguales.
+        self.assertAlmostEqual(bid, ask, places=12)
+        self.assertAlmostEqual(bid, self.floor / 2.0, places=12)
+
+    def test_sigma_alto_no_alterado_por_piso(self):
+        """(b) sigma alto: spread >> piso -> el cálculo previo queda intacto."""
+        snap = self._snap_quieta(mid=2.5, spread=0.002, volatility=0.001)
+        bid, ask = self.am.quote_distances(snap, 0.0, 0.0, 0.001)
+        self.assertGreater(bid + ask, self.floor)
+        # Referencia explícita de la fórmula previa (sin piso):
+        # base = spread/2 + K*sigma_efectiva, con sigma_ef = sigma*sqrt(12)*sqrt(5)
+        sigma_ef = 0.001 * math.sqrt(12.0) * math.sqrt(5.0)
+        base = 0.001 + sigma_ef
+        self.assertAlmostEqual(bid, base, places=12)
+        self.assertAlmostEqual(ask, base, places=12)
+
+    def test_skew_inventario_se_aplica_sobre_piso(self):
+        """(c) inventario long + sigma>0 con base < piso:
+        - el spread total queda en el piso (el piso se mantiene);
+        - el skew se aplica ENCIMA del piso (bid - ask == 2*skew)."""
+        mid = 2.5
+        sigma = 0.00002
+        inv = 10.0  # nocional = 25 USDC = MAX_POSITION_NOTIONAL_USDC -> ratio 1.0
+        snap = self._snap_quieta(mid=mid, volatility=sigma, inventory=inv)
+        bid, ask = self.am.quote_distances(snap, 0.0, inv, sigma)
+        # Piso se mantiene pese al skew.
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+        # Inventario long -> bid más lejos del mid que el ask.
+        self.assertGreater(bid, ask)
+        # El skew (2*skew = bid - ask) se preserva tal cual lo calcula el modelo.
+        sigma_ef = sigma * math.sqrt(12.0) * math.sqrt(5.0)
+        skew = ((inv * mid) / alpha_model.config.MAX_POSITION_NOTIONAL_USDC
+                * alpha_model.INVENTORY_SKEW_MULTIPLIER * sigma_ef)
+        self.assertAlmostEqual(bid - ask, 2.0 * skew, places=12)
 
 
 if __name__ == "__main__":

@@ -155,6 +155,27 @@ SAMPLING_INTERVAL_SEC: float = 5.0
 QUOTE_UPDATE_THRESHOLD_PCT: float = 0.001
 
 # ---------------------------------------------------------------------------
+# Piso de spread (breakeven contra fees maker) — aprobado por humano §0.2
+# ---------------------------------------------------------------------------
+
+# Tick size de XRPUSDC (0.0001 USDC, verificado contra exchangeInfo §3).
+# Fallback para alpha_model cuando el snapshot no trae tick_size dinámico;
+# si market_state llega a exponer tick_size, ese valor tiene prioridad
+# (specs dinámicas §3 — nunca asumir, pero no hay otra fuente hoy).
+TICK_SIZE_XRPUSDC: float = 0.0001
+
+# Piso mínimo de spread total cotizado (bid_dist + ask_dist), en ticks.
+# Breakeven con fee maker VIP0 (MAKER_FEE_RATE=0.0002) y tick 0.0001, para
+# el precio de referencia de la corrida mainnet (P ≈ 1.026):
+#     N_breakeven = 2 * f_maker * P / tick = 2*0.0002*1.026/0.0001 = 4.1 ticks
+#     -> mínimo operativo N_min = 5 ticks (redondeo hacia arriba).
+# Piso aprobado por humano (2026-08-10, tras round trip mainnet con adverse
+# selection -0.0113 USDC: no existía piso estructural): 8 ticks = 1.95x las
+# fees maker -> margen de seguridad; el spread por volatilidad puede ser
+# mayor y entonces manda el cálculo previo.
+MIN_SPREAD_TICKS: int = 8
+
+# ---------------------------------------------------------------------------
 # Kill switch (§13)
 # ---------------------------------------------------------------------------
 

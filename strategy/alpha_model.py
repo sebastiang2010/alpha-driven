@@ -182,6 +182,11 @@ class AlphaModel:
         bid_dist = base + skew      (inventario long -> bid mas lejos)
         ask_dist = base - skew      (inventario long -> ask mas cerca)
 
+        Piso de spread (§11, aprobado §0.2): si bid_dist + ask_dist <
+        MIN_SPREAD_TICKS * tick_size (breakeven 4.1 ticks, piso 8 = 1.95x
+        fees maker), se ensancha simetricamente desde el mid (extra/2 a
+        cada lado); el skew de inventario se preserva intacto.
+
         Documentacion de sigma_efectiva (un solo √T por escala, §0.6):
             sigma_efectiva = sigma * sqrt(INTERVALS_PER_MINUTE) * sqrt(CYCLE_INTERVAL_SEC)
             [sigma base: por intervalo de muestreo] -> [escala minutos]
@@ -209,8 +214,27 @@ class AlphaModel:
         )
         inventory_skew = notional_ratio * INVENTORY_SKEW_MULTIPLIER * sigma_efectiva
 
-        bid_dist = max(base + inventory_skew, MIN_QUOTE_DISTANCE)
-        ask_dist = max(base - inventory_skew, MIN_QUOTE_DISTANCE)
+        bid_dist = base + inventory_skew
+        ask_dist = base - inventory_skew
+
+        # Piso de spread (breakeven contra fees maker, §11/§0.2): el round
+        # trip mainnet 2026-08-10 perdió -0.0113 USDC por adverse selection
+        # porque no existía piso estructural. Breakeven:
+        #     N = 2 * f_maker * P / tick = 2*0.0002*1.026/0.0001 = 4.1 ticks
+        # Piso aprobado: MIN_SPREAD_TICKS = 8 (1.95x fees). Si el spread
+        # calculado por volatilidad queda por debajo, se ensancha
+        # SIMETRICAMENTE desde el mid (extra/2 a cada lado): el skew de
+        # inventario ya está incluido en bid_dist/ask_dist y se preserva
+        # intacto (se aplica después del piso).
+        tick_size = float(snapshot.get("tick_size") or config.TICK_SIZE_XRPUSDC)
+        min_spread = config.MIN_SPREAD_TICKS * tick_size
+        if bid_dist + ask_dist < min_spread:
+            extra = (min_spread - bid_dist - ask_dist) / 2.0
+            bid_dist += extra
+            ask_dist += extra
+
+        bid_dist = max(bid_dist, MIN_QUOTE_DISTANCE)
+        ask_dist = max(ask_dist, MIN_QUOTE_DISTANCE)
         return bid_dist, ask_dist
 
     # ── 4. Estimacion de NetPnL esperado (§9/§18) ───────────────────
