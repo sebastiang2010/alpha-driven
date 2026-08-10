@@ -14,7 +14,11 @@ dos señales independientes antes de tocar la cuenta real:
 Flujo:
   1. Chequeos de configuración (§0.4/§0.1).
   2. Pre-flight con cliente mainnet ya inicializado:
-       - reconciliar posición == 0 (exec.reconcile_position),
+       - reconciliar posición: se TOLERA una pre-existente dentro de los
+         presupuestos (§0.4) — notional a mark price <= MAX_POSITION_NOTIONAL_USDC
+         y |amt| <= 2*BASE_ORDER_SIZE_XRP — continuando como round trip
+         (inventario inicial); FUERA de esos límites = posición no
+         reconciliable §0.2 → detenerse y preguntar,
        - validar PERCENT_PRICE y requiredMarginPercent del exchangeInfo real
          (api.get_symbol — función real existente, §1),
        - verificar precio de marca disponible (api.get_mark_price),
@@ -53,6 +57,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from strategy.config import (  # noqa: E402
+    BASE_ORDER_SIZE_XRP,
     BUDGETS_CONFIRMED,
     CYCLE_INTERVAL_SEC,
     EXPOSURE_LEVEL,
@@ -62,12 +67,25 @@ from strategy.config import (  # noqa: E402
     LOG_ORDERS,
     LOG_PNL,
     MAX_LEVERAGE_USED,
+    MAX_POSITION_NOTIONAL_USDC,
     REAL,
     SYMBOL,
 )
 from strategy.market_maker import MarketMaker  # noqa: E402
 
-WATCHDOG_SECONDS = 125.0  # techo duro de la corrida
+WATCHDOG_FLOOR_SECONDS = 125.0  # piso del techo duro (§13: SIEMPRE activo)
+
+
+def _watchdog_seconds(max_cycles: int) -> float:
+    """Techo duro de la corrida (§13), derivado de ``--cycles``.
+
+    Un ciclo dura ~5-6 s: ``max_cycles * 6 + 30`` cubre el último ciclo y el
+    resumen; 125 s de piso de seguridad para corridas cortas. El watchdog
+    sigue siendo techo duro SIEMPRE activo (§13) — no es una estimación.
+    """
+    return max(WATCHDOG_FLOOR_SECONDS, float(max_cycles) * 6.0 + 30.0)
+
+
 DEFAULT_CYCLES = 20
 
 log = logging.getLogger("run_mainnet")
@@ -120,18 +138,56 @@ def _preflight(mm: MarketMaker) -> list[str]:
         return errors
     mm.exec.init_symbol_info()
 
-    # 2. Posición reconciliada en 0 (§0.2: posición no reconciliable = detenerse).
+    # 2. Precio de marca disponible (los quotes se anclan al mid real).
+    #    Se obtiene ANTES del chequeo de posición: hace falta para valuar el
+    #    notional de una posición pre-existente (§0.2/§0.4).
+    mark = api.get_mark_price(SYMBOL)
+    if not mark or mark <= 0:
+        errors.append(f"api.get_mark_price({SYMBOL}) no disponible — no se puede operar")
+        mark = None
+    else:
+        log.info("Pre-flight: mark price %s = %.6f", SYMBOL, mark)
+
+    # 3. Posición reconciliada (§0.2: posición no reconciliable = detenerse).
+    #    Espíritu §0.2: una posición dentro de los presupuestos de riesgo (§0.4)
+    #    es RECONCILIABLE — exigir posición == 0 impediría la reanudación tras un
+    #    fill real (p.ej. la cuenta mainnet con 4.9 XRP abiertos). Se continúa
+    #    como round trip (inventario inicial) si el notional a mark price <=
+    #    MAX_POSITION_NOTIONAL_USDC y |amt| <= 2 * BASE_ORDER_SIZE_XRP.
+    #    FUERA de esos límites (o sin mark price para valuar) = posición no
+    #    reconciliable §0.2 → abortar y preguntar al humano.
     pos = mm.exec.reconcile_position()
     if pos is None:
         errors.append("reconcile_position() devolvió None (no se puede reconciliar la posición)")
     else:
         amt = float(pos.get("positionAmt", 0.0) or 0.0)
-        if abs(amt) > 1e-9:
-            errors.append(f"posición abierta {amt} {SYMBOL} — debe ser 0 antes de mainnet")
-        else:
+        if abs(amt) <= 1e-9:
             log.info("Pre-flight: posición de %s reconciliada en 0.", SYMBOL)
+        elif mark is not None and (
+            abs(amt) * mark <= MAX_POSITION_NOTIONAL_USDC
+            and abs(amt) <= 2.0 * BASE_ORDER_SIZE_XRP
+        ):
+            log.warning(
+                "Pre-flight: posición pre-existente de %.4f %s (~$%.2f) dentro de "
+                "límites de riesgo (notional<=$%.2f USDC, |amt|<=%.2f %s); "
+                "continuando como round trip (inventario inicial).",
+                amt, SYMBOL, abs(amt) * mark,
+                MAX_POSITION_NOTIONAL_USDC, 2.0 * BASE_ORDER_SIZE_XRP, SYMBOL,
+            )
+        elif mark is None:
+            errors.append(
+                f"posición abierta {amt} {SYMBOL} sin mark price para valuar — "
+                "posición no reconciliable (§0.2): detenerse y preguntar"
+            )
+        else:
+            errors.append(
+                f"posición abierta {amt} {SYMBOL} fuera de límites reconciliables "
+                f"(|amt|={abs(amt):.4f} > {2.0 * BASE_ORDER_SIZE_XRP:.2f} XRP o "
+                f"notional ${abs(amt) * mark:.2f} > ${MAX_POSITION_NOTIONAL_USDC:.2f} USDC) — "
+                "posición no reconciliable (§0.2): detenerse y preguntar"
+            )
 
-    # 3. exchangeInfo real: PERCENT_PRICE + leverage máximo real.
+    # 4. exchangeInfo real: PERCENT_PRICE + leverage máximo real.
     info = api.get_symbol(SYMBOL)
     if info is None:
         errors.append(f"api.get_symbol({SYMBOL}) no encontró el símbolo en exchange_info")
@@ -314,11 +370,14 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     log.info("Pre-flight OK. Iniciando ciclo de cotización mainnet...")
 
+    # Techo duro §13 derivado de --cycles (ver _watchdog_seconds).
+    watchdog_seconds = _watchdog_seconds(args.cycles)
+
     def _watchdog():
-        time.sleep(WATCHDOG_SECONDS)
+        time.sleep(watchdog_seconds)
         if not mm._stop.is_set():
             log.warning("Watchdog: %.0f s excedidos, forzando stop (idempotente).",
-                        WATCHDOG_SECONDS)
+                        watchdog_seconds)
             mm.stop()
 
     watchdog = threading.Thread(target=_watchdog, daemon=True)
