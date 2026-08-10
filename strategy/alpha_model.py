@@ -26,10 +26,21 @@ CONVENCIONES DE TIEMPO / VOLATILIDAD (declaradas, §0.6: no mezclar escalas)
   Factor 2: amplia esa sigma de minutos al horizonte del ciclo en segundos.
   Cada √T se aplica UNA sola vez, siempre sobre sigma en su escala base;
   nunca se re-escala el resultado en otro punto (evita √T doble §0.6).
+
+FILTRO DE MOMENTUM (§14, ver config.MOMENTUM_*):
+- El historial de mid (ring buffer de (ts, mid)) lo alimenta el orquestador
+  via AlphaModel.record_mid() una vez por ciclo; quote_distances lo consulta.
+- Regla: si |mid_actual - mid_inicio_ventana| >= MOMENTUM_MAX_TICKS * tick_size
+  dentro de MOMENTUM_WINDOW_SECONDS (o el cooldown de
+  MOMENTUM_COOLDOWN_SECONDS sigue corriendo), el piso de spread efectivo pasa
+  de MIN_SPREAD_TICKS a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER.
+- SIMETRICO: usa |Δmid|, nunca el signo del movimiento (no asume dirección).
 ==============================================================================
 """
 
 import math
+import time
+from collections import deque
 from typing import Tuple
 
 from . import config
@@ -81,6 +92,14 @@ SAMPLING_INTERVAL_SEC: float = 5.0             # intervalo de referencia de sigm
 INTERVALS_PER_MINUTE: float = 60.0 / SAMPLING_INTERVAL_SEC  # = 12.0
 DEFAULT_HORIZON_MINUTES: float = 5.0           # T - t default de la reserva
 
+# ── Filtro de momentum anti-adverse-selection (§14) ───────────────────
+# El historial de mid que alimenta el filtro se guarda en un ring buffer
+# propio del AlphaModel (deque con maxlen): lo alimenta el orquestador
+# (market_maker.run) una vez por ciclo con (timestamp, mid). La ventana de
+# detección (MOMENTUM_WINDOW_SECONDS) es mucho menor que el maxlen, así que
+# el buffer nunca pierde la muestra más antigua de la ventana.
+_MID_HISTORY_MAXLEN: int = 256
+
 
 class AlphaModel:
     """
@@ -92,7 +111,93 @@ class AlphaModel:
         alpha = am.compute_alpha(snap)
         r = am.reservation_price(snap, alpha, snap["inventory"], snap["volatility"])
         bid_dist, ask_dist = am.quote_distances(snap, alpha, snap["inventory"], snap["volatility"])
+
+    Filtro de momentum (§14): el orquestador alimenta el historial con
+        am.record_mid(ts_sec, mid)
+    una vez por ciclo; quote_distances lo consulta para decidir si el piso
+    de spread pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER.
     """
+
+    def __init__(self) -> None:
+        # Historial de mid para el filtro de momentum (§14): (ts_seg, mid).
+        self._mid_history = deque(maxlen=_MID_HISTORY_MAXLEN)
+        # Timestamp (segundos) de la última detección de momentum (cooldown §14).
+        self._momentum_detected_at: float | None = None
+        # Último estado evaluado del filtro (para el journal del orquestador).
+        self.last_momentum_active: bool = False
+
+    # ── Filtro de momentum (§14) ─────────────────────────────────────
+    def record_mid(self, ts_sec, mid) -> None:
+        """Registra una muestra (timestamp en segundos, mid price).
+
+        Lo llama el orquestador una vez por ciclo. Descarta muestras no
+        válidas (sin timestamp o mid <= 0). El ring buffer tiene maxlen, así
+        que no crece sin límite.
+        """
+        try:
+            ts = float(ts_sec)
+            price = float(mid)
+        except (TypeError, ValueError):
+            return
+        if price <= 0 or ts < 0:
+            return
+        self._mid_history.append((ts, price))
+
+    def _prune_mid_history(self, now_sec: float) -> None:
+        """Descarta muestras más viejas que MOMENTUM_WINDOW_SECONDS."""
+        cutoff = now_sec - config.MOMENTUM_WINDOW_SECONDS
+        while self._mid_history and self._mid_history[0][0] < cutoff:
+            self._mid_history.popleft()
+
+    def _momentum_detected(self, now_sec: float, tick_size: float) -> bool:
+        """True si el mid se movió >= MOMENTUM_MAX_TICKS en la ventana.
+
+        Compara la muestra más nueva del buffer contra la más antigua que
+        sigue dentro de MOMENTUM_WINDOW_SECONDS (misma convención que
+        _compute_momentum en market_state.py: "muestra más reciente vs más
+        antigua dentro de la ventana"). |Δmid| / tick_size >= MOMENTUM_MAX_TICKS,
+        en valor absoluto: el filtro es SIMÉTRICO (no direccional, §14).
+        """
+        if not config.MOMENTUM_ENABLED:
+            return False
+        self._prune_mid_history(now_sec)
+        if len(self._mid_history) < 2:
+            return False
+        oldest = self._mid_history[0][1]
+        newest = self._mid_history[-1][1]
+        if oldest <= 0.0 or newest <= 0.0 or tick_size <= 0.0:
+            return False
+        # Tolerancia de polvo de punto flotante: un movimiento de EXACTAMENTE
+        # MOMENTUM_MAX_TICKS ticks (p.ej. 2.5008 - 2.5) puede dar
+        # 0.0007999... < 0.0008 y no activar el filtro (test del límite
+        # exacto). Los mids reales viven en múltiplos de 0.5 ticks, así que
+        # 1e-6 ticks de holgura no puede producir falsos positivos.
+        threshold = float(config.MOMENTUM_MAX_TICKS) * float(tick_size)
+        return abs(newest - oldest) >= threshold - float(tick_size) * 1e-6
+
+    def _momentum_active(self, now_sec: float, tick_size: float) -> bool:
+        """Estado del filtro: detección fresca O cooldown aún vigente.
+
+        Al detectar momentum se arma el cooldown (self._momentum_detected_at =
+        now); mientras now - _momentum_detected_at < MOMENTUM_COOLDOWN_SECONDS
+        el spread ampliado se mantiene aunque el mid se calme (no alternar
+        rápido 8/16 ticks, §14).
+        """
+        if not config.MOMENTUM_ENABLED:
+            self.last_momentum_active = False
+            return False
+        if self._momentum_detected(now_sec, tick_size):
+            self._momentum_detected_at = float(now_sec)
+            self.last_momentum_active = True
+            return True
+        if (
+            self._momentum_detected_at is not None
+            and now_sec - self._momentum_detected_at < config.MOMENTUM_COOLDOWN_SECONDS
+        ):
+            self.last_momentum_active = True
+            return True
+        self.last_momentum_active = False
+        return False
 
     @staticmethod
     def _safe_div(numer: float, denom: float) -> float:
@@ -170,6 +275,7 @@ class AlphaModel:
         inventory: float,
         sigma: float,
         spread_mult: float = 1.0,
+        now_sec: float | None = None,
     ) -> Tuple[float, float]:
         """
         (bid_dist, ask_dist) > 0 desde el mid.
@@ -187,6 +293,13 @@ class AlphaModel:
         fees maker), se ensancha simetricamente desde el mid (extra/2 a
         cada lado); el skew de inventario se preserva intacto.
 
+        Filtro de momentum (§14): si el mid se movió >= MOMENTUM_MAX_TICKS
+        dentro de MOMENTUM_WINDOW_SECONDS (o el cooldown aún corre), el
+        piso efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER
+        (8 -> 16 ticks). El filtro es SIMÉTRICO (no direccional) y el skew
+        de inventario se aplica igual, por encima del piso. now_sec solo
+        existe para hacer deterministas los tests (default: reloj real).
+
         Documentacion de sigma_efectiva (un solo √T por escala, §0.6):
             sigma_efectiva = sigma * sqrt(INTERVALS_PER_MINUTE) * sqrt(CYCLE_INTERVAL_SEC)
             [sigma base: por intervalo de muestreo] -> [escala minutos]
@@ -195,6 +308,9 @@ class AlphaModel:
         mid = snapshot.get("mid")
         if mid is None or mid <= 0:
             return MIN_QUOTE_DISTANCE, MIN_QUOTE_DISTANCE
+
+        if now_sec is None:
+            now_sec = time.time()
 
         spread = float(snapshot.get("spread", 0.0) or 0.0)
         sigma_efectiva = (
@@ -227,7 +343,15 @@ class AlphaModel:
         # inventario ya está incluido en bid_dist/ask_dist y se preserva
         # intacto (se aplica después del piso).
         tick_size = float(snapshot.get("tick_size") or config.TICK_SIZE_XRPUSDC)
-        min_spread = config.MIN_SPREAD_TICKS * tick_size
+        # Filtro de momentum (§14): el piso se MULTIPLICA (no solo se
+        # ensancha el spread calculado). Mismo tick_size que el piso base.
+        if self._momentum_active(float(now_sec), tick_size):
+            floor_ticks = (
+                float(config.MIN_SPREAD_TICKS) * float(config.MOMENTUM_SPREAD_MULTIPLIER)
+            )
+        else:
+            floor_ticks = float(config.MIN_SPREAD_TICKS)
+        min_spread = floor_ticks * tick_size
         if bid_dist + ask_dist < min_spread:
             extra = (min_spread - bid_dist - ask_dist) / 2.0
             bid_dist += extra

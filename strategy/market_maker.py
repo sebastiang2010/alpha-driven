@@ -192,6 +192,7 @@ class MarketMaker:
                 "bid_dist": 0.0, "ask_dist": 0.0,
                 "expected_pnl_bid": 0.0, "expected_pnl_ask": 0.0,
                 "quote_bid_ok": False, "quote_ask_ok": False,
+                "momentum_active": False,
                 "reasons": ["no_mid"],
             }
 
@@ -203,6 +204,10 @@ class MarketMaker:
         bid_dist, ask_dist = self.alpha.quote_distances(
             snapshot, alpha, inventory, sigma
         )  # §11
+
+        # Estado del filtro de momentum (§14): lo actualiza quote_distances;
+        # se expone en el dict para el journal (§16).
+        momentum_active = bool(getattr(self.alpha, "last_momentum_active", False))
 
         # Tamaño efectivo por nivel de exposición (§21). Nivel 0 (dry-run)
         # simula órdenes con SIMULATION_QUOTE_MULTIPLIER (decisión aprobada
@@ -269,6 +274,7 @@ class MarketMaker:
             "ask_size": ask_size,
             "bid_dist": bid_dist,
             "ask_dist": ask_dist,
+            "momentum_active": momentum_active,
             "expected_pnl_bid": expected_pnl_bid,
             "expected_pnl_ask": expected_pnl_ask,
             "quote_bid_ok": quote_bid_ok,
@@ -316,6 +322,7 @@ class MarketMaker:
             "bid_size": float(quotes.get("bid_size") or 0.0),
             "ask_size": float(quotes.get("ask_size") or 0.0),
             "reason": ";".join(quotes.get("reasons") or []) or "ok",
+            "momentum_active": bool(quotes.get("momentum_active")),
             "expected_pnl": round(
                 float(quotes.get("expected_pnl_bid") or 0.0)
                 + float(quotes.get("expected_pnl_ask") or 0.0),
@@ -558,7 +565,12 @@ class MarketMaker:
                     ts_sec = float(ts) / 1000.0
                     self.ws_connected = (time.time() - ts_sec) < WS_STALE_SEC
                     self._last_snapshot = snapshot
-                    self._price_history.append((time.time(), float(mid)))  # §14
+                    now = time.time()
+                    self._price_history.append((now, float(mid)))  # §14
+                    # Alimenta el filtro de momentum del alpha_model (§14):
+                    # una muestra (ts, mid) por ciclo, como ya hace con el
+                    # historial de adverse selection.
+                    self.alpha.record_mid(now, float(mid))
 
                     self._on_fill_detection(snapshot)
                     self._reconcile()

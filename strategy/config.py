@@ -176,6 +176,45 @@ TICK_SIZE_XRPUSDC: float = 0.0001
 MIN_SPREAD_TICKS: int = 8
 
 # ---------------------------------------------------------------------------
+# Filtro de momentum anti-adverse-selection (§14) — PROPUESTA pendiente de
+# confirmacion (§0.4)
+# ---------------------------------------------------------------------------
+#
+# Evidencia (2026-08-10, mainnet): con el piso de 8 ticks el mercado cayó
+# ~0.9% en ~50 min; el bid se llenó primero (compras en caída) y el ask no
+# (RTs -0.0118 y -0.0128 USDC). En mercado tranquilo el piso da
+# +0.0004..+0.0014 neto. Este filtro detecta movimiento direccional del mid
+# y ENSANCHA EL PISO (no solo el spread calculado): si hay momentum, el piso
+# efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER (8 -> 16
+# ticks). Es SIMETRICO (no direccional): no asume hacia dónde va el precio,
+# solo que un movimiento >= MOMENTUM_MAX_TICKS en la ventana hace más
+# probable que un fill inmediato sea adverso. El cooldown evita alternar
+# rápido entre 8 y 16 ticks cuando el mid oscila alrededor del umbral.
+
+# Activa/desactiva el filtro completo (sin borrar el historial).
+MOMENTUM_ENABLED: bool = True
+
+# Ventana de observación del mid (segundos): mid_actual vs mid al inicio de
+# la ventana. Con CYCLE_INTERVAL_SEC=5, ~6 muestras por ventana (suficiente
+# para un filtro de régimen; no es una medida de alta frecuencia).
+MOMENTUM_WINDOW_SECONDS: float = 30.0
+
+# Movimiento mínimo del mid (en ticks, tick_size=0.0001) dentro de la
+# ventana para declarar momentum. 8 ticks = mismo orden que el piso de
+# spread: un movimiento de 1 piso completo en 30 s es claramente direccional.
+MOMENTUM_MAX_TICKS: float = 8.0
+
+# Multiplicador del piso cuando hay momentum: piso efectivo =
+# MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER = 16 ticks (4x las fees
+# maker, cubriendo el gap típico observado de 19 ticks entre entrada y
+# salida en el RT adverso del 2026-08-10).
+MOMENTUM_SPREAD_MULTIPLIER: float = 2.0
+
+# Una vez detectado momentum, el spread ampliado se mantiene al menos este
+# tiempo aunque el mid se calme (evita alternar 8/16 ticks en cada ciclo).
+MOMENTUM_COOLDOWN_SECONDS: float = 60.0
+
+# ---------------------------------------------------------------------------
 # Kill switch (§13)
 # ---------------------------------------------------------------------------
 

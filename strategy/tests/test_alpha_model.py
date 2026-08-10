@@ -321,5 +321,179 @@ class TestPisoDeSpread(unittest.TestCase):
         self.assertAlmostEqual(bid - ask, 2.0 * skew, places=12)
 
 
+class TestFiltroMomentum(unittest.TestCase):
+    """Filtro de momentum anti-adverse-selection (§14, config MOMENTUM_*).
+
+    Evidencia (2026-08-10, mainnet): con piso de 8 ticks el mercado cayó
+    ~0.9% en ~50 min; el bid se llenó primero (compras en caída) y el ask
+    no (RTs -0.0118/-0.0128 USDC). Regla implementada:
+
+        Si |mid_actual - mid_inicio_ventana| >= MOMENTUM_MAX_TICKS * tick_size
+        dentro de MOMENTUM_WINDOW_SECONDS (o el cooldown de
+        MOMENTUM_COOLDOWN_SECONDS sigue vigente), el piso efectivo pasa de
+        MIN_SPREAD_TICKS (8) a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER
+        (16). SIMÉTRICO (usa |Δmid|) y el skew de inventario se aplica igual.
+
+    Verifica (sin red, con historial sintético vía record_mid + now_sec):
+    (a) mid estable  -> piso normal (8 ticks).
+    (b) movimiento >= umbral -> piso ampliado (16 ticks).
+    (c) cooldown: aunque el mid se calme, el piso sigue ampliado hasta
+        superar MOMENTUM_COOLDOWN_SECONDS; luego vuelve a 8.
+    (d) movimiento < umbral -> sin ampliación.
+    (e) simetría: subida y bajada activan el filtro por igual.
+    (f) el piso ampliado convive con el skew de inventario (se preserva).
+    (g) sin historial / filtro desactivado -> comportamiento previo.
+    """
+
+    def setUp(self):
+        self.am = alpha_model.AlphaModel()
+        self.tick = alpha_model.config.TICK_SIZE_XRPUSDC
+        self.floor = alpha_model.config.MIN_SPREAD_TICKS * self.tick
+        self.floor_momentum = (
+            alpha_model.config.MIN_SPREAD_TICKS
+            * alpha_model.config.MOMENTUM_SPREAD_MULTIPLIER
+            * self.tick
+        )
+        self.threshold = alpha_model.config.MOMENTUM_MAX_TICKS * self.tick
+
+    def _snap_quieta(self, mid=2.5, **overrides):
+        base = {"spread": 0.0, "volatility": 0.0, "imbalance": 0.0,
+                "momentum": 0.0, "microprice": 0.0, "inventory": 0.0}
+        base.update(overrides)
+        return _snapshot(mid=mid, **base)
+
+    def _dist(self, snap, now_sec, alpha=0.0, inv=0.0, sigma=0.0):
+        return self.am.quote_distances(snap, alpha, inv, sigma, now_sec=now_sec)
+
+    # (a) mid estable
+    def test_mid_estable_spread_normal(self):
+        """Mid sin movimiento en la ventana -> piso normal (8 ticks)."""
+        for ts, mid in [(0.0, 2.5), (10.0, 2.5), (20.0, 2.5), (30.0, 2.5)]:
+            self.am.record_mid(ts, mid)
+        snap = self._snap_quieta()
+        bid, ask = self._dist(snap, now_sec=35.0)
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+        self.assertAlmostEqual(bid, ask, places=12)
+        self.assertFalse(self.am.last_momentum_active)
+
+    # (b) movimiento >= umbral
+    def test_movimiento_mayor_umbral_amplia_spread(self):
+        """Mid moviéndose >= MOMENTUM_MAX_TICKS en la ventana -> 16 ticks."""
+        # 9 ticks (0.0009) en 20 s: por encima del umbral de 8 ticks.
+        self.am.record_mid(0.0, 2.5)
+        self.am.record_mid(20.0, 2.5 + 9.0 * self.tick)
+        snap = self._snap_quieta()
+        bid, ask = self._dist(snap, now_sec=25.0)
+        self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
+        self.assertAlmostEqual(bid, ask, places=12)
+        self.assertTrue(self.am.last_momentum_active)
+
+    def test_movimiento_igual_al_umbral_amplia_spread(self):
+        """Movimiento == MOMENTUM_MAX_TICKS exacto también activa (>=)."""
+        self.am.record_mid(0.0, 2.5)
+        self.am.record_mid(20.0, 2.5 + self.threshold)
+        snap = self._snap_quieta()
+        bid, ask = self._dist(snap, now_sec=25.0)
+        self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
+
+    # (c) cooldown
+    def test_cooldown_mantiene_spread_ampliado(self):
+        """Tras detectar momentum, el piso ampliado persiste aunque el mid
+        se estabilice, hasta superar MOMENTUM_COOLDOWN_SECONDS."""
+        self.am.record_mid(0.0, 2.5)
+        self.am.record_mid(20.0, 2.5 + 9.0 * self.tick)
+        snap = self._snap_quieta()
+
+        # t=25: detección fresca -> 16 ticks.
+        bid, ask = self._dist(snap, now_sec=25.0)
+        self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
+
+        # t=40: el mid ya se estabilizó (muestra vieja de la ventana
+        # podada), pero el cooldown (60 s desde t=25) sigue corriendo.
+        self.am.record_mid(40.0, 2.5 + 9.0 * self.tick)
+        bid, ask = self._dist(snap, now_sec=40.0)
+        self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
+
+        # t=90: cooldown vencido (90-25=65 >= 60) y sin nueva detección
+        # (muestras estables dentro de la ventana) -> vuelve a 8 ticks.
+        self.am.record_mid(90.0, 2.5 + 9.0 * self.tick)
+        bid, ask = self._dist(snap, now_sec=90.0)
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+        self.assertFalse(self.am.last_momentum_active)
+
+    # (d) movimiento < umbral
+    def test_movimiento_menor_umbral_sin_ampliacion(self):
+        """3 ticks (< 8) en la ventana -> piso normal (8 ticks)."""
+        self.am.record_mid(0.0, 2.5)
+        self.am.record_mid(20.0, 2.5 + 3.0 * self.tick)
+        snap = self._snap_quieta()
+        bid, ask = self._dist(snap, now_sec=25.0)
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+        self.assertFalse(self.am.last_momentum_active)
+
+    # (e) simetría
+    def test_simetrico_subida_y_bajada(self):
+        """Tanto subida como bajada del mid activan el filtro por igual."""
+        for direccion in (+1.0, -1.0):
+            am = alpha_model.AlphaModel()  # estado limpio por dirección
+            am.record_mid(0.0, 2.5)
+            am.record_mid(20.0, 2.5 + direccion * 10.0 * self.tick)
+            snap = self._snap_quieta()
+            bid, ask = am.quote_distances(snap, 0.0, 0.0, 0.0, now_sec=25.0)
+            self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
+            self.assertTrue(am.last_momentum_active)
+
+    # (f) convivencia con skew de inventario
+    def test_skew_inventario_convive_con_piso_ampliado(self):
+        """Con momentum activo: piso 16 ticks se mantiene y el skew de
+        inventario se aplica encima (bid - ask == 2*skew)."""
+        mid = 2.5
+        sigma = 0.00002
+        inv = 10.0  # nocional = 25 USDC = MAX_POSITION_NOTIONAL_USDC -> ratio 1.0
+        self.am.record_mid(0.0, 2.5)
+        self.am.record_mid(20.0, 2.5 + 9.0 * self.tick)
+        snap = self._snap_quieta(mid=mid, volatility=sigma, inventory=inv)
+        bid, ask = self._dist(snap, now_sec=25.0, inv=inv, sigma=sigma)
+        # Piso ampliado se mantiene pese al skew.
+        self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
+        # Inventario long -> bid más lejos del mid que el ask.
+        self.assertGreater(bid, ask)
+        sigma_ef = sigma * math.sqrt(12.0) * math.sqrt(5.0)
+        skew = ((inv * mid) / alpha_model.config.MAX_POSITION_NOTIONAL_USDC
+                * alpha_model.INVENTORY_SKEW_MULTIPLIER * sigma_ef)
+        self.assertAlmostEqual(bid - ask, 2.0 * skew, places=12)
+
+    # (g) comportamiento previo sin historial / desactivado
+    def test_sin_historial_comportamiento_previo(self):
+        """Sin historial alimentado -> el filtro no altera nada (8 ticks)."""
+        snap = self._snap_quieta()
+        bid, ask = self._dist(snap, now_sec=100.0)
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+        self.assertFalse(self.am.last_momentum_active)
+
+    def test_record_mid_ignora_muestras_invalidas(self):
+        """record_mid descarta ts/mid inválidos (no contaminan el filtro)."""
+        for ts, mid in [(0.0, 2.5), (None, 2.5), (10.0, None), (20.0, -1.0),
+                        (30.0, 0.0), (float("nan"), 2.5)]:
+            self.am.record_mid(ts, mid)
+        snap = self._snap_quieta()
+        bid, ask = self._dist(snap, now_sec=35.0)
+        self.assertAlmostEqual(bid + ask, self.floor, places=12)
+
+    def test_desactivado_por_config(self):
+        """MOMENTUM_ENABLED=False -> gran movimiento NO amplía el piso."""
+        enabled = alpha_model.config.MOMENTUM_ENABLED
+        try:
+            alpha_model.config.MOMENTUM_ENABLED = False
+            self.am.record_mid(0.0, 2.5)
+            self.am.record_mid(20.0, 2.5 + 50.0 * self.tick)
+            snap = self._snap_quieta()
+            bid, ask = self._dist(snap, now_sec=25.0)
+            self.assertAlmostEqual(bid + ask, self.floor, places=12)
+            self.assertFalse(self.am.last_momentum_active)
+        finally:
+            alpha_model.config.MOMENTUM_ENABLED = enabled
+
+
 if __name__ == "__main__":
     unittest.main()
