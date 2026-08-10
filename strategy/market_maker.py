@@ -216,6 +216,26 @@ class MarketMaker:
         bid_size = base_size * self.inventory.order_side_aggression("BUY")
         ask_size = base_size * self.inventory.order_side_aggression("SELL")
 
+        # Clamp del lado que REDUCE inventario (fix 2026-08-10, corrida
+        # mainnet real): con inventory=4.9 el skew 1.5x pide ask_size=7.35,
+        # pero el Risk Engine rechaza qty > max_order_size (=4.9) con
+        # order_size_exceeded -> posición atascada (ni reduce ni repone).
+        # Fórmula del clamp (lado reduce):
+        #     reduce_cap = min(risk.max_order_size, |inventario a reducir| + base_size)
+        #     ask_size   = min(ask_size, reduce_cap)  si inventory > 0 (long)
+        #     bid_size   = min(bid_size, reduce_cap)  si inventory < 0 (short)
+        # - inventory=4.9, base=4.9: cap = min(4.9, 9.8) = 4.9 -> ask=4.9
+        #   (exactamente la posición, reduce-only 100%; pasa order_size_exceeded).
+        # - inventory=0: el clamp no aplica (agresión 1.0 en ambos lados,
+        #   4.9/4.9, comportamiento original intacto).
+        max_order_size = float(getattr(self.risk, "max_order_size", 0.0) or 0.0)
+        if max_order_size > 0.0 and inventory != 0.0:
+            reduce_cap = min(max_order_size, abs(inventory) + base_size)
+            if inventory > 0.0:  # long: el ask reduce
+                ask_size = min(ask_size, reduce_cap)
+            else:  # short: el bid reduce
+                bid_size = min(bid_size, reduce_cap)
+
         bid_price = r - bid_dist
         ask_price = r + ask_dist
 
