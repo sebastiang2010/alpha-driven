@@ -43,8 +43,18 @@ MAX_POSITION_NOTIONAL_USDC: float = 25.0
 # Drawdown máximo permitido desde el pico de equity (5%).
 MAX_DRAWDOWN_PCT: float = 0.05
 
-# Apalancamiento máximo usado. Moderado, NO el máximo (nota §4 sugiere 5x-10x).
-MAX_LEVERAGE_USED: int = 5
+# Apalancamiento máximo usado. = máximo REAL del símbolo: 1/requiredMarginPercent
+# (exchangeInfo fapi.binance.com verificado 2026-08-09: 5.0% → 20x). 75x es
+# imposible: a 75x el margen inicial (1.33%) < margen de mantenimiento (2.5%).
+# Autorizado por humano §0.4 (2026-08-09).
+MAX_LEVERAGE_USED: int = 20
+
+# Presupuestos de riesgo §0.4 CONFIRMADOS por humano (2026-08-09):
+# MAX_DAILY_LOSS_USDC=10.0, MAX_POSITION_NOTIONAL_USDC=25.0,
+# MAX_DRAWDOWN_PCT=0.05, MAX_LEVERAGE_USED=20, BASE_ORDER_SIZE_XRP=5.0.
+# run_mainnet.py aborta si esto es False (§0.4: no operar con fondos reales
+# con presupuestos "pendiente de confirmación").
+BUDGETS_CONFIRMED: bool = True
 
 # ---------------------------------------------------------------------------
 # Niveles de exposición (§21)
@@ -52,7 +62,8 @@ MAX_LEVERAGE_USED: int = 5
 
 # Nivel actual de exposición. Nivel 0 = dry-run (no enviar órdenes reales).
 # Subir de nivel requiere autorización humana (§0.2).
-EXPOSURE_LEVEL: int = 0
+# Autorizado por humano §0.2 (2026-08-09): Nivel 1 mainnet mínimo.
+EXPOSURE_LEVEL: int = 1
 
 # Multiplicador de tamaño por nivel. La exposición efectiva se calcula
 # multiplicando el tamaño base por este multiplicador.
@@ -86,7 +97,9 @@ def effective_exposure_multiplier() -> float:
 
 # Cantidad mínima típica para XRPUSDC futures. El execution_engine la valida
 # contra los filtros reales del símbolo consultados dinámicamente (§3).
-BASE_ORDER_SIZE_XRP: float = 20.0
+# 5.0 XRP ≈ $5.17 a $1.0330: mínimo seguro sobre minNotional $5 (el mínimo
+# viable exacto es 4.9 XRP = $5.0617). Autorizado por humano §0.4 (2026-08-09).
+BASE_ORDER_SIZE_XRP: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Ciclo principal
