@@ -464,7 +464,14 @@ class ExecutionEngine:
     def reconcile_position(self):
         """Devuelve el dict de posición de api.get_open_position_for_symbol.
 
-        None si falla la API o el módulo no está disponible.
+        Semántica de retorno:
+        - dict → posición reconciliada (válida). Si la API confirmó que NO
+          hay posición abierta, se devuelve un dict normalizado de posición
+          vacía: {"symbol", "positionAmt": "0", "entryPrice": "0",
+          "unrealizedProfit": "0"} — permite distinguir "cuenta limpia"
+          (válido) de "error" (None).
+        - None → error: la API falló (BinanceAPIException) o el módulo no
+          está disponible (api is None).
         """
         if api is None:
             return None
@@ -472,6 +479,15 @@ class ExecutionEngine:
         if isinstance(result, BinanceAPIException):
             logger.error("ExecutionEngine: get_open_position_for_symbol falló: %s", result)
             return None
+        if result is None:
+            # API OK pero sin posición abierta: dict normalizado de posición 0
+            # (el caller distingue "válido" de "error" que devuelve None).
+            return {
+                "symbol": self.symbol,
+                "positionAmt": "0",
+                "entryPrice": "0",
+                "unrealizedProfit": "0",
+            }
         return result
 
     # ── Leverage ─────────────────────────────────────────────────────────
