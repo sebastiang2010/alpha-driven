@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-11 09:42 (reporte de trades activo cada 5 min — `reports/trade_status.txt`).
+> Última actualización: 2026-08-11 09:54 (reporte de trades activo cada 5 min — `reports/trade_status.txt`, con PnL real de Binance API).
 
 ---
 
@@ -30,7 +30,7 @@
 
 **Corrida actual (2026-08-11)**: bot PID **26756** relanzado 09:18:59 local vía `relauncher_2h.sh` (v3+lock, ventana 120 min). Código `732177b` (constante 5.0). Decisiones activas con `bid_size=ask_size=5.0` (> $5 minNotional ✓). Risk engine en espera: `expected_net_pnl_non_positive` (no emite órdenes perdedoras, correcto). Inventario 0.0. El fix del code-reviewer (`30b3cd2`) fue revertido por decisión humana — el algoritmo quedó intacto y el minNotional se resuelve solo con la constante 5.0.
 
-**Reporte de trades (nuevo)**: `reports/trade_status.py` genera `reports/trade_status.txt` (trades, PnL neto con fee maker 0.0002 §0.4, últimos fills/rechazos, estado del bot) y `reports/update_trade_status.sh` lo actualiza **cada 5 min** (loop en background, PID 102528/61688). Datos al 09:42 local: **45 trades reales** (fills `simulated=false`, 10/8 + 11/8), Gross PnL **+5.0042 USDC**, Net PnL **+4.9590 USDC**, inventario 0.0. Hoy 11/8: 4 fills (2 BUY + 2 SELL de 5.0 XRP). Rechazos = maker check §10 (sanos, sin errores Binance).
+**Reporte de trades (nuevo)**: `reports/trade_status.py` genera `reports/trade_status.txt` (trades, PnL neto con fee maker 0.0002 §0.4, últimos fills/rechazos, estado del bot) y `reports/update_trade_status.sh` lo actualiza **cada 5 min** (loop en background, relanzado 09:53 local con el fetch de PnL integrado). **PnL REAL según Binance API (fuente de verdad, `reports/fetch_binance_pnl.py` → `binance_pnl.json`)**: 49 trades XRPUSDC → **Net PnL = −0.026540 USDC** (realized −0.026540, commission 0.0, funding 0.0; 10/08: 42 trades −0.022540; 11/08: 7 trades −0.004000). **El PnL estimado por logs locales (+4.9630) está INFLADO**: el log de fills del 10/08 quedó truncado (faltan compras → notional comprado subestimado). Auditoría: 48/48 orderIds de la API coinciden con `server_order_id` de los logs → todos los trades son del bot (el `clientOrderId` viene `None` en python-binance, el filtro `MM-` no funciona). El humano tenía razón en dudar de +4.96. Rechazos = maker check §10 (sanos, sin errores Binance).
 
 ---
 
@@ -138,6 +138,7 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 ## Log de actualizaciones
 
+- **2026-08-11 (09:54 local)**: **PnL REAL integrado al reporte — el estimado por logs estaba mal**. Nuevo `reports/fetch_binance_pnl.py` (usa `get_my_trades` + `get_income_history` de la API, fuente de verdad §18) → `reports/binance_pnl.json` con `trades_raw` para auditoría. Resultado: **Net PnL real = −0.026540 USDC** (49 trades; 10/08 −0.0225, 11/08 −0.0040; commission/funding 0.0 según API — posible fee-0 del par, reportar tal cual). El **+4.9590 estimado era artefacto del log de fills truncado del 10/08** (faltan compras). Auditoría de coincidencia: 48/48 orderIds API ↔ `server_order_id` de logs → 0 trades ajenos; `clientOrderId` es `None` en `futures_account_trades` (la librería no lo mapea) → el filtro `MM-` es inútil, usar `orderId`/`server_order_id`. `trade_status.py` ampliado (secciones PNL BINANCE / PNL ESTIMADO / ULTIMOS TRADES BINANCE); `update_trade_status.sh` ahora corre fetch+status cada 5 min (loop relanzado, PIDs viejos 102528/61688 matados). Bot sigue operando normal (trades 09:31–09:49 local). Pendiente commit.
 - **2026-08-11**: **fix bug minNotional — SOLO constante (decisión humana §0.2: "usa 5.0 XRP")**: `BASE_ORDER_SIZE_XRP` 4.9→5.0 (5.0 XRP × ~$1,02 ≈ $5,10 ≥ minNotional $5). El intento del subagente (commit `30b3cd2`: floor de notional + reduce_only + exención minNotional en engine, suite 76/76) fue **revertido a pedido del humano**: no tocar el algoritmo de cálculo ahora, revisarlo en una iteración dedicada. **Suite 67/67 OK.** Pendiente: verificación en vivo (re-lanzar mainnet — el relauncher relanza al matar el proceso).
 - **2026-08-09**: creado este archivo. Módulos `strategy/` completos, `market_maker.py` orquestador creado, tests Risk Engine 13/13 OK, kill switch cubierto.
 - **2026-08-09**: corregidos maker check §10 y semántica de fills `is_buyer_maker`. Nuevo `test_execution_engine.py` (14/14 OK). Auditados bugs pendientes (Nivel 0/dry-run, init_client, cancel purga local, kill switch reduce/close, NetPnL, sigma).

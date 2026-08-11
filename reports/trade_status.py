@@ -122,14 +122,52 @@ def main():
     L.append(f"  Vendido:              {sell_qty:.1f} XRP en {len([r for r in fills if r['side']=='SELL'])} fills @ medio {avg_sell:.5f}")
     L.append(f"  Inventario actual:    {inv:.2f} XRP  ({'posicion cerrada' if abs(inv) < 1e-9 else 'posicion ABIERTA'})")
     L.append("")
-    L.append("--- PNL (USDC) ---")
+    # ---- PnL BINANCE (fuente de verdad, si el fetch corrio hace poco) ----
+    bnl = None
+    bnl_path = os.path.join(ROOT, "reports", "binance_pnl.json")
+    if os.path.exists(bnl_path):
+        try:
+            with open(bnl_path, "r", encoding="utf-8") as f:
+                bnl = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            bnl = None
+    bnl_fresh = False
+    if bnl and bnl.get("fetched_at_utc"):
+        try:
+            ft = datetime.fromisoformat(bnl["fetched_at_utc"].replace("Z", "+00:00"))
+            bnl_fresh = (datetime.now(timezone.utc) - ft).total_seconds() <= 600
+        except ValueError:
+            bnl_fresh = False
+
+    L.append("--- PNL BINANCE (fuente de verdad, API directa §18) ---")
+    if bnl and bnl_fresh:
+        L.append(f"  Trades segun exchange: {bnl['n_trades']}   (fetch {bnl['fetched_at_utc'][11:16]}Z)")
+        L.append(f"  Realized PnL:        {bnl['realized_pnl']:+.6f}")
+        L.append(f"  Commission:          {bnl['commission']:+.6f}  ({', '.join(bnl['commission_assets']) if bnl['commission_assets'] else 'n/a'})")
+        L.append(f"  Funding fee:         {bnl['funding_fee']:+.6f}")
+        L.append(f"  NET PnL (BINANCE):   {bnl['net_pnl']:+.6f}")
+        for d, v in sorted(bnl.get("per_day", {}).items()):
+            L.append(f"    {d}: trades={v['n']}  realized={v['realized']:+.6f}  comm={v['commission']:+.6f}  funding={v['funding']:+.6f}")
+    else:
+        L.append("  (no disponible — correr reports/fetch_binance_pnl.py)")
+    L.append("")
+    L.append("--- PNL ESTIMADO (logs locales — puede estar incompleto) ---")
     L.append(f"  Gross PnL:            {gross_pnl:+.4f}")
     L.append(f"  Fees estimadas:       -{fees:.4f}  (fee maker {fee_rate:.4%})")
-    L.append(f"  Net PnL:              {net_pnl:+.4f}")
+    L.append(f"  Net PnL (estimado):   {net_pnl:+.4f}")
     if abs(unreal) > 1e-9:
         L.append(f"  PnL no realizado:     {unreal:+.4f} (marcado a mercado, inventario abierto)")
     L.append("")
-    L.append("--- ULTIMOS FILLS ---")
+    L.append("--- ULTIMOS TRADES BINANCE ---")
+    if bnl and bnl_fresh and bnl.get("trades_raw"):
+        for t in bnl["trades_raw"][-5:]:
+            ts = datetime.fromtimestamp(t["time"] / 1000).strftime("%d/%m %H:%M:%S")
+            rp = float(t.get("realizedPnl") or 0)
+            L.append(f"  {ts}  {t['side']:<4} {t['qty']} @ {t['price']}  (rp={rp:+.6f})")
+    else:
+        L.append("  (sin datos de Binance)")
+    L.append("")
+    L.append("--- ULTIMOS FILLS (log local) ---")
     if fills:
         for r in fills[-5:]:
             L.append(f"  {local_ts(r['ts'])}  {r['side']:<4} {r['fill_qty']:.1f} @ {r['fill_price']:.5f}")
