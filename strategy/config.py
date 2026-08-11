@@ -101,7 +101,7 @@ def effective_exposure_multiplier() -> float:
 # precio $1.0314 = 4.8478 XRP → redondeado al step 0.1 = 4.9 XRP ≈ $5.05
 # (4.8 XRP = $4.95 < $5 sería rechazado). Cumple minNotional mientras
 # precio > $1.0204.
-BASE_ORDER_SIZE_XRP: float = 4.9
+BASE_ORDER_SIZE_XRP: float = 5.0  # fix aprobado humano §0.2 2026-08-10: 5.0 XRP = $5.00 @ $1.00 → notional >= minNotional $5
 
 # ---------------------------------------------------------------------------
 # Ciclo principal
@@ -163,6 +163,14 @@ QUOTE_UPDATE_THRESHOLD_PCT: float = 0.001
 # si market_state llega a exponer tick_size, ese valor tiene prioridad
 # (specs dinámicas §3 — nunca asumir, pero no hay otra fuente hoy).
 TICK_SIZE_XRPUSDC: float = 0.0001
+
+# Specs del símbolo usadas como FALLBACK para el floor de notional (§3).
+# En runtime el floor lee symbol_info dinámico del exchange (min_notional /
+# step_size); estas constantes solo aplican en dry-run/tests sin API.
+# Valores verificados contra exchangeInfo mainnet (corrida 2026-08-10):
+# minNotional 5.0 USDC, stepSize 0.1 XRP. Fix aprobado humano §0.2 (2026-08-10).
+MIN_NOTIONAL_USDC: float = 5.0
+QUANTITY_STEP: float = 0.1
 
 # Piso mínimo de spread total cotizado (bid_dist + ask_dist), en ticks.
 # Breakeven con fee maker VIP0 (MAKER_FEE_RATE=0.0002) y tick 0.0001, para

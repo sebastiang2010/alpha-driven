@@ -250,8 +250,14 @@ class ExecutionEngine:
         return self.symbol_info
 
     # ── Validación de parámetros (§3, §0.6) ──────────────────────────────
-    def validate_order_params(self, price: float, qty: float):
+    def validate_order_params(self, price: float, qty: float,
+                              reduce_only: bool = False):
         """Redondea price al tick y qty al step; valida minQty/minNotional y price > 0.
+
+        reduce_only=True (Reduce-Only que reduce/cierra posición): Binance
+        exime a estas órdenes del filtro MIN_NOTIONAL (announcement 2021-01-20;
+        punto 3 del fix §0.2 2026-08-10) → se omite el check de minNotional.
+        minQty, tick/step y price > 0 se siguen validando siempre.
 
         Returns: (ok, reason, rounded_price, rounded_qty). Los dos últimos son
         los valores ya redondeados para usar en la orden.
@@ -283,7 +289,7 @@ class ExecutionEngine:
                     f"qty {rounded_qty} < minQty {info['min_qty']}",
                     rounded_price, rounded_qty)
 
-        if info.get("min_notional") is not None:
+        if info.get("min_notional") is not None and not reduce_only:
             notional = rounded_price * rounded_qty
             if notional < info["min_notional"] - 1e-12:
                 return (False,
@@ -324,7 +330,9 @@ class ExecutionEngine:
         if side not in ("BUY", "SELL"):
             return (None, False, f"side inválido: {side}")
 
-        ok, reason, rounded_price, rounded_qty = self.validate_order_params(price, qty)
+        ok, reason, rounded_price, rounded_qty = self.validate_order_params(
+            price, qty, reduce_only=reduce_only
+        )
         if not ok:
             return (None, False, reason)
         price, qty = rounded_price, rounded_qty
