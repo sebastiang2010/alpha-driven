@@ -427,6 +427,44 @@ class ExecutionEngine:
                 canceled += 1
         return canceled
 
+    def sweep_orphan_orders(self):
+        """Cancela órdenes del bot que quedaron fuera del seguimiento local (§0.6).
+
+        Una orden "huérfana" es una maker del bot (clientOrderId con prefijo
+        MM-) abierta en el exchange que NO está en self.open_orders. Puede
+        aparecer tras un proceso anterior muerto sin stop(), un crash a mitad
+        de ciclo o una pérdida de tracking local (clase de bug de la corrida
+        2026-08-11). El preflight y stop() la barren para no dejar posiciones
+        resting que el bot no controla.
+
+        No toca órdenes de otros bots (los clientOrderId no-MM- se ignoran;
+        en la misma VPS corren otros procesos §0.3). En dry-run no hay API:
+        devuelve 0.
+        """
+        if self.dry_run or api is None:
+            return 0
+        result = api.get_open_orders(self.symbol)
+        if isinstance(result, BinanceAPIException):
+            logger.error("ExecutionEngine: get_open_orders falló en sweep: %s", result)
+            return 0
+        with self._lock:
+            tracked = set(self.open_orders.keys())
+        swept = 0
+        for o in result or []:
+            coid = o.get("clientOrderId") or ""
+            if not coid.startswith("MM-") or coid in tracked:
+                continue
+            if isinstance(api.cancel_order(self.symbol, orig_client_id=coid),
+                          BinanceAPIException):
+                logger.error("ExecutionEngine: sweep no pudo cancelar huérfana %s", coid)
+                continue
+            swept += 1
+            logger.warning("ExecutionEngine: orden huérfana cancelada (sweep): %s", coid)
+            self._log_order_event("sweep_canceled", coid,
+                                  o.get("side", "?"), o.get("price"), o.get("origQty"),
+                                  "huérfana fuera de tracking (sweep §0.6)")
+        return swept
+
     # ── Sincronización con el exchange (§0.6 frecuencia) ─────────────────
     def refresh_open_orders(self):
         """Sincroniza open_orders con la realidad del exchange.

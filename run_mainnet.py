@@ -34,7 +34,8 @@ Flujo:
      simuladas (dry-run) en el journal.
 
 Exit codes: 0 = gate OK, 1 = gate falló, 2 = sin data de mercado,
-            3 = pre-flight falló o autorización denegada.
+            3 = pre-flight falló o autorización denegada,
+            4 = otra instancia corriendo (lock single-instance §12).
 
 Uso:
     python run_mainnet.py [--cycles N] [--yes]
@@ -45,6 +46,7 @@ import argparse
 import datetime
 import json
 import logging
+import os
 import pathlib
 import sys
 import threading
@@ -60,7 +62,9 @@ from strategy.config import (  # noqa: E402
     BASE_ORDER_SIZE_XRP,
     BUDGETS_CONFIRMED,
     CYCLE_INTERVAL_SEC,
+    DIVERGENCE_MIN_DECISIONS,
     EXPOSURE_LEVEL,
+    INSTANCE_LOCK_PATH,
     LOG_DECISIONS,
     LOG_DIR,
     LOG_FILLS,
@@ -68,7 +72,10 @@ from strategy.config import (  # noqa: E402
     LOG_PNL,
     MAX_LEVERAGE_USED,
     MAX_POSITION_NOTIONAL_USDC,
+    MONITOR_INTERVAL_SEC,
     REAL,
+    STALL_STOP_SEC,
+    STALL_WARN_SEC,
     SYMBOL,
 )
 from strategy.market_maker import MarketMaker  # noqa: E402
@@ -128,6 +135,146 @@ def _read_lines(path: pathlib.Path) -> list[dict]:
     return out
 
 # ── Pre-flight (§0.2/§0.4/§3) ──────────────────────────────────────────────
+
+def _lock_is_stale(pid: int) -> bool:
+    """True si el PID del lock ya no existe en el sistema."""
+    try:
+        os.kill(pid, 0)
+        return False
+    except OSError:
+        return True
+
+
+def _acquire_instance_lock() -> bool:
+    """Lock single-instance (§12): O_EXCL + PID. Aborta (False) si otra
+    instancia está corriendo (clase de bug de la corrida 2026-08-11: 2
+    procesos compartiendo XRPUSDC -> -2011 y orden huérfana)."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    try:
+        fd = os.open(INSTANCE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            pid = int(INSTANCE_LOCK_PATH.read_text().strip() or "0")
+        except (OSError, ValueError):
+            pid = 0
+        if pid and _lock_is_stale(pid):
+            log.warning("Lock previo con PID muerto (%d): lo reemplazo.", pid)
+            try:
+                INSTANCE_LOCK_PATH.unlink()
+            except OSError:
+                return False
+            return _acquire_instance_lock()
+        log.error("Otra instancia de run_mainnet corriendo (PID %s). Abortando (exit 4).",
+                  pid if pid else "desconocido")
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+    log.info("Lock single-instance adquirido: %s (PID %d)", INSTANCE_LOCK_PATH, os.getpid())
+    return True
+
+
+def _release_instance_lock() -> None:
+    """Libera el lock single-instance (solo si el PID es el nuestro)."""
+    try:
+        pid = int(INSTANCE_LOCK_PATH.read_text().strip() or "0")
+    except (OSError, ValueError):
+        pid = 0
+    if pid == os.getpid():
+        try:
+            INSTANCE_LOCK_PATH.unlink()
+            log.info("Lock single-instance liberado.")
+        except OSError as e:
+            log.warning("No pude liberar el lock: %s", e)
+
+
+def _start_monitor(mm: MarketMaker, start_iso: str, start_wall: float) -> threading.Thread:
+    """Hilo de monitor ligero (§11): heartbeat + stall/divergencia.
+
+    - Stall: el journal de decisiones no avanza mientras el WS está conectado
+      (data fresca pero el loop no avanza → colgamiento real). Warning a
+      STALL_WARN_SEC; stop() conservador (cierra órdenes) a STALL_STOP_SEC.
+      Si el WS está caído el bot espera reconexión legítimamente: no se
+      detiene (lo cubre el techo duro del watchdog §13).
+    - Divergencia decisión/ejecución: >= DIVERGENCE_MIN_DECISIONS con
+      reason==ok en la ventana y 0 eventos de órdenes → el execution_engine
+      podría estar colgado tras los quotes.
+    """
+    def _loop() -> None:
+        prev_divergent = False
+        last_stall_warn = 0.0
+        while not mm._stop.is_set():
+            time.sleep(MONITOR_INTERVAL_SEC)
+            try:
+                dec = _read_lines(LOG_DECISIONS / "agent_decisions.jsonl")
+                new_dec = [ev for ev in dec if str(ev.get("timestamp", "")) >= start_iso]
+                orders = _read_lines(LOG_ORDERS / f"orders_{datetime.datetime.now():%Y%m%d}.jsonl")
+                new_orders = [ev for ev in orders if float(ev.get("ts", 0.0) or 0.0) >= start_wall]
+                fills = _read_lines(LOG_FILLS / f"fills_{datetime.datetime.now():%Y%m%d}.jsonl")
+                new_fills = [ev for ev in fills if float(ev.get("ts", 0.0) or 0.0) >= start_wall]
+
+                ok_dec = [ev for ev in new_dec if ev.get("reason") == "ok"]
+                order_events = [ev for ev in new_orders
+                                if str(ev.get("event") or "") in
+                                ("placed", "canceled", "rejected", "error", "sweep_canceled")]
+
+                # Stall: edad del último evento de decisión.
+                stall_age = None
+                if new_dec:
+                    last = max(str(ev.get("timestamp", "")) for ev in new_dec)
+                    try:
+                        last_dt = datetime.datetime.fromisoformat(last)
+                        stall_age = (datetime.datetime.utcnow() - last_dt).total_seconds()
+                    except ValueError:
+                        pass
+
+                log.info("[monitor] decisions=%d ok=%d orders=%d fills=%d ws=%s stall_age=%s",
+                         len(new_dec), len(ok_dec), len(order_events), len(new_fills),
+                         mm.ws_connected,
+                         f"{stall_age:.0f}s" if stall_age is not None else "n/a")
+
+                if (mm.ws_connected and stall_age is not None
+                        and stall_age > STALL_STOP_SEC):
+                    log.critical("[monitor] STALL: %d s sin decisiones con WS "
+                                 "conectado. Stop conservador (cierra órdenes).",
+                                 int(stall_age))
+                    mm.stop()
+                    break
+                if (mm.ws_connected and stall_age is not None
+                        and stall_age > STALL_WARN_SEC
+                        and time.time() - last_stall_warn > 60.0):
+                    log.warning("[monitor] stall sospechoso: %d s sin decisiones "
+                                "con WS conectado.", int(stall_age))
+                    last_stall_warn = time.time()
+
+                # Divergencia: muchas decisiones ok sin ningún evento de órdenes.
+                cutoff = time.time() - 60.0
+                ok_in_window = sum(1 for ev in ok_dec if _iso_age_sec(ev.get("timestamp")) <= 60.0)
+                orders_in_window = sum(1 for ev in order_events if ev.get("ts", 0.0) >= cutoff)
+                fills_in_window = sum(1 for ev in new_fills if ev.get("ts", 0.0) >= cutoff)
+                divergent = (ok_in_window >= DIVERGENCE_MIN_DECISIONS
+                             and orders_in_window == 0 and fills_in_window == 0)
+                if divergent and not prev_divergent:
+                    log.warning("[monitor] DIVERGENCIA: %d decisiones reason==ok en 60 s "
+                                "con 0 eventos de órdenes/fills — posible colgamiento "
+                                "del execution_engine.", ok_in_window)
+                prev_divergent = divergent
+            except Exception as e:  # nunca matar el monitor ni la corrida
+                log.exception("[monitor] error interno: %s", e)
+
+    t = threading.Thread(target=_loop, name="monitor", daemon=True)
+    t.start()
+    return t
+
+
+def _iso_age_sec(iso: str | None) -> float:
+    """Edad en segundos de un timestamp ISO (utcnow), o +inf si no parsea."""
+    try:
+        dt = datetime.datetime.fromisoformat(str(iso))
+        return (datetime.datetime.utcnow() - dt).total_seconds()
+    except ValueError:
+        return float("inf")
+
+
 def _preflight(mm: MarketMaker) -> list[str]:
     """Chequeos previos a la primera orden mainnet. Devuelve lista de errores."""
     errors: list[str] = []
@@ -137,6 +284,17 @@ def _preflight(mm: MarketMaker) -> list[str]:
         errors.append("init_client(real=True) falló (cliente mainnet no disponible)")
         return errors
     mm.exec.init_symbol_info()
+
+    # 1.5 Órdenes huérfanas del bot (prefijo MM-) fuera de tracking local
+    #     (§0.6): clase de bug de la corrida 2026-08-11 (orden de un proceso
+    #     anterior que quedó resting). Cancelarlas antes de operar evita
+    #     -2011 y que el bot conviva con órdenes que no controla.
+    try:
+        n = mm.exec.sweep_orphan_orders()
+        if n:
+            log.warning("Pre-flight: %d órdenes huérfanas canceladas (sweep §0.6)", n)
+    except Exception as e:
+        errors.append(f"sweep_orphan_orders falló: {e}")
 
     # 2. Precio de marca disponible (los quotes se anclan al mid real).
     #    Se obtiene ANTES del chequeo de posición: hace falta para valuar el
@@ -335,7 +493,13 @@ def main(argv: list[str] | None = None) -> int:
                   "No se opera con fondos reales. Abortando.")
         return 3
 
-    log_path = LOG_DIR / "run_mainnet.log"
+    # ── Instancia única (§12) ─────────────────────────────────────────────
+    if not _acquire_instance_lock():
+        return 4
+
+    # Log por corrida (§13): nombre único con timestamp; no se mezclan
+    # corridas en un mismo archivo (clase de bug 2026-08-11).
+    log_path = LOG_DIR / f"run_mainnet_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
     _setup_logging(log_path)
     start_iso = datetime.datetime.utcnow().isoformat(timespec="seconds")
     start_wall = time.time()
@@ -383,6 +547,10 @@ def main(argv: list[str] | None = None) -> int:
     watchdog = threading.Thread(target=_watchdog, daemon=True)
     watchdog.start()
 
+    # Monitor ligero (§11): heartbeat + stall/divergencia (no reemplaza el
+    # techo duro del watchdog §13, lo complementa para colgamientos cortos).
+    monitor = _start_monitor(mm, start_iso, start_wall)
+
     exit_code = 1
     try:
         mm.run(max_cycles=args.cycles)  # incluye finally: self.stop()
@@ -396,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
         mm.stop()
         exit_code = 1
     finally:
+        monitor.join(timeout=5)
+        _release_instance_lock()
         log.info("Fin mainnet. Exit code=%d", exit_code)
     return exit_code
 

@@ -268,3 +268,25 @@ LOG_ORDERS: pathlib.Path = LOG_DIR / "orders"
 LOG_FILLS: pathlib.Path = LOG_DIR / "fills"
 LOG_PNL: pathlib.Path = LOG_DIR / "pnl"
 LOG_DECISIONS: pathlib.Path = LOG_DIR / "decisions"
+
+# ---------------------------------------------------------------------------
+# Operación: instancia única y watchdog ligero (§11, §12)
+# ---------------------------------------------------------------------------
+
+# Lock single-instance (§12): run_mainnet.py lo crea con O_EXCL + PID y aborta
+# (exit code 4) si otra instancia está corriendo. Previene la clase de bug de la
+# corrida 2026-08-11 (2 procesos compartiendo XRPUSDC -> -2011 y orden huérfana).
+INSTANCE_LOCK_PATH: pathlib.Path = LOG_DIR / "run_mainnet.lock"
+
+# Heartbeat del monitor (§11): cada cuánto reporta progreso el hilo monitor.
+MONITOR_INTERVAL_SEC: float = 15.0
+
+# Sin decisiones nuevas en el journal por este tiempo -> warning de diagnóstico.
+STALL_WARN_SEC: float = 60.0
+
+# Sin decisiones nuevas por este tiempo -> stop() conservador (cierra órdenes).
+STALL_STOP_SEC: float = 180.0
+
+# Divergencia decisión/ejecución (§11): si hay >= N decisiones reason==ok en la
+# ventana y 0 eventos de órdenes -> posible colgamiento del execution_engine.
+DIVERGENCE_MIN_DECISIONS: int = 8

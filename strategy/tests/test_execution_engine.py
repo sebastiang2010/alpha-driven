@@ -54,9 +54,13 @@ class FakeBookAPI:
     def __init__(self, best_bid=None, best_ask=None):
         self.best_bid = best_bid
         self.best_ask = best_ask
+        self.open_orders = []
 
     def get_order_book_top(self, symbol):
         return {"best_bid": self.best_bid, "best_ask": self.best_ask}
+
+    def get_open_orders(self, symbol):
+        return list(self.open_orders)
 
     def get_symbol(self, symbol):
         """Exchange info mínimo para que init_symbol_info cargue filtros reales."""
@@ -260,6 +264,66 @@ class TestCancelOrderById(unittest.TestCase):
         self.assertTrue(ok, reason)
         self.assertTrue(engine.cancel_order_by_id(oid))
         self.assertNotIn(oid, engine.open_orders)
+
+
+class TestSweepOrphanOrders(unittest.TestCase):
+    """§0.6: sweep_orphan_orders cancela solo órdenes MM- fuera de tracking.
+
+    Clase de bug de la corrida 2026-08-11: una orden de un proceso anterior
+    quedó resting fuera del seguimiento local. El sweep (preflight + stop)
+    debe cancelarla SIN tocar órdenes rastreadas ni las de otros bots
+    (clientOrderId sin prefijo MM-; en la misma VPS corren otros procesos).
+    """
+
+    def setUp(self):
+        self.api = FakeBookAPI(best_bid=0.45, best_ask=0.55)
+        self.cancel_mock = mock.patch.object(
+            self.api, "cancel_order", return_value={"orderId": 123}
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+        patcher = mock.patch.object(execution_engine, "api", self.api)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp_logs = _isolate_log_paths(self)
+        self.engine = ExecutionEngine("XRPUSDC", real=True, dry_run=False)
+
+    def _orphan(self, coid, side="BUY", price="0.50", qty="12.0"):
+        return {"clientOrderId": coid, "side": side, "price": price, "origQty": qty}
+
+    def test_sweep_cancela_huerfanas_mm(self):
+        """Una MM- abierta sin tracking local se cancela."""
+        self.api.open_orders = [self._orphan("MM-BUY-111-1")]
+        n = self.engine.sweep_orphan_orders()
+        self.assertEqual(n, 1)
+        self.cancel_mock.assert_called_once_with("XRPUSDC", orig_client_id="MM-BUY-111-1")
+
+    def test_sweep_no_toca_tracked_ni_otros_bots(self):
+        """No cancela órdenes MM- en tracking ni clientOrderIds de otros bots."""
+        oid, ok, reason = self.engine.place_maker_order("BUY", 12.0, 0.50)
+        self.assertTrue(ok, reason)
+        self.api.open_orders = [
+            self._orphan(oid),
+            self._orphan("GRID-123", side="SELL"),
+            self._orphan("MM-BUY-999-9"),
+        ]
+        n = self.engine.sweep_orphan_orders()
+        self.assertEqual(n, 1)
+        self.cancel_mock.assert_called_once_with("XRPUSDC", orig_client_id="MM-BUY-999-9")
+
+    def test_sweep_error_api_devuelve_0(self):
+        """get_open_orders con error de API -> 0, sin crash (degrade, no aborta)."""
+        with mock.patch.object(execution_engine, "BinanceAPIException",
+                               _FakeBinanceError):
+            with mock.patch.object(self.api, "get_open_orders",
+                                   return_value=_FakeBinanceError("request timeout")):
+                self.assertEqual(self.engine.sweep_orphan_orders(), 0)
+        self.cancel_mock.assert_not_called()
+
+    def test_sweep_dry_run_sin_api(self):
+        """En dry-run no hay API: devuelve 0 y no hace llamadas."""
+        _isolate_log_paths(self)
+        engine = ExecutionEngine("XRPUSDC", real=False, dry_run=True)
+        self.assertEqual(engine.sweep_orphan_orders(), 0)
 
 
 if __name__ == "__main__":

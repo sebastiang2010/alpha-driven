@@ -327,11 +327,14 @@ class MarketMaker:
         self.risk.update_daily_pnl(self.daily_pnl)
 
     # ── 5. Journal del agente (§16) ──────────────────────────────────────
-    def _journal(self, snapshot, quotes, risk_score) -> None:
+    def _journal(self, snapshot, quotes, risk_score,
+                 cycle: int | None = None,
+                 stage_ts: dict | None = None) -> None:
         """Escribe una línea en agent_decisions.jsonl (§16). Sin credenciales."""
         sigma = float(snapshot.get("volatility") or 0.0)
         event = {
             "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+            "cycle": cycle,
             "regime": self._regime(sigma),
             "inventory": float(snapshot.get("inventory") or 0.0),
             "mid_price": float(snapshot.get("mid") or 0.0),
@@ -351,6 +354,11 @@ class MarketMaker:
             ),
             "risk_score": float(risk_score),
         }
+        # §10: duración de las etapas del ciclo (muestras periódicas para
+        # limitar ruido). Epoch float con precisión suficiente para deltas de
+        # ms; el monitor puede medir colgamientos entre etapas.
+        if stage_ts:
+            event["stage_ts"] = stage_ts
         self._log_event_jsonl(self.journal_path, event)  # §16
 
     # ── 6. Métricas de mercado (§15) ─────────────────────────────────────
@@ -602,8 +610,13 @@ class MarketMaker:
                     snapshot["realized_pnl"] = self.inventory.realized_pnl
                     snapshot["fill_count"] = len(self.exec.fills)
 
+                    # §10: registra el arranque de cada etapa del ciclo para
+                    # medir duraciones reales (journal, muestras periódicas).
+                    stage_ts = {"cycle_start": now, "snapshot_ready": time.time()}
                     quotes = self._compute_quotes(snapshot)
+                    stage_ts["quotes_done"] = time.time()
                     self._manage_orders(snapshot, quotes)
+                    stage_ts["orders_done"] = time.time()
 
                     # Actualizar equity/PnL para el Risk Engine (§13).
                     self.daily_pnl = self.inventory.realized_pnl - self.inventory.total_fees
@@ -616,7 +629,12 @@ class MarketMaker:
                     self.risk.update_daily_pnl(self.daily_pnl)
 
                     risk_score = self._compute_risk_score()
-                    self._journal(snapshot, quotes, risk_score)  # §16
+                    if cycles <= 3 or cycles % 100 == 0:
+                        self._journal(snapshot, quotes, risk_score,
+                                      cycle=cycles, stage_ts=stage_ts)  # §16
+                    else:
+                        self._journal(snapshot, quotes, risk_score,
+                                      cycle=cycles)  # §16
                     self._log_market_data(snapshot)              # §15
                     self.risk.reset_error_count()
 
@@ -646,6 +664,12 @@ class MarketMaker:
                 logger.info("MarketMaker: canceladas %d órdenes al detener", n)
         except Exception as e:
             logger.warning("MarketMaker: error cancelando órdenes: %s", e)
+        try:
+            n = self.exec.sweep_orphan_orders()
+            if n:
+                logger.warning("MarketMaker: barridas %d órdenes huérfanas al detener", n)
+        except Exception as e:
+            logger.warning("MarketMaker: error en sweep de huérfanas: %s", e)
         self._stop.set()
         logger.info("MarketMaker: detenido.")
 
