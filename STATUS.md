@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-11 09:25 (constante 5.0 activa en mainnet, bot PID 26756).
+> Última actualización: 2026-08-11 09:42 (reporte de trades activo cada 5 min — `reports/trade_status.txt`).
 
 ---
 
@@ -29,6 +29,8 @@
 **Regla §0.1**: testnet primero, mainnet SOLO con autorización humana explícita. **Mainnet OPERADA por primera vez el 2026-08-10** (`REAL=True`, `EXPOSURE_LEVEL=1`, autorización explícita §0.2 + confirmación interactiva `CONFIRMAR`).
 
 **Corrida actual (2026-08-11)**: bot PID **26756** relanzado 09:18:59 local vía `relauncher_2h.sh` (v3+lock, ventana 120 min). Código `732177b` (constante 5.0). Decisiones activas con `bid_size=ask_size=5.0` (> $5 minNotional ✓). Risk engine en espera: `expected_net_pnl_non_positive` (no emite órdenes perdedoras, correcto). Inventario 0.0. El fix del code-reviewer (`30b3cd2`) fue revertido por decisión humana — el algoritmo quedó intacto y el minNotional se resuelve solo con la constante 5.0.
+
+**Reporte de trades (nuevo)**: `reports/trade_status.py` genera `reports/trade_status.txt` (trades, PnL neto con fee maker 0.0002 §0.4, últimos fills/rechazos, estado del bot) y `reports/update_trade_status.sh` lo actualiza **cada 5 min** (loop en background, PID 102528/61688). Datos al 09:42 local: **45 trades reales** (fills `simulated=false`, 10/8 + 11/8), Gross PnL **+5.0042 USDC**, Net PnL **+4.9590 USDC**, inventario 0.0. Hoy 11/8: 4 fills (2 BUY + 2 SELL de 5.0 XRP). Rechazos = maker check §10 (sanos, sin errores Binance).
 
 ---
 
