@@ -51,7 +51,7 @@ MAX_LEVERAGE_USED: int = 20
 
 # Presupuestos de riesgo §0.4 CONFIRMADOS por humano (2026-08-09):
 # MAX_DAILY_LOSS_USDC=10.0, MAX_POSITION_NOTIONAL_USDC=25.0,
-# MAX_DRAWDOWN_PCT=0.05, MAX_LEVERAGE_USED=20, BASE_ORDER_SIZE_XRP=4.9.
+# MAX_DRAWDOWN_PCT=0.05, MAX_LEVERAGE_USED=20, BASE_ORDER_SIZE_XRP=5.0.
 # run_mainnet.py aborta si esto es False (§0.4: no operar con fondos reales
 # con presupuestos "pendiente de confirmación").
 BUDGETS_CONFIRMED: bool = True
@@ -97,11 +97,13 @@ def effective_exposure_multiplier() -> float:
 
 # Cantidad mínima para XRPUSDC futures. El execution_engine la valida contra
 # los filtros reales del símbolo consultados dinámicamente (§3).
-# Mínimo exacto (autorizado por humano §0.2, 2026-08-10): minNotional $5 ÷
-# precio $1.0314 = 4.8478 XRP → redondeado al step 0.1 = 4.9 XRP ≈ $5.05
-# (4.8 XRP = $4.95 < $5 sería rechazado). Cumple minNotional mientras
-# precio > $1.0204.
-BASE_ORDER_SIZE_XRP: float = 5.0  # fix aprobado humano §0.2 2026-08-10: 5.0 XRP = $5.00 @ $1.00 → notional >= minNotional $5
+# AUTORIZADO por humano §0.2 (2026-08-10/11, "usa 5.0 XRP"): minNotional $5
+# confirmado por humano → 5.0 XRP × ~$1.02 ≈ $5.10 > $5 (margen 2%).
+# Antes: 4.9 XRP ≈ $5.05 (marginal; el lado reduce de 2.4 XRP ≈ $2.44 < $5
+# era rechazado → 0 órdenes todo el día, posición 4.9 atascada).
+# NOTA: el algoritmo de cálculo de tamaños queda para revisión dedicada
+# (el humano pidió NO tocarlo en esta iteración).
+BASE_ORDER_SIZE_XRP: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Ciclo principal
@@ -163,14 +165,6 @@ QUOTE_UPDATE_THRESHOLD_PCT: float = 0.001
 # si market_state llega a exponer tick_size, ese valor tiene prioridad
 # (specs dinámicas §3 — nunca asumir, pero no hay otra fuente hoy).
 TICK_SIZE_XRPUSDC: float = 0.0001
-
-# Specs del símbolo usadas como FALLBACK para el floor de notional (§3).
-# En runtime el floor lee symbol_info dinámico del exchange (min_notional /
-# step_size); estas constantes solo aplican en dry-run/tests sin API.
-# Valores verificados contra exchangeInfo mainnet (corrida 2026-08-10):
-# minNotional 5.0 USDC, stepSize 0.1 XRP. Fix aprobado humano §0.2 (2026-08-10).
-MIN_NOTIONAL_USDC: float = 5.0
-QUANTITY_STEP: float = 0.1
 
 # Piso mínimo de spread total cotizado (bid_dist + ask_dist), en ticks.
 # Breakeven con fee maker VIP0 (MAKER_FEE_RATE=0.0002) y tick 0.0001, para

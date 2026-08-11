@@ -22,7 +22,6 @@ from collections import deque
 from datetime import datetime
 import json
 import logging
-import math
 import pathlib
 import threading
 import time
@@ -268,49 +267,6 @@ class MarketMaker:
         if not quote_ask_ok:
             reasons.append("expected_net_pnl_non_positive:ask")
 
-        # Floor de notional mínimo por lado (fix aprobado §0.2, 2026-08-10):
-        # Binance rechaza órdenes con notional < MIN_NOTIONAL_USDC. Tamaño
-        # mínimo por lado según su precio:
-        #     floor_qty = ceil(MIN_NOTIONAL_USDC / price / QUANTITY_STEP) * QUANTITY_STEP
-        # - Si el tamaño cotizado queda por debajo del floor, se sube al
-        #   floor (siempre que no exceda max_order_size).
-        # - Si el floor excede max_order_size el lado NO cotiza
-        #   (quote_ok=False, reason min_notional_floor_blocked:<side>),
-        #   salvo CIERRE TOTAL de inventario (tamaño == |inventory| en el
-        #   lado reduce): esa orden va reduce_only y Binance EXIME el
-        #   minNotional para reduceOnly (announcement 2021-01-20), por lo
-        #   que se permite el tamaño menor.
-        min_notional = 0.0
-        qty_step = 0.0
-        symbol_info = getattr(self.exec, "symbol_info", None) or {}
-        if symbol_info:
-            # Specs reales del símbolo (§3): nunca asumirlas en runtime.
-            min_notional = float(symbol_info.get("min_notional") or 0.0)
-            qty_step = float(symbol_info.get("step_size") or 0.0)
-        # Fallback para dry-run/tests (sin API): constantes de config.
-        if min_notional <= 0.0:
-            min_notional = float(getattr(config, "MIN_NOTIONAL_USDC", 0.0) or 0.0)
-        if qty_step <= 0.0:
-            qty_step = float(getattr(config, "QUANTITY_STEP", 0.0) or 0.0)
-        if min_notional > 0.0 and qty_step > 0.0:
-            floor_bid = math.ceil(min_notional / bid_price / qty_step) * qty_step
-            floor_ask = math.ceil(min_notional / ask_price / qty_step) * qty_step
-            inv_abs = abs(inventory)
-            if bid_size > 0.0 and bid_size < floor_bid:
-                if floor_bid <= max_order_size:
-                    bid_size = floor_bid
-                elif not (reduce_bid and inv_abs > 0.0 and bid_size == inv_abs):
-                    bid_size = 0.0
-                    quote_bid_ok = False
-                    reasons.append("min_notional_floor_blocked:bid")
-            if ask_size > 0.0 and ask_size < floor_ask:
-                if floor_ask <= max_order_size:
-                    ask_size = floor_ask
-                elif not (reduce_ask and inv_abs > 0.0 and ask_size == inv_abs):
-                    ask_size = 0.0
-                    quote_ask_ok = False
-                    reasons.append("min_notional_floor_blocked:ask")
-
         return {
             "reservation_price": r,
             "alpha": alpha,
@@ -469,20 +425,7 @@ class MarketMaker:
                 "MarketMaker: %s rechazada por Risk Engine (%s)", side, ";".join(reasons)
             )
             return None
-        # reduce_only solo cuando la orden NO excede el inventario del lado
-        # reduce (fix aprobado §0.2, 2026-08-10): Binance rechaza
-        # reduceOnly con qty > posición (error -2022). Además, una orden
-        # reduce_only queda EXENTA del minNotional (announcement 2021-01-20)
-        # → el cierre total de inventario pasa aunque su notional < $5.0.
-        inv = float(getattr(self.inventory, "inventory", 0.0) or 0.0)
-        reduce_only = False
-        if (side == "BUY" and inv < 0.0 and qty <= -inv) or (
-            side == "SELL" and inv > 0.0 and qty <= inv
-        ):
-            reduce_only = True
-        oid, ok, reason = self.exec.place_maker_order(
-            side, qty, price, reduce_only=reduce_only
-        )
+        oid, ok, reason = self.exec.place_maker_order(side, qty, price)
         if ok and oid:
             self.quote_age[oid] = time.time()
             logger.debug(
