@@ -127,5 +127,59 @@ class TestReduceOrClose(_MarketMakerTestCase):
         self.assertEqual(self.mm.inventory.inventory, 0.0)
 
 
+class TestMinNotionalGuard(_MarketMakerTestCase):
+    """§3, fix 2026-08-11: un lado cuyo notional quede bajo minNotional NO se
+    cotiza (antes: rechazo ~5/s en loop "notional 2.52 < minNotional 5.0"
+    con el lado agravante 2.5 XRP del skew §11). El guard es DINÁMICO con el
+    precio: minNotional está en USDC, así que si XRP sube, el mismo tamaño
+    cumple el piso y el lado vuelve a cotizar solo (sin intervención)."""
+
+    def _setup(self, mid, inventory):
+        """Alpha mockeado (reservación = mid, distancias ±0.01, NetPnL > 0)
+        y filtros del símbolo con minNotional 5.0."""
+        self.mm.alpha.compute_alpha = mock.Mock(return_value=0.0)
+        self.mm.alpha.reservation_price = mock.Mock(return_value=mid)
+        self.mm.alpha.quote_distances = mock.Mock(return_value=(0.01, 0.01))
+        self.mm.alpha.expected_net_pnl_estimate = mock.Mock(return_value=1.0)
+        self.mm.exec.symbol_info = {
+            "min_notional": 5.0, "tick_size": 0.0001, "step_size": 0.1,
+        }
+        if inventory > 0:
+            self.mm.inventory.record_fill("BUY", inventory, mid, 0.0)
+        elif inventory < 0:
+            self.mm.inventory.record_fill("SELL", abs(inventory), mid, 0.0)
+        return self.mm._compute_quotes(
+            {"mid": mid, "inventory": inventory, "volatility": 0.0}
+        )
+
+    def test_lado_agravante_bajo_notional_no_cotiza(self):
+        """Corto −5.0 @ ~$1.2: el SELL agrava (skew 0.5x → 2.5 XRP →
+        $3.03 < $5) y NO debe cotizarse; el BUY reduce (≥ 5 XRP → $5.95 ≥ $5)
+        sí cotiza y sigue cerrando el corto."""
+        q = self._setup(mid=1.2, inventory=-5.0)
+        self.assertTrue(q["quote_bid_ok"], q["reasons"])
+        self.assertFalse(q["quote_ask_ok"], q["reasons"])
+        self.assertIn("below_min_notional:ask", q["reasons"])
+
+    def test_xrp_subio_y_el_lado_vuelve_a_cotizar(self):
+        """Futuro: XRP sube a ~$2.2 → el mismo tamaño 2.5 XRP ya cumple
+        minNotional ($5.53 ≥ $5) → el lado agravante vuelve a cotizar solo,
+        sin intervención manual (minNotional en USDC, precio en XRP)."""
+        q = self._setup(mid=2.2, inventory=-5.0)
+        self.assertTrue(q["quote_bid_ok"], q["reasons"])
+        self.assertTrue(q["quote_ask_ok"], q["reasons"])
+        self.assertNotIn("below_min_notional:ask", q["reasons"])
+
+    def test_flat_con_precio_bajo_no_cotiza_ningun_lado(self):
+        """Inventario 0 y XRP en $0.9: 5.0 XRP = $4.45/$4.55 < $5 → ningún
+        lado se cotiza (evita el spam de órdenes que el exchange rechazaría
+        aunque el NetPnL estimado sea positivo)."""
+        q = self._setup(mid=0.9, inventory=0.0)
+        self.assertFalse(q["quote_bid_ok"], q["reasons"])
+        self.assertFalse(q["quote_ask_ok"], q["reasons"])
+        self.assertIn("below_min_notional:bid", q["reasons"])
+        self.assertIn("below_min_notional:ask", q["reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()

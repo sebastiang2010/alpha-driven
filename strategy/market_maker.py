@@ -267,6 +267,25 @@ class MarketMaker:
         if not quote_ask_ok:
             reasons.append("expected_net_pnl_non_positive:ask")
 
+        # Piso de notional del exchange (§3, fix 2026-08-11): NO intentar un
+        # lado cuyo notional quede bajo minNotional. Antes del fix, el lado
+        # agravante del skew §11 (p.ej. 2.5 XRP con corto −5.0) quedaba en
+        # ~$2.52 < $5 y el engine reintentaba cada ciclo: spam de rechazos
+        # (~5/s en mainnet 2026-08-11) que quemaba rate-limit sin colocar
+        # nada. El guard es DINÁMICO con el precio vigente: minNotional está
+        # en USDC, así que si XRP sube, el mismo tamaño cumple el piso y el
+        # lado vuelve a cotizar solo, sin intervención manual.
+        min_notional = float(
+            (self.exec.symbol_info or {}).get("min_notional") or 0.0
+        )
+        if min_notional > 0.0:
+            if bid_size > 0.0 and bid_price * bid_size < min_notional - 1e-12:
+                quote_bid_ok = False
+                reasons.append("below_min_notional:bid")
+            if ask_size > 0.0 and ask_price * ask_size < min_notional - 1e-12:
+                quote_ask_ok = False
+                reasons.append("below_min_notional:ask")
+
         return {
             "reservation_price": r,
             "alpha": alpha,
