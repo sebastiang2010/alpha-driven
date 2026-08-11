@@ -1,43 +1,43 @@
 === ALPHA-DRIVEN XRPUSDC FUTURES (mainnet) — ESTADO DE TRADES ===
-Generado: 11/08/2026 11:19:50 local  |  2026-08-11 14:19:50Z UTC
+Generado: 11/08/2026 11:34:59 local  |  2026-08-11 14:34:59Z UTC
 
 --- RESUMEN DE TRADES (fills reales, simulated=false) ---
-  Trades (fills):       80
-  Comprado:             198.0 XRP en 40 fills @ medio 1.01523
-  Vendido:              197.9 XRP en 40 fills @ medio 1.01572
-  Inventario actual:    5.00 XRP  (posicion ABIERTA)
+  Trades (fills):       86
+  Comprado:             208.0 XRP en 42 fills @ medio 1.01472
+  Vendido:              217.9 XRP en 44 fills @ medio 1.01472
+  Inventario actual:    -5.00 XRP  (posicion ABIERTA)
 
 --- PNL BINANCE (fuente de verdad, API directa §18) ---
-  Trades segun exchange: 82   (fetch 14:19Z)
-  Realized PnL:        -0.005540
+  Trades segun exchange: 88   (fetch 14:34Z)
+  Realized PnL:        -0.014040
   Commission:          +0.000000  (n/a)
   Funding fee:         +0.000000
-  NET PnL (BINANCE):   -0.005540
+  NET PnL (BINANCE):   -0.014040
     10/08: trades=42  realized=-0.022540  comm=+0.000000  funding=+0.000000
-    11/08: trades=40  realized=+0.017000  comm=+0.000000  funding=+0.000000
+    11/08: trades=46  realized=+0.008500  comm=+0.000000  funding=+0.000000
 
 --- PNL ESTIMADO (logs locales — puede estar incompleto) ---
-  Gross PnL:            -0.0063
-  Fees estimadas:       -0.0804  (fee maker 0.0200%)
-  Net PnL (estimado):   -0.0867
-  PnL no realizado:     -0.0374 (marcado a mercado, inventario abierto)
+  Gross PnL:            +10.0457
+  Fees estimadas:       -0.0864  (fee maker 0.0200%)
+  Net PnL (estimado):   +9.9592
+  PnL no realizado:     -0.0519 (marcado a mercado, inventario abierto)
 
 --- ULTIMOS TRADES BINANCE ---
-  11/08 11:12:46  SELL 5 @ 1.0088  (rp=+0.000000)
-  11/08 11:13:30  BUY  5 @ 1.0083  (rp=+0.002500)
-  11/08 11:15:58  SELL 5 @ 1.0090  (rp=+0.000000)
-  11/08 11:16:32  BUY  5 @ 1.0087  (rp=+0.001500)
-  11/08 11:18:24  BUY  5 @ 1.0075  (rp=+0.000000)
+  11/08 11:27:32  BUY  5 @ 1.0052  (rp=+0.000000)
+  11/08 11:28:26  SELL 5 @ 1.0047  (rp=-0.002500)
+  11/08 11:31:20  SELL 5 @ 1.0049  (rp=+0.000000)
+  11/08 11:33:17  BUY  5 @ 1.0039  (rp=+0.005000)
+  11/08 11:33:28  SELL 5 @ 1.0046  (rp=+0.000000)
 
 --- ULTIMOS FILLS (log local) ---
-  11/08 11:13:09  SELL 5.0 @ 1.00880
-  11/08 11:13:42  BUY  5.0 @ 1.00830
-  11/08 11:16:29  SELL 5.0 @ 1.00900
-  11/08 11:17:02  BUY  5.0 @ 1.00870
-  11/08 11:18:42  BUY  5.0 @ 1.00750
+  11/08 11:28:04  BUY  5.0 @ 1.00520
+  11/08 11:28:38  SELL 5.0 @ 1.00470
+  11/08 11:31:24  SELL 5.0 @ 1.00490
+  11/08 11:33:35  BUY  5.0 @ 1.00390
+  11/08 11:33:35  SELL 5.0 @ 1.00460
 
 --- ORDENES HOY ---
-  Eventos: 420   (canceled: 146 | error: 1 | placed: 186 | rejected: 48 | sync_removed: 39)
+  Eventos: 467   (canceled: 163 | error: 1 | placed: 210 | rejected: 48 | sync_removed: 45)
 
 --- ULTIMOS RECHAZOS (motivo) ---
   11/08 10:21:02  SELL 5.0 @ 1.0043  ->  maker check §10 rechazó: orden SELL @ 1.0043 cruzaría el spread
@@ -46,8 +46,8 @@ Generado: 11/08/2026 11:19:50 local  |  2026-08-11 14:19:50Z UTC
 
 --- ESTADO DEL BOT ---
   Estado:               OPERATIVO
-  Ultima decision:      2026-08-11T14:19:48Z  (hace 0m 2s)
-  Regime:               low_vol  |  mid: 1.0077500000000001  |  spread: 9.999999999998899e-05
-  Quotes:               bid 1.0067490256692124 (2.5) / ask 1.0081340850194842 (5.0)
-  Reason:               ok
-  Alpha: -0.00024266161668153404 | expected_pnl: 0.00290348 | risk_score: 0.0 | momentum: False
+  Ultima decision:      2026-08-11T14:34:57Z  (hace 0m 2s)
+  Regime:               low_vol  |  mid: 1.00435  |  spread: 9.999999999998899e-05
+  Quotes:               bid 1.0027188570720884 (5.0) / ask 1.0052306413624426 (2.5)
+  Reason:               below_min_notional:ask
+  Alpha: -0.0005 | expected_pnl: 0.00884414 | risk_score: 0.0 | momentum: False
