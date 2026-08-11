@@ -15,6 +15,8 @@ Corren con unittest puro (NO pytest):
 """
 import os
 import sys
+import pathlib
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -24,6 +26,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from strategy import config
 from strategy import execution_engine
 from strategy.market_maker import MarketMaker
+
+
+def _isolate_log_paths(testcase):
+    """Redirige los paths de logging de config a un tmpdir (§15).
+
+    MarketMaker.__init__ construye un ExecutionEngine real que lee
+    config.LOG_ORDERS / config.LOG_FILLS en construcción, y guarda su
+    journal de decisiones en config.LOG_DECISIONS (el kill switch escribe
+    además en config.LOG_PNL). Sin este aislamiento, los tests escribirían
+    eventos SIMULATED (dry-run) al journal real del día y contaminarían la
+    ventana de gate de una corrida mainnet en paralelo ("GATE FAIL: N
+    órdenes marcadas como simuladas"). Parchear ANTES de construir el
+    MarketMaker: el __init__ lee los paths en construcción.
+    """
+    tmp = tempfile.mkdtemp(prefix="test_logs_")
+    for name in ("LOG_ORDERS", "LOG_FILLS", "LOG_DECISIONS", "LOG_PNL",
+                 "LOG_MARKET_DATA"):
+        patcher = mock.patch.object(config, name, pathlib.Path(tmp) / f"{name}.jsonl")
+        patcher.start()
+        testcase.addCleanup(patcher.stop)
+    return tmp
 
 
 def _quotes(bid_ok=True, ask_ok=True, bid_price=2.49, ask_price=2.51,
@@ -47,6 +70,7 @@ class _MarketMakerTestCase(unittest.TestCase):
         patcher = mock.patch.object(execution_engine, "api", None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._tmp_logs = _isolate_log_paths(self)
         self.mm = MarketMaker(dry_run=True)
 
 

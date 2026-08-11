@@ -15,13 +15,37 @@ Corren con unittest puro (NO pytest):
 """
 import sys
 import os
+import pathlib
+import tempfile
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from strategy import config
 from strategy import execution_engine
 from strategy.execution_engine import ExecutionEngine
+
+
+def _isolate_log_paths(testcase):
+    """Redirige los paths de logging de config a un tmpdir (§15).
+
+    ExecutionEngine.__init__ lee config.LOG_ORDERS / config.LOG_FILLS en
+    construcción (y hace os.makedirs de esos directorios). Sin este
+    aislamiento, los tests escribirían eventos SIMULATED (dry-run) al
+    journal real del día y contaminarían la ventana de gate de una corrida
+    mainnet en paralelo ("GATE FAIL: N órdenes marcadas como simuladas").
+    Parchear ANTES de construir el engine: el __init__ lee los paths en
+    construcción. Se incluyen también LOG_DECISIONS / LOG_PNL / LOG_MARKET_DATA
+    por defensa (los usan MarketMaker y el kill switch).
+    """
+    tmp = tempfile.mkdtemp(prefix="test_logs_")
+    for name in ("LOG_ORDERS", "LOG_FILLS", "LOG_DECISIONS", "LOG_PNL",
+                 "LOG_MARKET_DATA"):
+        patcher = mock.patch.object(config, name, pathlib.Path(tmp) / f"{name}.jsonl")
+        patcher.start()
+        testcase.addCleanup(patcher.stop)
+    return tmp
 
 
 class FakeBookAPI:
@@ -69,6 +93,7 @@ class TestMakerCheck(unittest.TestCase):
         patcher = mock.patch.object(execution_engine, "api", self.api)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._tmp_logs = _isolate_log_paths(self)
         self.engine = ExecutionEngine("XRPUSDC", real=True, dry_run=False)
 
     # ── BUY: maker si price < best_ask ────────────────────────────────
@@ -121,6 +146,7 @@ class TestProcessFillsFromTrades(unittest.TestCase):
         patcher = mock.patch.object(ExecutionEngine, "init_symbol_info", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._tmp_logs = _isolate_log_paths(self)
         self.engine = ExecutionEngine("XRPUSDC", real=False, dry_run=True)
 
     def _place(self, side, price, qty=1.0):
@@ -201,6 +227,7 @@ class TestCancelOrderById(unittest.TestCase):
         patcher = mock.patch.object(execution_engine, "api", self.api)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self._tmp_logs = _isolate_log_paths(self)
         self.engine = ExecutionEngine("XRPUSDC", real=True, dry_run=False)
 
     def _place(self, side="BUY", price=0.50, qty=12.0):
@@ -227,6 +254,7 @@ class TestCancelOrderById(unittest.TestCase):
 
     def test_dry_run_purga_sin_api(self):
         """En dry-run no hay API: se purga directamente."""
+        _isolate_log_paths(self)
         engine = ExecutionEngine("XRPUSDC", real=False, dry_run=True)
         oid, ok, reason = engine.place_maker_order("BUY", 12.0, 0.50)
         self.assertTrue(ok, reason)
