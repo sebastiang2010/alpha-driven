@@ -51,7 +51,7 @@ class DepthWebSocket:
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self.ws.run_forever(ping_interval=10, ping_timeout=10)
+                self.ws.run_forever(ping_interval=10, ping_timeout=5)  # websocket-client exige ping_interval > ping_timeout
             except Exception as e:
                 logger.error("Depth WS fatal: %s", e)
             time.sleep(1)
