@@ -51,10 +51,10 @@ class DepthWebSocket:
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                self.ws.run_forever(ping_interval=10, ping_timeout=10)
             except Exception as e:
                 logger.error("Depth WS fatal: %s", e)
-            time.sleep(5)
+            time.sleep(1)
 
     def _on_open(self, ws):
         logger.info("DepthWebSocket conectado para %s (top-%s)", self.symbol, self.depth_levels)

@@ -57,10 +57,10 @@ class TradeWebSocket:
                     on_close=self._on_close,
                     on_open=self._on_open,
                 )
-                self.ws.run_forever(ping_interval=20, ping_timeout=10)
+                self.ws.run_forever(ping_interval=10, ping_timeout=10)
             except Exception as e:
                 logger.error("Trade WS fatal: %s", e)
-            time.sleep(5)   # esperar antes de reintentar
+            time.sleep(1)   # esperar antes de reintentar
 
     # ── Callbacks del WebSocket ───────────────────────────────
     def _on_open(self, ws):

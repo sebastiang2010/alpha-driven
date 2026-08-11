@@ -38,7 +38,9 @@ from .risk_engine import RiskEngine, MAX_ERROR_COUNT, MAX_VOLATILITY
 # ---------------------------------------------------------------------------
 
 # Frescura del snapshot de WS: por encima de esto se considera desconectado (§13).
-WS_STALE_SEC: float = 15.0
+# 60 s (antes 15 s): cortes transitorios de red de 20-30 s; la reconexión automática
+# restaura en <10 s; el kill switch sigue protegiendo desconexiones reales >60 s (§13 intacto).
+WS_STALE_SEC: float = 60.0
 
 # Horizonte de la medida de adverse selection (§14).
 ADVERSE_SELECTION_HORIZON_SEC: float = 5.0
