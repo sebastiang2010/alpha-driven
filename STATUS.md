@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-11 (fix minNotional implementado, suite 76/76).
+> Última actualización: 2026-08-11 09:25 (constante 5.0 activa en mainnet, bot PID 26756).
 
 ---
 
@@ -27,6 +27,8 @@
 | Git | ✅ Inicializado | 1 commit (`4bf0ae7`, módulos base + tests). `.gitignore` protege credenciales. |
 
 **Regla §0.1**: testnet primero, mainnet SOLO con autorización humana explícita. **Mainnet OPERADA por primera vez el 2026-08-10** (`REAL=True`, `EXPOSURE_LEVEL=1`, autorización explícita §0.2 + confirmación interactiva `CONFIRMAR`).
+
+**Corrida actual (2026-08-11)**: bot PID **26756** relanzado 09:18:59 local vía `relauncher_2h.sh` (v3+lock, ventana 120 min). Código `732177b` (constante 5.0). Decisiones activas con `bid_size=ask_size=5.0` (> $5 minNotional ✓). Risk engine en espera: `expected_net_pnl_non_positive` (no emite órdenes perdedoras, correcto). Inventario 0.0. El fix del code-reviewer (`30b3cd2`) fue revertido por decisión humana — el algoritmo quedó intacto y el minNotional se resuelve solo con la constante 5.0.
 
 ---
 
