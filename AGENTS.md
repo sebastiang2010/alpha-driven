@@ -13,6 +13,7 @@
 - **Detenerse y preguntar** (§0.2) ante: primera orden mainnet, subir de Nivel de exposición, kill switch activado, falta una función de API (no escribir implementación paralela), posición no reconciliable, credenciales nuevas.
 - **Presupuesto de riesgo** como constantes en `config.py`, no números improvisados (§0.4): `MAX_DAILY_LOSS_USDC`, `MAX_POSITION_NOTIONAL_USDC`, `MAX_DRAWDOWN_PCT`, `MAX_LEVERAGE_USED`. Si no están definidos: proponer valores conservadores, marcarlos "pendiente de confirmación" en `STATUS.md`, y no operar con fondos reales.
 - **Decisión de diseño aprobada — Nivel 0 / dry-run con simulación**: cuando `EXPOSURE_LEVEL=0`, el bot NO queda bloqueado en tamaño 0: puede simular órdenes usando una constante de simulación (`SIMULATION_QUOTE_MULTIPLIER` en `config.py`) en lugar del multiplicador `0.0` del nivel 0. Esto habilita la corrida integrada dry-run. Los niveles reales (>=1) NO se modifican y subirlos sigue requiriendo autorización humana (§0.2). En Nivel 0 jamás se envían órdenes reales (§0.1/§21).
+- **Promo 0 fees en XRPUSDC (confirmada por humano 2026-08-11; la API reporta `commission=0.0` y `funding=0.0` — coherente con la promo)**: **priorizar SIEMPRE órdenes MAKER** (post-only `GTX`, que es el comportamiento actual del bot §2). No degradar a taker (IOC/FOK) por conveniencia de ejecución: con 0 fees el edge completo está en el lado maker y el taker no aporta nada. Si la promo termina (vuelve `MAKER_FEE_RATE=0.0002`), **detenerse y reportar** antes de seguir operando igual: hay que re-evaluar el piso de spread (`MIN_SPREAD_TICKS=8`) y los costos §18.
 - Mantener **`STATUS.md`** actualizado cada 15–20 min y commits chicos y frecuentes (§0.3).
 
 ## Autonomía del desarrollo
@@ -36,7 +37,7 @@ URLs: real `wss://fstream.binance.com/public/ws`, testnet `wss://stream.binancef
 
 ## Peculiaridades de la API
 - Los métodos devuelven `BinanceAPIException` como resultado en vez de lanzarla — el caller debe chequear el tipo de retorno.
-- Órdenes maker: `timeInForce='GTX'` (post-only), `positionSide='BOTH'`, `reduceOnly` según corresponda.
+- Órdenes maker: `timeInForce='GTX'` (post-only), `positionSide='BOTH'`, `reduceOnly` según corresponda. **Siempre maker-first** — el par XRPUSDC tiene promo de 0 fees (regla §0, 2026-08-11): no usar taker mientras dure la promo.
 - `_call_with_retry(func, retries=2, delay=0.5, ...)` envuelve las llamadas críticas.
 - Sincronización de tiempo: `adjust_client_time()` + hilo daemon cada 300 s que fija `client.timestamp_offset`.
 - **Bug latente**: `close_listen_key` está definida como método de instancia (`def close_listen_key(self, listen_key)` → `self.client`) en un módulo de funciones sueltas; llamarla como función del módulo rompe.
