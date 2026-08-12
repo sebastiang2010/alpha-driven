@@ -164,6 +164,27 @@ class TestRiskEngine(unittest.TestCase):
         self.assertFalse(triggered)
         self.assertEqual(reasons, [])
 
+    def test_kill_switch_triggers_on_realized_loss_guard(self):
+        # Guard de pérdida realizada ajustado (§0.2 / "el bot no da pérdida"):
+        # ante una pérdida neta realizada por debajo de -LOSS_GUARD_USDC el
+        # kill switch frena y aplana, sin esperar a -MAX_DAILY_LOSS_USDC.
+        triggered, reasons = self.engine.check_kill_switch(
+            _snapshot(daily_pnl=-config.LOSS_GUARD_USDC - 1e-6),
+            ws_connected=True, error_count=0,
+        )
+        self.assertTrue(triggered)
+        self.assertIn(risk_engine.REASON_KS_REALIZED_LOSS_GUARD, reasons)
+
+    def test_kill_switch_realized_loss_guard_below_threshold_ok(self):
+        # Por encima del umbral ajustado (incluso levemente negativo) no frena:
+        # el bot opera con normalidad en régimen range-bound (día 11 +0.0045).
+        triggered, reasons = self.engine.check_kill_switch(
+            _snapshot(daily_pnl=-config.LOSS_GUARD_USDC / 2.0),
+            ws_connected=True, error_count=0,
+        )
+        self.assertFalse(triggered)
+        self.assertNotIn(risk_engine.REASON_KS_REALIZED_LOSS_GUARD, reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,7 @@ REASON_INVALID_ORDER = "invalid_order"
 REASON_KS_DAILY_LOSS = "daily_loss_exceeded"
 REASON_KS_DRAWDOWN = "drawdown_exceeded"
 REASON_KS_UNREALIZED_LOSS = "unrealized_loss_exceeded"
+REASON_KS_REALIZED_LOSS_GUARD = "realized_loss_guard_exceeded"
 REASON_KS_WS_DISCONNECTED = "ws_disconnected"
 REASON_KS_TOO_MANY_ERRORS = "too_many_errors"
 REASON_KS_MID_INVALID = "mid_invalid"
@@ -113,6 +114,11 @@ class RiskEngine:
             UNREALIZED_LOSS_FLOOR_USDC,
             UNREALIZED_LOSS_FACTOR * float(config.MAX_DAILY_LOSS_USDC),
         )
+
+        # Guard de pérdida realizada ajustado (§0.2 / "el bot no da pérdida"):
+        # frena y aplana ante cualquier pérdida neta realizada. PROPUESTA
+        # pendiente de confirmación (§0.4).
+        self.loss_guard = float(config.LOSS_GUARD_USDC)
 
         # Volatilidad máxima: se prefiere config si algún día la define.
         self.max_volatility = float(getattr(config, "MAX_VOLATILITY", MAX_VOLATILITY))
@@ -311,6 +317,12 @@ class RiskEngine:
         daily_loss = self._loss_from_pnl(snap.get("daily_pnl"))
         if daily_loss >= self.max_daily_loss:
             reasons.append(REASON_KS_DAILY_LOSS)
+
+        # Guard de pérdida realizada ajustado (§0.2 / "el bot no da pérdida"):
+        # el PnL diario realizado neto (realized - fees) cayó por debajo del
+        # umbral ajustado. Frena y aplana para no acumular pérdida material.
+        if daily_loss >= self.loss_guard:
+            reasons.append(REASON_KS_REALIZED_LOSS_GUARD)
 
         # Drawdown.
         if self._compute_drawdown(snap) >= self.max_drawdown_pct:

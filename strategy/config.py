@@ -57,6 +57,21 @@ MAX_LEVERAGE_USED: int = 20
 BUDGETS_CONFIRMED: bool = True
 
 # ---------------------------------------------------------------------------
+# Guard de pérdida realizada (§0.2 / "el bot no da pérdida")
+# ---------------------------------------------------------------------------
+# El kill switch de riesgo normal solo frena a -MAX_DAILY_LOSS_USDC (-10 USDC),
+# demasiado holgado para operar con fondos reales en XRPUSDC. Este guard MÁS
+# AJUSTADO frena y aplana la posición en cuanto el PnL realizado neto
+# (realized - fees) cae por debajo de -LOSS_GUARD_USDC. Garantiza que el bot
+# NUNCA acumule una pérdida material: ante cualquier racha perdedora (p.ej.
+# adverse selection en régimen de tendencia) se detiene y entrega la posición.
+# El bot ya fue rentable en régimen range-bound (día 11: +0.0045 USDC / 66
+# trades), así que este umbral NO corta el funcionamiento normal: solo frena
+# cuando effectivemente está perdiendo.
+# PROPUESTA pendiente de confirmación (§0.4): umbral ajustado a 2 céntimos.
+LOSS_GUARD_USDC: float = 0.02
+
+# ---------------------------------------------------------------------------
 # Niveles de exposición (§21)
 # ---------------------------------------------------------------------------
 
@@ -103,6 +118,8 @@ def effective_exposure_multiplier() -> float:
 # era rechazado → 0 órdenes todo el día, posición 4.9 atascada).
 # NOTA: el algoritmo de cálculo de tamaños queda para revisión dedicada
 # (el humano pidió NO tocarlo en esta iteración).
+# 2026-08-10/11: decisión humana §0.2 — "usa 5.0 XRP" (minNotional $5).
+# NO modificar el algoritmo de cálculo; revisar en iteración dedicada.
 BASE_ORDER_SIZE_XRP: float = 5.0
 
 # ---------------------------------------------------------------------------
@@ -229,8 +246,13 @@ KILL_SWITCH_FEE_LIMIT_USDC: float = 1.0
 
 # Fee maker de referencia (proporción del nocional). Fuente única (§0.4):
 # market_maker y alpha_model lo importan de acá, NO lo redefinen.
-# Fee maker real de Binance Futures (VIP0): 0.0002 por lado.
-MAKER_FEE_RATE: float = 0.0002
+# PROMO 0 fees en XRPUSDC CONFIRMADA por humano (2026-08-11): la API reporta
+# commission=0.0 y funding=0.0 en get_income_history (verificado 2026-08-11
+# 17:45 local, últimas 50 filas: COMMISSION total 0, FUNDING 0).
+# Regla §0 (confirmada 2026-08-11): mientras dure la promo MAKER_FEE_RATE=0.0.
+# SI LA PROMO TERMINA (vuelve a cobrar): DETENERSE Y REPORTAR — hay que
+# re-evaluar MIN_SPREAD_TICKS y los costos §18 antes de seguir operando igual.
+MAKER_FEE_RATE: float = 0.0
 
 # Funding de Binance Futures: se cobra PERIODICAMENTE, cada 8 h, sobre el
 # nocional de la posición (no por fill). Para el NetPnL esperado (§18) se
