@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-11 11:40 (PnL 30 días recomputado — reporte cada 5 min vía `reports/trade_status.txt`).
+> Última actualización: 2026-08-11 14:22 (relanzamiento mainnet + observación 15 min sin errores — ver abajo).
 
 ---
 
@@ -28,7 +28,7 @@
 
 **Regla §0.1**: testnet primero, mainnet SOLO con autorización humana explícita. **Mainnet OPERADA por primera vez el 2026-08-10** (`REAL=True`, `EXPOSURE_LEVEL=1`, autorización explícita §0.2 + confirmación interactiva `CONFIRMAR`).
 
-**Corrida actual (2026-08-11)**: bot PID **27636** relanzado 11:31 local con `run_mainnet.py --cycles 100000 --yes` (corrida extendida ~13 días, **sin el techo de 500 ciclos** — autorización humana 11:30). Código `5e723a6` (fix minNotional dinámico). Decisiones activas con `bid_size=ask_size=5.0` (> $5 minNotional ✓). **0 rechazos "notional < minNotional" desde el arranque** (antes ~5/s con código viejo). Fix `5e723a6`: no cotiza un lado cuyo notional quede bajo el mín. del exchange; si XRP sube, el mismo tamaño pasa el piso y el lado vuelve a cotizar solo.
+**Corrida actual (2026-08-11)**: bot PID **27840** relanzado 13:52:09 local con `run_mainnet.py --cycles 100000 --yes` (corrida extendida, sin techo de 500 ciclos). **Es la primera corrida con TODO el hardening FASE B ACTIVO EN VIVO**: timeout REST explícito (§8), sweep de huérfanas (pre-flight + stop), lock single-instance (§12), monitor/heartbeat cada 15 s con stall y divergencia (§11), journal con etapas (§10), log por corrida `logs/run_mainnet_20260811_135209.log`. Código `5e723a6` + FASE B. Pre-flight OK: mark 1.0068, leverage máx real 20x, 3 candados §0.2 satisfechos, sweep 0 huérfanas.
 
 **Reporte de trades (nuevo)**: `reports/trade_status.py` genera `reports/trade_status.txt` (trades, PnL neto, últimos fills/rechazos, estado del bot) y `reports/update_trade_status.sh` lo actualiza **cada 5 min** (loop en background con el fetch de PnL integrado). **PnL REAL según Binance API (fuente de verdad, `reports/fetch_binance_pnl.py` → `binance_pnl.json`, recomputado 11:35 con `--days 30`)**: **84 trades XRPUSDC en los últimos 30 días → Net PnL = −0.013541 USDC** (realized −0.013541, commission 0.0, funding 0.0). Por día: **10/08**: 42 trades −0.022540; **11/08**: 42 trades **+0.009000** (fees 0 por promo). **El PnL estimado por logs locales (+4.9630) está INFLADO**: el log de fills del 10/08 quedó truncado (faltan compras → notional comprado subestimado). Auditoría: 48/48 orderIds de la API coinciden con `server_order_id` de los logs → todos los trades son del bot (el `clientOrderId` viene `None` en python-binance, el filtro `MM-` no funciona). El humano tenía razón en dudar de +4.96. Rechazos = maker check §10 (sanos, sin errores Binance). **Conclusión 30 días**: la promo 0 fees hace al bot marginalmente rentable; sin ella (fees 0.0002), los round trips con spread 8 ticks pierden contra los costos — el mes se recupera apretando spread o subiendo tamaño.
 
@@ -168,3 +168,19 @@ Cambios aplicados y validados (74/74 tests OK + smoke tests):
 - **Journal con etapas (§10)**: `agent_decisions.jsonl` ahora incluye `cycle` siempre y `stage_ts` (cycle_start/snapshot_ready/quotes_done/orders_done) en ciclos 1-3 y cada 100 ciclos → permite medir duraciones reales y detectar colgamientos entre etapas.
 - **Log por corrida (§13)**: `logs/run_mainnet_YYYYmmdd_HHMMSS.log` en vez de un archivo compartido.
 - **Nota**: la corrida mainnet activa (PID 27636, código `5e723a6`) sigue con el código viejo; los cambios aplican al próximo reinicio vía relauncher.
+
+---
+
+## Relanzamiento mainnet 2026-08-11 13:52 + observación §20 (14:22 local)
+
+- **2026-08-11 (13:52–14:07 local)**: **relanzamiento mainnet PID 27840** (autorizado: corrida previa PID 27636 venció por watchdog). Pre-flight OK (mark 1.0068, leverage real 20x, lock único OK al arranque, sweep 0 huérfanas, 3 candados §0.2). **Observación completa de 15 min — TODOS los criterios §20 OK**:
+  - **1 solo proceso** + `logs/run_mainnet.lock` con PID (exit 4 si duplicado). Sin relauncher activo compitiendo (relauncher_2h cerró ventana 11:19, no re-lanzado).
+  - **Market data**: ws=True continuo, stall_age ≤ 6 s en todo momento (umbral warn 60 s).
+  - **Decision loop**: 0 → 141 decisiones en 15 min, `ok` 29, avanzando sin pausas.
+  - **Execution**: 39 eventos de órdenes, **7 fills reales** (source=refresh, idempotente por client_order_id, véase `logs/fills/fills_20260811.jsonl`).
+  - **Reconciliation**: sync 30 s purga órdenes llenadas y registra el fill (sin órdenes fantasma §0.6 — la cancel de una orden ya llenada devuelve `-2011` y NO se purga localmente hasta verificar, por diseño).
+  - **`-2011` acotados**: 16 totales, todos WARNINGs auto-resueltos (4–5 reintentos ≤ 30 s hasta el siguiente sync; luego cesan). **0 cadena infinita** (§14), 0 `-2011` en los últimos 2 min de la ventana.
+  - **Errores**: 1 único ERROR (transitorio `get_symbol` antes de `init_client` en pre-flight, auto-curado tras init — mismo patrón conocido). Kill switch: **0 disparos** en la corrida (kill_switch.jsonl solo tiene entradas de ayer).
+  - **Posición reconciliada en vivo**: arrancó 0.0, 3 fills (SELL 5 @ 1.0092, BUY 5 @ 1.0083, BUY 5 @ 1.0085) → **long 5.0 XRP ≈ $5.05** (<< $25 límite, dentro de presupuesto §0.4), bot recomprando el lado SELL a 1.0087 GTX para cerrar el round trip. Capturando spread maker real con promo 0 fees.
+- **2026-08-11 (14:22 local)**: **fix cosmético `UnicodeEncodeError` cp1252** — el único carácter no-cp1252 en strings de log era `→` (U+2192) en `run_mainnet.py:356` (`Pre-flight: requiredMarginPercent...`); reemplazado por `->` (los acentos/§/— son cp1252-compatibles, verificados con escaneo de los 8 módulos). El error solo rompía el handler de consola, no el archivo de log. **Aplica al próximo reinicio** (el proceso vivo 27840 ya cargó el código previo).
+- **Lección §0.6 (observada en vivo)**: el patrón "cancel de orden ya llenada → `-2011` → reintentar" está acotado por el sync de 30 s y termina solo; NO es cadena infinita. Opcional futuro: ante `-2011` en cancel, forzar refresh inmediato para purgar antes del siguiente ciclo (reduce ruido y rate-limit).

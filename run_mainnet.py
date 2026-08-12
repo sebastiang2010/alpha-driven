@@ -353,7 +353,7 @@ def _preflight(mm: MarketMaker) -> list[str]:
         req_margin = info.get("requiredMarginPercent")
         if req_margin:
             max_real_lev = int(1.0 / (float(req_margin) / 100.0))
-            log.info("Pre-flight: requiredMarginPercent=%s%% → leverage máx real=%dx",
+            log.info("Pre-flight: requiredMarginPercent=%s%% -> leverage max real=%dx",
                      req_margin, max_real_lev)
             if MAX_LEVERAGE_USED > max_real_lev:
                 errors.append(
