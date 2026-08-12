@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-12 15:25 (relanzamiento mainnet con fix "no da pérdida" + baseline PnL registrado; ver Log de actualizaciones).
+> Última actualización: 2026-08-12 20:23 (fin graceful de la corrida mainnet 1h; ver Log de actualizaciones).
 
 ---
 
@@ -191,3 +191,21 @@ Cambios aplicados y validados (74/74 tests OK + smoke tests):
 - **2026-08-11 (14:22 local)**: **fix cosmético `UnicodeEncodeError` cp1252** — el único carácter no-cp1252 en strings de log era `→` (U+2192) en `run_mainnet.py:356` (`Pre-flight: requiredMarginPercent...`); reemplazado por `->` (los acentos/§/— son cp1252-compatibles, verificados con escaneo de los 8 módulos). El error solo rompía el handler de consola, no el archivo de log. **Aplica al próximo reinicio** (el proceso vivo 27840 ya cargó el código previo).
 - **2026-08-12 19:05 local**: **fix del gate `expected_net_pnl` (§10) — el bot ahora cotiza two-sided en testnet**. Diagnosis: `expected_net_pnl_estimate` medía el edge contra el `mid` crudo, ignorando el sesgo de alpha; con `alpha≈0` el lado opuesto a la señal (el SELL sin señal alcista) daba NetPnL<0 → el gate §10 lo rechazaba siempre → 0 fills / 0 `reason=ok`. **Fix**: medir contra el valor justo `reservation_price = mid + alpha − penalty` (no contra mid); el skew de alpha y de inventario se cancelan y ambos lados quedan con spread capturado > 0 cuando el piso se cumple. `strategy/alpha_model.py:expected_net_pnl_estimate`. Test de la lógica de signo actualizado (`test_quote_dentro_del_spread...` ahora valida branch de bloqueo con quote sin edge, sin asumir alpha=0). **Suite 76/76 OK**. **Validación testnet (dry-run, REAL=False, sin mainnet)**: 24 órdenes colocadas / 16 fills (vs 0 antes), `reason==ok` 17/35, sin kill switch ni errores. Rechazos residuales `below_min_notional:bid` = el engine descarta bids cuyo notional < $5 de Binance cuando el skew los empuja bajo $1.00 (comportamiento correcto del risk engine, no bug). **Nota**: testnet solo valida mecánica de órdenes (caveat humano: no refleja estructura de mercado real → no se infiere edge/PnL de esta corrida). El fix modifica un gate de riesgo: requiere revisión humana antes de cualquier uso con capital real.
 - **Lección §0.6 (observada en vivo)**: el patrón "cancel de orden ya llenada → `-2011` → reintentar" está acotado por el sync de 30 s y termina solo; NO es cadena infinita. Opcional futuro: ante `-2011` en cancel, forzar refresh inmediato para purgar antes del siguiente ciclo (reduce ruido y rate-limit).
+
+## 2026-08-12 19:22 — MAINNET live (autorización humana §0.2 "pasa a mainet")
+- Run mainnet 1h: `echo CONFIRMAR | python run_mainnet.py --cycles 600` (PID 12036, watchdog ~3630s).
+- Pre-flight OK: mark 1.0055, posición 0, leverage 20x = máx real, PERCENT_PRICE ±5%.
+- Fix `expected_net_pnl_estimate` (commit 628cb4f) confirmado en mainnet: dos lados cotizan con expected_pnl>0.
+- Fills reales two-sided (76 hoy, simulated:False), round-trips ~1.0054-1.0076.
+- Risk gate conservador: rechazos below_min_notional / expected_net_pnl_non_positive por diseño (seguro).
+- Inventario manejado (corto -5 XRP siendo aplanado). Monitor cada 5 min: monitor_mainnet.log.
+
+## 2026-08-12 20:23 — Fin graceful de la corrida mainnet 1h (PID 12036)
+- **Corrida completa**: `max_cycles=600` alcanzado a las 20:19:17 local (3402.1 s ≈ 56.7 min); WS cerrados limpios (bookTicker/depth/trade), lock liberado, **Exit code=0**. Process dead (RUN_GONE) confirmado a 20:26:33.
+- **RESUMEN MAINNET**: EXPOSURE_LEVEL=1, dry_run=False, real=True, ws_connected=True. decisions=599, orders=304, fills=12 (este run; 58 reales hoy), kill_switch=0. mid min/max 0.99995/1.00635. bid_size/ask_size max 5.0. reason==ok 307/599; resto below_min_notional:ask/bid (skew-manage). **GATE OK: sizes>0, reason==ok, sin kill switch, sin errores, sin simuladas.**
+- **Reconciliación post-run (read-only, mainnet real)**: `futures_position_information(XRPUSDC)` = `[]` (posición plana, 0 XRP); `futures_get_open_orders(XRPUSDC)` = 0 órdenes abiertas. Journal decisión final (cyc 600, ts 2026-08-12T23:19:11): inventory 0.0. **Sin exposición abierta al cierre.**
+- **Kill switch**: 0 eventos durante la corrida (kill_switch.jsonl solo tiene 8 entradas históricas pre-run, última `ws_disconnected`).
+- **DNS**: 2 `NameResolutionError` transitorios en `fapi.binance.com` `reconcile_position` REST (primer 19:32:49); no afectaron cotización (WS ok; kill switch solo en `ws_disconnected`). Count estable en 2.
+- **Edge**: expected_pnl consistentemente +0.003 a +0.008 por lado; epnl acumulado snapshot ~+0.003. Real fills today = 58 (0 simulados en mainnet; 24 simulados pre-mainnet 16:43–17:09).
+- **Nota skew**: el bot sostuvo +5.0 XRP de inventario (real maker bid fill) y lo manejó vía `below_min_notional:bid` (no recompró hasta reducir) — skew-manage conservador, dentro de $25 notional.
+- **Cambios on-disk sin commit corriendo en mainnet**: `strategy/execution_engine.py`, `strategy/market_maker.py`, `strategy/tests/test_market_maker.py`. Commit `628cb4f` (alpha_model + test + STATUS) ya está local (no push).

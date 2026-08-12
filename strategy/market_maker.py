@@ -42,6 +42,14 @@ from .risk_engine import RiskEngine, MAX_ERROR_COUNT, MAX_VOLATILITY
 # restaura en <10 s; el kill switch sigue protegiendo desconexiones reales >60 s (§13 intacto).
 WS_STALE_SEC: float = 60.0
 
+# Gracia de reconexión §13 (2026-08-11, iteración independencia): con WS caído
+# el bot cancela makers (libro limpio, sin llenados a precio stale) y NO cotiza,
+# esperando la reconexión (backoff interno de los WS <10 s). Solo si el WS no
+# vuelve en WS_KILL_GRACE_SEC se ejecuta el kill switch real (cancel_all +
+# reduce/close + bloqueo + GATE FAIL, §13 intacto). Antes: 1er ciclo con stale
+# mataba la corrida → corridas de 3.5 h perdidas por cortes de 1-2 min.
+WS_KILL_GRACE_SEC: float = 120.0
+
 # Horizonte de la medida de adverse selection (§14).
 ADVERSE_SELECTION_HORIZON_SEC: float = 5.0
 

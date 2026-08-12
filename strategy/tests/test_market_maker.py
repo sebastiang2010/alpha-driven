@@ -171,10 +171,10 @@ class TestMinNotionalGuard(_MarketMakerTestCase):
         self.assertNotIn("below_min_notional:ask", q["reasons"])
 
     def test_flat_con_precio_bajo_no_cotiza_ningun_lado(self):
-        """Inventario 0 y XRP en $0.9: 5.0 XRP = $4.45/$4.55 < $5 → ningún
+        """Inventario 0 y XRP en $0.6: 8.0 XRP = $4.80 < $5 → ningún
         lado se cotiza (evita el spam de órdenes que el exchange rechazaría
         aunque el NetPnL estimado sea positivo)."""
-        q = self._setup(mid=0.9, inventory=0.0)
+        q = self._setup(mid=0.6, inventory=0.0)
         self.assertFalse(q["quote_bid_ok"], q["reasons"])
         self.assertFalse(q["quote_ask_ok"], q["reasons"])
         self.assertIn("below_min_notional:bid", q["reasons"])
