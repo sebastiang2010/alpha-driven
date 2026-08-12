@@ -295,8 +295,11 @@ class TestPisoDeSpread(unittest.TestCase):
         bid, ask = self.am.quote_distances(snap, 0.0, 0.0, 0.001)
         self.assertGreater(bid + ask, self.floor)
         # Referencia explícita de la fórmula previa (sin piso):
-        # base = spread/2 + K*sigma_efectiva, con sigma_ef = sigma*sqrt(12)*sqrt(5)
-        sigma_ef = 0.001 * math.sqrt(12.0) * math.sqrt(5.0)
+        # base = spread/2 + K*sigma_efectiva, con sigma_ef = sigma*sqrt(CYCLE/SAMPLING)
+        sigma_ef = 0.001 * math.sqrt(
+            alpha_model.config.CYCLE_INTERVAL_SEC
+            / alpha_model.config.SAMPLING_INTERVAL_SEC
+        )
         base = 0.001 + sigma_ef
         self.assertAlmostEqual(bid, base, places=12)
         self.assertAlmostEqual(ask, base, places=12)
@@ -315,7 +318,10 @@ class TestPisoDeSpread(unittest.TestCase):
         # Inventario long -> bid más lejos del mid que el ask.
         self.assertGreater(bid, ask)
         # El skew (2*skew = bid - ask) se preserva tal cual lo calcula el modelo.
-        sigma_ef = sigma * math.sqrt(12.0) * math.sqrt(5.0)
+        sigma_ef = sigma * math.sqrt(
+            alpha_model.config.CYCLE_INTERVAL_SEC
+            / alpha_model.config.SAMPLING_INTERVAL_SEC
+        )
         skew = ((inv * mid) / alpha_model.config.MAX_POSITION_NOTIONAL_USDC
                 * alpha_model.INVENTORY_SKEW_MULTIPLIER * sigma_ef)
         self.assertAlmostEqual(bid - ask, 2.0 * skew, places=12)
@@ -458,7 +464,10 @@ class TestFiltroMomentum(unittest.TestCase):
         self.assertAlmostEqual(bid + ask, self.floor_momentum, places=12)
         # Inventario long -> bid más lejos del mid que el ask.
         self.assertGreater(bid, ask)
-        sigma_ef = sigma * math.sqrt(12.0) * math.sqrt(5.0)
+        sigma_ef = sigma * math.sqrt(
+            alpha_model.config.CYCLE_INTERVAL_SEC
+            / alpha_model.config.SAMPLING_INTERVAL_SEC
+        )
         skew = ((inv * mid) / alpha_model.config.MAX_POSITION_NOTIONAL_USDC
                 * alpha_model.INVENTORY_SKEW_MULTIPLIER * sigma_ef)
         self.assertAlmostEqual(bid - ask, 2.0 * skew, places=12)

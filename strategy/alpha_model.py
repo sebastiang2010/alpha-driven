@@ -73,7 +73,7 @@ ALPHA_MAX: float = 0.0005
 # ---------------------------------------------------------------------------
 # Parámetros de re-cotizacion (§8, §11) — PROPUESTA pendiente de confirmacion
 # ---------------------------------------------------------------------------
-GAMMA_INVENTORY_RISK: float = 0.5   # aversion al riesgo de inventario (f)
+GAMMA_INVENTORY_RISK: float = 1.0   # aversion al riesgo de inventario (f)
 K_QUOTE: float = 1.0                # multiplicador de sigma_efectiva en quotes
 # ALPHA_QUOTE_FACTOR: §8 define r = S + alpha; el alpha ya desplaza la
 # reserva (reservation_price). Sumar |alpha| a la distancia (como hacia el
@@ -82,7 +82,7 @@ K_QUOTE: float = 1.0                # multiplicador de sigma_efectiva en quotes
 # run 22:26 UTC: ask=1.0622 con mid=1.04215). Se fija en 0.0 para respetar
 # §8. PENDIENTE DE CONFIRMACION (§0.4).
 ALPHA_QUOTE_FACTOR: float = 0.0     # cuanto ensancha |alpha| ambas puntas
-INVENTORY_SKEW_MULTIPLIER: float = 0.5  # skew de precio por inventario normalizado
+INVENTORY_SKEW_MULTIPLIER: float = 1.0  # skew de precio por inventario normalizado
 MIN_QUOTE_DISTANCE: float = 1e-8    # piso para que (bid_dist, ask_dist) > 0
 
 # ---------------------------------------------------------------------------
@@ -301,9 +301,10 @@ class AlphaModel:
         existe para hacer deterministas los tests (default: reloj real).
 
         Documentacion de sigma_efectiva (un solo √T por escala, §0.6):
-            sigma_efectiva = sigma * sqrt(INTERVALS_PER_MINUTE) * sqrt(CYCLE_INTERVAL_SEC)
-            [sigma base: por intervalo de muestreo] -> [escala minutos]
-            -> [horizonte del ciclo de re-cotizacion en segundos].
+            sigma_efectiva = sigma * sqrt(CYCLE_INTERVAL_SEC / SAMPLING_INTERVAL_SEC)
+            [sigma base: por intervalo de muestreo] -> [horizonte del ciclo de
+            re-cotizacion]. Unica conversion de escala temporal; no se aplica
+            sqrt(INTERVALS_PER_MINUTE) y sqrt(CYCLE_INTERVAL_SEC) a la vez.
         """
         mid = snapshot.get("mid")
         if mid is None or mid <= 0:
@@ -313,10 +314,12 @@ class AlphaModel:
             now_sec = time.time()
 
         spread = float(snapshot.get("spread", 0.0) or 0.0)
-        sigma_efectiva = (
-            float(sigma)
-            * math.sqrt(INTERVALS_PER_MINUTE)
-            * math.sqrt(config.CYCLE_INTERVAL_SEC)
+        # Un solo sqrt(T) (§0.6): convierte sigma de su escala de muestreo a la
+        # del horizonte de re-cotizacion (ciclo). Aplicar sqrt(INTERVALS_PER_MINUTE)
+        # Y sqrt(CYCLE_INTERVAL_SEC) era un doble sqrt(T) que inflaba ~7.75x el
+        # ancho del quote (quotes de 43-159 ticks en lugar de near-floor).
+        sigma_efectiva = float(sigma) * math.sqrt(
+            config.CYCLE_INTERVAL_SEC / config.SAMPLING_INTERVAL_SEC
         )
 
         base = (
