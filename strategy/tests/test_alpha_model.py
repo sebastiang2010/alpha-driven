@@ -180,13 +180,19 @@ class TestModeloDeCostos(unittest.TestCase):
         snap = _snapshot(mid=1.0, spread=0.0006)
         pnl_bid = self.am.expected_net_pnl_estimate(snap, "bid", 0.9997, 20.0)
         self.assertGreater(pnl_bid, 0.0)
-        # Contraste con el modelo viejo: costos fijos 0.0004 => NetPnL negativo.
-        pnl_viejo = self.am.expected_net_pnl_estimate(
-            snap, "bid", 0.9997, 20.0,
-            maker_fee=0.0002, funding_rate_per_8h=0.0001,
-            expected_hold_sec=28800.0, slippage_rate=0.0001,
+        # Logica de signo del gate (§10) contra el valor justo (reservation
+        # price = mid + alpha), no contra el mid crudo. Un quote SIN edge
+        # (precio en/sobre el valor justo) debe dar NetPnL <= 0 y ser
+        # bloqueado, sea cual sea el alpha. Valida el branch de bloqueo sin
+        # asumir alpha=0 (el contraste viejo vs mid ya no aplica).
+        fair = self.am.reservation_price(
+            snap, self.am.compute_alpha(snap),
+            float(snap.get("inventory", 0.0)), float(snap.get("volatility", 0.0)),
         )
-        self.assertLess(pnl_viejo, 0.0)
+        pnl_sin_edge = self.am.expected_net_pnl_estimate(
+            snap, "bid", fair + 0.0005, 20.0,
+        )
+        self.assertLessEqual(pnl_sin_edge, 0.0)
 
 
 class TestComputeAlpha(unittest.TestCase):

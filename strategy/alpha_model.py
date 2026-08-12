@@ -422,9 +422,23 @@ class AlphaModel:
         cost_rate = fee_rate + funding + slippage
         costs = float(price) * float(qty) * cost_rate
 
+        # Valor justo = precio de reserva (§8): r = mid + alpha - penalty.
+        # Medir el edge contra r, NO contra el mid crudo: el sesgo de alpha
+        # (y el skew de inventario) ya estan incorporados en r, por lo que el
+        # spread capturado es bid_dist/ask_dist (> 0 por el piso). Medir contra
+        # mid castigaba el sesgo direccional y rechazaba siempre un lado cuando
+        # habia senal (bug: el bot no podia cotizar two-sided). Ver reporte de
+        # medicion en testnet 2026-08-12.
+        alpha = self.compute_alpha(snapshot)
+        inventory = float(snapshot.get("inventory", 0.0) or 0.0)
+        sigma = float(snapshot.get("volatility", 0.0) or 0.0)
+        fair = self.reservation_price(snapshot, alpha, inventory, sigma)
+        if fair is None or fair <= 0:
+            fair = float(mid)
+
         side_norm = str(side).upper()
         if side_norm in ("BID", "BUY"):
-            return (float(mid) - float(price)) * float(qty) - costs
+            return (fair - float(price)) * float(qty) - costs
         if side_norm in ("ASK", "SELL"):
-            return (float(price) - float(mid)) * float(qty) - costs
+            return (float(price) - fair) * float(qty) - costs
         return 0.0
