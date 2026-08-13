@@ -1,7 +1,7 @@
 # STATUS.md — Bot de Market Making XRPUSDC (Binance Futures)
 
 > Documento vivo. Se actualiza cada 15–20 min durante el desarrollo (§0.3).
-> Última actualización: 2026-08-12 20:23 (fin graceful de la corrida mainnet 1h; ver Log de actualizaciones).
+> Última actualización: 2026-08-13 (corrida mainnet "última para evaluar VPS" + aplanado de posición; ver Log de actualizaciones).
 
 ---
 
@@ -138,6 +138,13 @@ Pendientes de decisión (NO corregidos aún — ver Pendiente):
 
 ## Log de actualizaciones
 
+### 2026-08-13 — Corrida "última para evaluar VPS" + aplanado la posición (autorizado por humano)
+- **Fix freeze aplicado y COMITEADO** (`e4a5c0d`, autorizado por humano): en `risk_engine.check_order` se añadió `is_reducing = (side=="ask" and inventory>0) or (side=="bid" and inventory<0)`; las verificaciones #2 (inventory) y #9 (exposure) se **saltean** si `is_reducing`, y la #9 usa `gross_exposure = abs(projected_notional) + abs(notional)` (notional proyectado en vez de solo la posición actual). Tests actualizados: renombrado `test_rejects_when_exposure_exceeded`→`test_rejects_when_exposure_exceeded_non_reducing` (BUY desde plano, notional 25, precio 5.0 → gross 50>25 rechaza) + nuevo `test_allows_reducing_order_to_unwind` (SELL cuando long, inventory=49, current_pos_notional=24.5, notional 2.0 → permitido). **Suite 77/77 OK.**
+- **Corrida mainnet 4** (`run_mainnet.py --cycles 200 --yes`, PID 2170, ~09:22→09:41, exit 0): 199/199 decisiones `ok`, 72 órdenes, 7 fills, kill_switch=0, 1111.5 s, mid 1.00325/1.00585, bid/ask_size max 5.0, GATE OK. **Confirma que el fix de desarmar funciona**: fills muestran SELL por encima de BUY (BUY 1.0043→SELL 1.0057; BUY 1.0037→SELL 1.0051). 2 round-trips completos, **+0.014 USDC, 100% ganadores**. 7 rechazos `exposure_exceeded` (BUYs cerca del tope). La cuenta quedó **long 15.0 XRP** (la corrida redujo de un arrastre previo a 15 vía ventas maker).
+- **Verificación de posición real** (lectura read-only, autorizada): `get_open_position_for_symbol` → **long 15.0 XRP, entry 1.0051, mark 1.0039, notional $15.06, uPnL −0.018, SIN órdenes abiertas**. **Corrige el cálculo fill-derivado erróneo de 35.1 XRP**: la reconciliación real es 15 (bajo el tope `MAX_POSITION_NOTIONAL_USDC=25`). **El tope de posición SÍ se respeta**; el bot redujo el inventario vía ventas maker durante la corrida.
+- **Aplanado de la posición** (autorizado por humano, opción "Taker IOC reduceOnly"): las órdenes **maker GTX `reduceOnly` fueron rechazadas por Binance con `-5022`** (el libro de 1 tick + latencia del cliente hacían que la orden cruzara al colocarse). IOC LIMIT por encima del ask expiró sin fill (`EXPIRED`, libro fino). Finalmente **MARKET `reduceOnly` SELL 15.0 XRP FILLED @ avg 1.00540** (orderId 8025135291) → **cuenta plana (0 XRP)**. Nota: rompe la regla §0 maker-first (taker); fue decisión explícita del humano para cerrar ya. El endpoint de posición dio `None` transitorio pero el fill es definitivo.
+- **Evaluación VPS (conclusión)**: el unwind funciona y los round-trips son positivos (muestra pequeña: 2 RTs +0.014), y la posición real respetó el tope. **PERO sigue NO listo para VPS** por: (1) fill rate extremadamente bajo (7 fills / ~18 min) → rentabilidad no probada a escala; (2) muestra de RTs ganadores aún pequeña. Además pasar a VPS = producción mainnet requiere autorización humana explícita §0.1/§0.2. Pendiente: más corridas con mayor fill rate antes de declararlo listo; y sincronizar `vps_upload/strategy/` (que aún tiene `MIN_SPREAD_TICKS=8` y NO el fix Opción 1) antes de cualquier deploy.
+
 ### 2026-08-12 15:22 — Relanzamiento mainnet con fix "no da pérdida" (autorizado por humano)
 - **Estado previo**: bot CAÍDO (lock obsoleto, PID 1952 muerto). Cuenta real mainnet sin posición XRPUSDC (plana); el STATUS previo "LONG 5 XRP" no correspondía a esta cuenta.
 - **Fix deployado**: `LOSS_GUARD_USDC = 0.02` + nuevo motivo `REASON_KS_REALIZED_LOSS_GUARD` en `risk_engine.py` (§0.2: frena y aplana si `daily_pnl = realized_pnl − fees` < −2 céntimos). El skew de inventario (`INVENTORY_SKEW_MULTIPLIER` / `GAMMA_INVENTORY_RISK` en `alpha_model.py`) **ya estaba en 1.0** — no requirió cambio (corrige nota anterior).
@@ -247,3 +254,16 @@ Decisión del usuario: **opción 1** (mantener ambos lados cotizando; no rechaza
 **Tests**: `strategy/tests/test_market_maker.py` actualizado (`test_lado_agravante_bajo_notional_se_sube_al_piso`); suite completa **76/76 OK**. `run_mainnet.py` importa `strategy.market_maker` → el fix aplica en vivo (no hace falta tocar `vps_upload/` para la corrida local; ver nota deploy abajo si se despliega en VPS).
 
 **Siguiente**: medición mainnet corta (run acotado) para confirmar que el RT se vuelve positivo al capturar spread two-sided. Nota: `vps_upload/strategy/config.py` y `alpha_model.py` siguen en 8 ticks y sin este fix — actualizar si el deploy corre desde `vps_upload/`.
+
+## 2026-08-12 23:30 — Run 2 (PID 1944): fix validado, termina por kill switch WS.
+
+- Corrida `--cycles 200 --yes`, 22:28→23:25 local (~57 min). `reason==ok: 79/79` (antes ~33/210). **Ambos lados cotizan two-sided confirmado en vivo.**
+- Fill rate real: 7 fills en la ventana (escaso para XRPUSDC maker — mercado ilíquido o niveles no tocados). 2 round-trips analizados (FIFO):
+  - RT1: BUY 1.0012 → SELL 1.0015 = **+0.0015** (primer RT positivo de toda la medición).
+  - RT2: BUY 1.0017 → SELL 1.0015 = **−0.001** (adverse: compró en local-high, vendió en baja).
+  - Net: **+0.0005** (~breakeven). Con MAKER_FEE=0 el spread debería acumular +, pero la **adverse selection** sigue comiéndolo en ~50% de los RTs.
+- **Fin por kill switch `ws_disconnected`** (§13) tras caída transitoria del WebSocket a las 23:25. Comportamiento de seguridad CORRECTO (evita órdenes huérfanas). Exit code 1, lock liberado, VPS bots intactos.
+- **Pendiente / siguientes palancas** (todavía no rentable de forma conclusiva):
+  1. **Tuning de adverse selection**: el reservation-price skew / alpha hace que el bot compre en local-highs. Recalibrar `RESERVATION_SKEW` / `alpha` para que el bid baje cuando está long y el ask suba cuando está long (no comprar en la subida). Con 0 fees, capturar el spread requiere no ser adverse-selected.
+  2. **Relanzar** corrida acotada para acumular >10 RTs y confirmar signo del net (2 RTs es muestra chica).
+  3. **WS resilience** (opcional, post-rentabilidad): reconexión con backoff ya existe en los módulos WS; el kill switch por `ws_disconnected` es deliberado y seguro — no cambiar sin evaluar riesgo de órdenes huérfanas.
