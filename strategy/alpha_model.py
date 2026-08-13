@@ -288,15 +288,17 @@ class AlphaModel:
         bid_dist = base + skew      (inventario long -> bid mas lejos)
         ask_dist = base - skew      (inventario long -> ask mas cerca)
 
-        Piso de spread (§11, aprobado §0.2): si bid_dist + ask_dist <
-        MIN_SPREAD_TICKS * tick_size (breakeven 4.1 ticks, piso 8 = 1.95x
-        fees maker), se ensancha simetricamente desde el mid (extra/2 a
-        cada lado); el skew de inventario se preserva intacto.
+        Piso de spread (§11): si bid_dist + ask_dist <
+        MIN_SPREAD_TICKS * tick_size, se ensancha simetricamente desde el
+        mid (extra/2 a cada lado); el skew de inventario se preserva intacto.
+        Con la promo 0 fees (MAKER_FEE_RATE=0.0) el piso ya no cubre fees
+        sino adverse selection; por eso MIN_SPREAD_TICKS=12 (subido de 8 el
+        2026-08-12 tras medir -0.00024/RT con 8 ticks).
 
         Filtro de momentum (§14): si el mid se movió >= MOMENTUM_MAX_TICKS
         dentro de MOMENTUM_WINDOW_SECONDS (o el cooldown aún corre), el
         piso efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER
-        (8 -> 16 ticks). El filtro es SIMÉTRICO (no direccional) y el skew
+        (12 -> 24 ticks). El filtro es SIMÉTRICO (no direccional) y el skew
         de inventario se aplica igual, por encima del piso. now_sec solo
         existe para hacer deterministas los tests (default: reloj real).
 
@@ -336,15 +338,15 @@ class AlphaModel:
         bid_dist = base + inventory_skew
         ask_dist = base - inventory_skew
 
-        # Piso de spread (breakeven contra fees maker, §11/§0.2): el round
-        # trip mainnet 2026-08-10 perdió -0.0113 USDC por adverse selection
-        # porque no existía piso estructural. Breakeven:
-        #     N = 2 * f_maker * P / tick = 2*0.0002*1.026/0.0001 = 4.1 ticks
-        # Piso aprobado: MIN_SPREAD_TICKS = 8 (1.95x fees). Si el spread
-        # calculado por volatilidad queda por debajo, se ensancha
-        # SIMETRICAMENTE desde el mid (extra/2 a cada lado): el skew de
-        # inventario ya está incluido en bid_dist/ask_dist y se preserva
-        # intacto (se aplica después del piso).
+        # Piso de spread (§11): el round trip mainnet 2026-08-10 perdió
+        # -0.0113 USDC por adverse selection porque no existía piso
+        # estructural. Con la promo 0 fees (MAKER_FEE_RATE=0.0) el piso ya
+        # no cubre fees sino adverse selection. Medición 2026-08-12: con 8
+        # ticks el NET fue -0.01954 USDC (-0.00024/RT); se subió a 12 ticks.
+        # Si el spread calculado por volatilidad queda por debajo, se
+        # ensancha SIMETRICAMENTE desde el mid (extra/2 a cada lado): el
+        # skew de inventario ya está incluido en bid_dist/ask_dist y se
+        # preserva intacto (se aplica después del piso).
         tick_size = float(snapshot.get("tick_size") or config.TICK_SIZE_XRPUSDC)
         # Filtro de momentum (§14): el piso se MULTIPLICA (no solo se
         # ensancha el spread calculado). Mismo tick_size que el piso base.

@@ -184,15 +184,17 @@ QUOTE_UPDATE_THRESHOLD_PCT: float = 0.001
 TICK_SIZE_XRPUSDC: float = 0.0001
 
 # Piso mínimo de spread total cotizado (bid_dist + ask_dist), en ticks.
-# Breakeven con fee maker VIP0 (MAKER_FEE_RATE=0.0002) y tick 0.0001, para
-# el precio de referencia de la corrida mainnet (P ≈ 1.026):
-#     N_breakeven = 2 * f_maker * P / tick = 2*0.0002*1.026/0.0001 = 4.1 ticks
-#     -> mínimo operativo N_min = 5 ticks (redondeo hacia arriba).
-# Piso aprobado por humano (2026-08-10, tras round trip mainnet con adverse
-# selection -0.0113 USDC: no existía piso estructural): 8 ticks = 1.95x las
-# fees maker -> margen de seguridad; el spread por volatilidad puede ser
-# mayor y entonces manda el cálculo previo.
-MIN_SPREAD_TICKS: int = 8
+# Con la PROMO 0 fees (MAKER_FEE_RATE=0.0, confirmada 2026-08-11) el breakeven
+# por fees es 0; el piso ya NO se justifica por cubrir fees sino por cubrir
+# ADVERSE SELECTION. P = ~1.01, qty base 5 XRP, tick 0.0001 ->
+#     1 tick = qty * tick = 5 * 0.0001 = 0.0005 USDC por round-trip.
+# Medición 2026-08-12 (82 round-trips mainnet, NET -0.01954 USDC): el piso de
+# 8 ticks (= 0.004 USDC / RT, coincide con el |RT| medio observado 0.00409)
+# captura ~8 ticks pero la adverse selection lo sesga -0.00024/RT de media.
+# Subir a 12 ticks (+4 ticks = +0.002 USDC/RT) vuelca la media a ~+0.0018/RT
+# (claramente positivo). Piso efectivo en momentum = 12 * 2 = 24 ticks.
+# Criterio de revisión: si tras el cambio el NET sigue <= 0, subir a 16.
+MIN_SPREAD_TICKS: int = 12
 
 # ---------------------------------------------------------------------------
 # Filtro de momentum anti-adverse-selection (§14) — PROPUESTA pendiente de
@@ -204,11 +206,11 @@ MIN_SPREAD_TICKS: int = 8
 # (RTs -0.0118 y -0.0128 USDC). En mercado tranquilo el piso da
 # +0.0004..+0.0014 neto. Este filtro detecta movimiento direccional del mid
 # y ENSANCHA EL PISO (no solo el spread calculado): si hay momentum, el piso
-# efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER (8 -> 16
+# efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER (12 -> 24
 # ticks). Es SIMETRICO (no direccional): no asume hacia dónde va el precio,
 # solo que un movimiento >= MOMENTUM_MAX_TICKS en la ventana hace más
 # probable que un fill inmediato sea adverso. El cooldown evita alternar
-# rápido entre 8 y 16 ticks cuando el mid oscila alrededor del umbral.
+# rápido entre 12 y 24 ticks cuando el mid oscila alrededor del umbral.
 
 # Activa/desactiva el filtro completo (sin borrar el historial).
 MOMENTUM_ENABLED: bool = True
@@ -224,9 +226,9 @@ MOMENTUM_WINDOW_SECONDS: float = 30.0
 MOMENTUM_MAX_TICKS: float = 8.0
 
 # Multiplicador del piso cuando hay momentum: piso efectivo =
-# MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER = 16 ticks (4x las fees
-# maker, cubriendo el gap típico observado de 19 ticks entre entrada y
-# salida en el RT adverso del 2026-08-10).
+# MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER = 24 ticks (12 * 2, cubriendo
+# el gap típico observado de 19 ticks entre entrada y salida en el RT
+# adverso del 2026-08-10).
 MOMENTUM_SPREAD_MULTIPLIER: float = 2.0
 
 # Una vez detectado momentum, el spread ampliado se mantiene al menos este

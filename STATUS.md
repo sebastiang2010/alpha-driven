@@ -209,3 +209,19 @@ Cambios aplicados y validados (74/74 tests OK + smoke tests):
 - **Edge**: expected_pnl consistentemente +0.003 a +0.008 por lado; epnl acumulado snapshot ~+0.003. Real fills today = 58 (0 simulados en mainnet; 24 simulados pre-mainnet 16:43–17:09).
 - **Nota skew**: el bot sostuvo +5.0 XRP de inventario (real maker bid fill) y lo manejó vía `below_min_notional:bid` (no recompró hasta reducir) — skew-manage conservador, dentro de $25 notional.
 - **Cambios on-disk sin commit corriendo en mainnet**: `strategy/execution_engine.py`, `strategy/market_maker.py`, `strategy/tests/test_market_maker.py`. Commit `628cb4f` (alpha_model + test + STATUS) ya está local (no push).
+
+---
+
+## 2026-08-12 21:20 — FIX del piso de spread (causa raíz de la pérdida)
+
+**Diagnóstico (PnL real `reports/binance_pnl.json`, fetch 23:43Z)**: NET mainnet = **−0.020046 USDC** (178 trades, 82 round-trips). Win 47.6% (39W/43L) con avg win **+0.00405** ≈ avg loss **−0.00413** (SIMÉTRICOS → no es fee ni slippage, es adverse selection pura). Precio real **~1.01** (PnL/tick = qty 5 × tick 0.0001 = **0.0005 USDC/tick**). Spread 8 ticks = 0.004 USDC/RT = coincide con avg |RT| 0.00409 → el piso captura ~8 ticks pero adverse selection sesga **−0.00024/RT**.
+
+**Por qué el floor de 8 no basta (promo 0 fees)**: con `MAKER_FEE_RATE=0.0` el breakeven por fees es 0; el piso ya NO cubre fees sino adverse selection. Subir a **12 ticks** (+4 ticks = +0.002 USDC/RT) vuelca la media de −0.00024 a **~+0.0018/RT** (claramente positivo). Ensanchar es SEGURO: solo reduce fills / aumenta edge, no puede aumentar pérdidas.
+
+**Cambio**: `strategy/config.py:197` `MIN_SPREAD_TICKS: int = 8 → 12`. Piso efectivo en momentum = 12 × 2 = **24 ticks**. Comentarios desactualizados actualizados en `config.py`, `alpha_model.py`, `analyze_loss_guard.py`, `test_alpha_model.py` (docstrings 8→12 / 16→24; el cálculo usa el valor de config dinámicamente, así que no rompe). Tests dinámicos pasan.
+
+**Suite 76/76 OK** (commit local pendiente).
+
+**Pendiente (acción con fondos reales — requiere autorización §0.2)**: re-corrida mainnet corta (30–60 min) con `monitor_mainnet.py` para medir PnL real con 12 ticks. Criterio de éxito: NET > 0. Si tras el cambio sigue ≤ 0, subir a 16 (ver comentario en config.py).
+
+**Nota deploy**: `vps_upload/strategy/config.py` y `vps_upload/strategy/alpha_model.py` siguen en 8 ticks (espejo de deploy). Si el bot corre desde `vps_upload/`, debe actualizarse también antes de la medición.

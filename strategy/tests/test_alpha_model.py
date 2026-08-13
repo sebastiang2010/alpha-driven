@@ -261,18 +261,21 @@ class TestAlphaSinDobleConteoEnQuotes(unittest.TestCase):
 
 
 class TestPisoDeSpread(unittest.TestCase):
-    """Piso de spread MIN_SPREAD_TICKS=8 (§11, aprobado §0.2 2026-08-10).
+    """Piso de spread MIN_SPREAD_TICKS (valor dinámico desde config; 12 ticks
+    desde 2026-08-12).
 
-    Breakeven contra fees maker: N = 2*f_maker*P/tick = 2*0.0002*1.026/0.0001
-    = 4.1 ticks -> piso de 8 ticks = 1.95x las fees (decisión tras round
-    trip mainnet con adverse selection -0.0113 USDC: no existía piso).
+    Con la promo 0 fees (MAKER_FEE_RATE=0.0) el piso ya no se justifica por
+    cubrir fees sino por cubrir adverse selection. Medición 2026-08-12: el
+    piso previo de 8 ticks capturaba ~8 ticks pero la adverse selection lo
+    sesgaba -0.00024/RT; subir a 12 ticks (+4 ticks = +0.002 USDC/RT) vuelca
+    la media a positivo. Los tests usan el valor de config dinámicamente.
 
     Verifica:
-    (a) sigma->0            => spread resultante == 8 ticks exacto.
+    (a) sigma->0            => spread resultante == MIN_SPREAD_TICKS exacto.
     (b) sigma alto          => spread ya supera el piso: comportamiento
-                               previo intacto (sin cambios).
+                                previo intacto (sin cambios).
     (c) skew de inventario  => el piso se mantiene y el skew se aplica
-                               encima (bid - ask == 2*skew esperado).
+                                encima (bid - ask == 2*skew esperado).
     """
 
     def setUp(self):
@@ -287,7 +290,7 @@ class TestPisoDeSpread(unittest.TestCase):
         return _snapshot(mid=mid, **base)
 
     def test_sigma_cero_spread_igual_piso_exacto(self):
-        """(a) sigma->0: el piso domina -> bid_dist + ask_dist == 8 ticks."""
+        """(a) sigma->0: el piso domina -> bid_dist + ask_dist == MIN_SPREAD_TICKS."""
         snap = self._snap_quieta()
         bid, ask = self.am.quote_distances(snap, 0.0, 0.0, 0.0)
         self.assertAlmostEqual(bid + ask, self.floor, places=12)
@@ -338,19 +341,21 @@ class TestFiltroMomentum(unittest.TestCase):
 
     Evidencia (2026-08-10, mainnet): con piso de 8 ticks el mercado cayó
     ~0.9% en ~50 min; el bid se llenó primero (compras en caída) y el ask
-    no (RTs -0.0118/-0.0128 USDC). Regla implementada:
+    no (RTs -0.0118/-0.0128 USDC). Medición 2026-08-12: el piso de 8 ticks
+    perdía -0.00024/RT por adverse selection, por eso el piso base subió a 12.
+    Regla implementada:
 
         Si |mid_actual - mid_inicio_ventana| >= MOMENTUM_MAX_TICKS * tick_size
         dentro de MOMENTUM_WINDOW_SECONDS (o el cooldown de
         MOMENTUM_COOLDOWN_SECONDS sigue vigente), el piso efectivo pasa de
-        MIN_SPREAD_TICKS (8) a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER
-        (16). SIMÉTRICO (usa |Δmid|) y el skew de inventario se aplica igual.
+        MIN_SPREAD_TICKS (12) a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER
+        (24). SIMÉTRICO (usa |Δmid|) y el skew de inventario se aplica igual.
 
     Verifica (sin red, con historial sintético vía record_mid + now_sec):
-    (a) mid estable  -> piso normal (8 ticks).
-    (b) movimiento >= umbral -> piso ampliado (16 ticks).
+    (a) mid estable  -> piso normal (12 ticks).
+    (b) movimiento >= umbral -> piso ampliado (24 ticks).
     (c) cooldown: aunque el mid se calme, el piso sigue ampliado hasta
-        superar MOMENTUM_COOLDOWN_SECONDS; luego vuelve a 8.
+        superar MOMENTUM_COOLDOWN_SECONDS; luego vuelve a 12.
     (d) movimiento < umbral -> sin ampliación.
     (e) simetría: subida y bajada activan el filtro por igual.
     (f) el piso ampliado convive con el skew de inventario (se preserva).
@@ -379,7 +384,7 @@ class TestFiltroMomentum(unittest.TestCase):
 
     # (a) mid estable
     def test_mid_estable_spread_normal(self):
-        """Mid sin movimiento en la ventana -> piso normal (8 ticks)."""
+        """Mid sin movimiento en la ventana -> piso normal (12 ticks)."""
         for ts, mid in [(0.0, 2.5), (10.0, 2.5), (20.0, 2.5), (30.0, 2.5)]:
             self.am.record_mid(ts, mid)
         snap = self._snap_quieta()
@@ -390,7 +395,7 @@ class TestFiltroMomentum(unittest.TestCase):
 
     # (b) movimiento >= umbral
     def test_movimiento_mayor_umbral_amplia_spread(self):
-        """Mid moviéndose >= MOMENTUM_MAX_TICKS en la ventana -> 16 ticks."""
+        """Mid moviéndose >= MOMENTUM_MAX_TICKS en la ventana -> 24 ticks."""
         # 9 ticks (0.0009) en 20 s: por encima del umbral de 8 ticks.
         self.am.record_mid(0.0, 2.5)
         self.am.record_mid(20.0, 2.5 + 9.0 * self.tick)
@@ -435,7 +440,7 @@ class TestFiltroMomentum(unittest.TestCase):
 
     # (d) movimiento < umbral
     def test_movimiento_menor_umbral_sin_ampliacion(self):
-        """3 ticks (< 8) en la ventana -> piso normal (8 ticks)."""
+        """3 ticks (< 8) en la ventana -> piso normal (12 ticks)."""
         self.am.record_mid(0.0, 2.5)
         self.am.record_mid(20.0, 2.5 + 3.0 * self.tick)
         snap = self._snap_quieta()
@@ -480,7 +485,7 @@ class TestFiltroMomentum(unittest.TestCase):
 
     # (g) comportamiento previo sin historial / desactivado
     def test_sin_historial_comportamiento_previo(self):
-        """Sin historial alimentado -> el filtro no altera nada (8 ticks)."""
+        """Sin historial alimentado -> el filtro no altera nada (12 ticks)."""
         snap = self._snap_quieta()
         bid, ask = self._dist(snap, now_sec=100.0)
         self.assertAlmostEqual(bid + ask, self.floor, places=12)

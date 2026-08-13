@@ -7,7 +7,7 @@ from strategy import config
 BASE = config.BASE_ORDER_SIZE_XRP        # 5.0 XRP por orden
 GUARD = config.LOSS_GUARD_USDC           # 0.02 USDC
 TICK = config.TICK_SIZE_XRPUSDC          # 0.0001
-SPREAD_TICKS = config.MIN_SPREAD_TICKS   # 8
+SPREAD_TICKS = config.MIN_SPREAD_TICKS   # valor dinámico (12 desde 2026-08-12)
 MAX_NOTIONAL = config.MAX_POSITION_NOTIONAL_USDC  # 25 USDC
 FEE = config.MAKER_FEE_RATE              # 0.0 (promo)
 
