@@ -22,6 +22,7 @@ from collections import deque
 from datetime import datetime
 import json
 import logging
+import math
 import pathlib
 import threading
 import time
@@ -275,24 +276,44 @@ class MarketMaker:
         if not quote_ask_ok:
             reasons.append("expected_net_pnl_non_positive:ask")
 
-        # Piso de notional del exchange (§3, fix 2026-08-11): NO intentar un
-        # lado cuyo notional quede bajo minNotional. Antes del fix, el lado
+        # Piso de notional del exchange (§3). Histórico 2026-08-11: el lado
         # agravante del skew §11 (p.ej. 2.5 XRP con corto −5.0) quedaba en
-        # ~$2.52 < $5 y el engine reintentaba cada ciclo: spam de rechazos
-        # (~5/s en mainnet 2026-08-11) que quemaba rate-limit sin colocar
-        # nada. El guard es DINÁMICO con el precio vigente: minNotional está
-        # en USDC, así que si XRP sube, el mismo tamaño cumple el piso y el
-        # lado vuelve a cotizar solo, sin intervención manual.
+        # ~$2.52 < $5 y el engine lo rechazaba cada ciclo -> spam de
+        # rechazos que quemaba rate-limit. El fix original lo RECHAZABA, pero
+        # eso volvía al bot ONE-SIDED y lo obligaba a salir en precio adverso
+        # en vez de capturar el spread (medición 2026-08-12: 8 RTs net −0.0255,
+        # avgLoss −0.007 ≫ avgWin +0.003). Fix 2026-08-12: en lugar de
+        # rechazar, SUBIMOS el tamaño al mínimo que cumple minNotional para
+        # mantener AMBOS lados cotizando y poder cerrar two-sided en el spread.
+        # Solo rechazamos si ni siquiera el tamaño máximo (max_order_size)
+        # alcanza el notional (precio tan bajo que 5 XRP < minNotional).
+        # El guard es DINÁMICO con el precio: minNotional está en USDC.
         min_notional = float(
             (self.exec.symbol_info or {}).get("min_notional") or 0.0
         )
         if min_notional > 0.0:
+            step = float((self.exec.symbol_info or {}).get("step_size") or 0.1)
+            qprec = int((self.exec.symbol_info or {}).get("quantity_precision") or 1)
+            cap = float(getattr(self.risk, "max_order_size", 0.0) or 0.0)
+
+            def _min_qty(p: float) -> float:
+                q = math.ceil((min_notional / p) / step - 1e-9) * step
+                return round(q, qprec)
+
             if bid_size > 0.0 and bid_price * bid_size < min_notional - 1e-12:
-                quote_bid_ok = False
-                reasons.append("below_min_notional:bid")
+                mq = _min_qty(bid_price)
+                if cap > 0.0 and mq > cap + 1e-9:
+                    quote_bid_ok = False
+                    reasons.append("below_min_notional:bid")
+                else:
+                    bid_size = max(bid_size, mq)
             if ask_size > 0.0 and ask_price * ask_size < min_notional - 1e-12:
-                quote_ask_ok = False
-                reasons.append("below_min_notional:ask")
+                mq = _min_qty(ask_price)
+                if cap > 0.0 and mq > cap + 1e-9:
+                    quote_ask_ok = False
+                    reasons.append("below_min_notional:ask")
+                else:
+                    ask_size = max(ask_size, mq)
 
         return {
             "reservation_price": r,

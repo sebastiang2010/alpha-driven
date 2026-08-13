@@ -235,3 +235,15 @@ Cambios aplicados y validados (74/74 tests OK + smoke tests):
 **Conclusión**: el driver de pérdida es el **turnover de inventario / ejecución**, no el ancho del piso. Próximo fix (a decidir): mantener ambos lados cotizando (no rechazar el lado min_notional; en su lugar reducir el tamaño del lado corto para cumplir notional, p.ej. 5/5 siempre, o escalar size) para capturar el spread simétricamente; y/o subir a 16 ticks como parche. Requiere validación testnet primero.
 
 **Run detenido** (PID 46560 kill /F; lock removido; bots del VPS intactos). Pendiente decisión de diseño antes de relanzar mainnet.
+
+## 2026-08-12 22:25 — Fix opción 1 aplicado: ambos lados cotizan siempre.
+
+Decisión del usuario: **opción 1** (mantener ambos lados cotizando; no rechazar el lado min-notional).
+
+**Cambio en `strategy/market_maker.py`** (bloque min_notional, ~línea 278): antes RECHAZABA el lado cuyo notional < minNotional (lo volvía one-sided). Ahora **sube el tamaño al mínimo que cumple minNotional** (`ceil(min_notional/price/step)*step`, redondeado a quantity_precision) para mantener AMBOS lados vivos y cerrar two-sided en el spread. Solo rechaza si ni siquiera `max_order_size` alcanza el notional (precio tan bajo que 5 XRP < minNotional).
+
+**Hallazgo de config**: `max_order_size = BASE_ORDER_SIZE_XRP × multiplier = 5.0` XRP; el piso notional a ~$1.0 exige ≥5 XRP. El "4.9" del comentario viejo era un ejemplo obsoleto. Con ambos lados obligados a ≥5 XRP, el size-skew queda neutralizado y el control de inventario recae en el reservation-price skew / alpha (comportamiento MM simétrico, correcto).
+
+**Tests**: `strategy/tests/test_market_maker.py` actualizado (`test_lado_agravante_bajo_notional_se_sube_al_piso`); suite completa **76/76 OK**. `run_mainnet.py` importa `strategy.market_maker` → el fix aplica en vivo (no hace falta tocar `vps_upload/` para la corrida local; ver nota deploy abajo si se despliega en VPS).
+
+**Siguiente**: medición mainnet corta (run acotado) para confirmar que el RT se vuelve positivo al capturar spread two-sided. Nota: `vps_upload/strategy/config.py` y `alpha_model.py` siguen en 8 ticks y sin este fix — actualizar si el deploy corre desde `vps_upload/`.

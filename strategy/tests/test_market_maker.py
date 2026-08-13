@@ -152,14 +152,18 @@ class TestMinNotionalGuard(_MarketMakerTestCase):
             {"mid": mid, "inventory": inventory, "volatility": 0.0}
         )
 
-    def test_lado_agravante_bajo_notional_no_cotiza(self):
+    def test_lado_agravante_bajo_notional_se_sube_al_piso(self):
         """Corto −5.0 @ ~$1.2: el SELL agrava (skew 0.5x → 2.5 XRP →
-        $3.03 < $5) y NO debe cotizarse; el BUY reduce (≥ 5 XRP → $5.95 ≥ $5)
-        sí cotiza y sigue cerrando el corto."""
+        $3.03 < $5). Fix 2026-08-12: en vez de rechazar (one-sided), se sube
+        el tamaño al mínimo que cumple notional (ceil(5/1.21/0.1)*0.1 = 4.2
+        XRP → $5.08 ≥ $5) y AMBOS lados cotizan two-sided para capturar el
+        spread en vez de salir en precio adverso."""
         q = self._setup(mid=1.2, inventory=-5.0)
         self.assertTrue(q["quote_bid_ok"], q["reasons"])
-        self.assertFalse(q["quote_ask_ok"], q["reasons"])
-        self.assertIn("below_min_notional:ask", q["reasons"])
+        self.assertTrue(q["quote_ask_ok"], q["reasons"])
+        self.assertNotIn("below_min_notional:ask", q["reasons"])
+        # el ask se subió al piso notional en vez de descartarse
+        self.assertGreaterEqual(q["ask_size"] * q["ask_price"], 5.0 - 1e-9)
 
     def test_xrp_subio_y_el_lado_vuelve_a_cotizar(self):
         """Futuro: XRP sube a ~$2.2 → el mismo tamaño 2.5 XRP ya cumple
