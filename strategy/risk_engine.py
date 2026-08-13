@@ -249,12 +249,25 @@ class RiskEngine:
             projected_notional = current_position_notional + notional
             projected_inventory = inventory + qty
 
+        # Orden REDUCTORA: acerca el inventario a cero (vende si está long,
+        # compra si está short). Siempre debe permitirse para poder DESARMAR
+        # la posición; si no, el market maker se congela en máximo inventario
+        # (ver run3: 16 min congelado sin poder hacer SELL para reducir).
+        is_reducing = (side == "ask" and inventory > 0) or (
+            side == "bid" and inventory < 0
+        )
+
         # 1. Notional propuesto + posición actual > max position notional.
         if abs(projected_notional) > self.max_position_notional:
             reasons.append(REASON_POSITION_NOTIONAL)
 
         # 2. Inventario máximo (derivado en XRP desde el precio).
-        if price > 0 and abs(projected_inventory) * price > self.max_position_notional:
+        # Se salta si la orden REDUCE (debe poder desarmar).
+        if (
+            not is_reducing
+            and price > 0
+            and abs(projected_inventory) * price > self.max_position_notional
+        ):
             reasons.append(REASON_INVENTORY)
 
         # 3. Tamaño máximo de orden (nivel 0 => rechaza toda qty>0).
@@ -285,9 +298,13 @@ class RiskEngine:
             reasons.append(REASON_VOLATILITY)
 
         # 9. Exposición total proyectada (bruta, incluye ambos lados).
-        gross_exposure = abs(current_position_notional) + abs(notional)
-        if gross_exposure > self.max_exposure:
-            reasons.append(REASON_EXPOSURE)
+        # Se salta si la orden REDUCE (debe poder desarmar). En otro caso se
+        # usa el nocional PROYECTADO (no el actual) para no penalizar una orden
+        # que reduce la exposición al sumar su notional al actual.
+        if not is_reducing:
+            gross_exposure = abs(projected_notional) + abs(notional)
+            if gross_exposure > self.max_exposure:
+                reasons.append(REASON_EXPOSURE)
 
         allowed = len(reasons) == 0
         return allowed, reasons

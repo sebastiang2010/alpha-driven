@@ -116,16 +116,29 @@ class TestRiskEngine(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn(risk_engine.REASON_VOLATILITY, reasons)
 
-    def test_rejects_when_exposure_exceeded(self):
-        # Exposición bruta proyectada 24.5 + 2.0 = 26.5 > 25 => rechaza,
-        # aunque la posición neta proyectada (ask) baje a 22.5.
+    def test_rejects_when_exposure_exceeded_non_reducing(self):
+        # Orden que AGREGA exposición (BUY desde plano) con notional tal que la
+        # exposición bruta proyectada supera el máximo => rechaza (REASON_EXPOSURE).
+        # Caso no reductivo: la posición neta proyectada (=25) no excede el tope,
+        # pero gross = 25 + 25 = 50 > 25 sí.
+        eng = risk_engine.RiskEngine(max_order_size_override=10.0)
+        allowed, reasons = eng.check_order(
+            config.SYMBOL, "bid", 5.0, 5.0, 25.0, 0,
+            _snapshot(current_position_notional=0.0, inventory=0.0),
+        )
+        self.assertFalse(allowed)
+        self.assertIn(risk_engine.REASON_EXPOSURE, reasons)
+
+    def test_allows_reducing_order_to_unwind(self):
+        # Market maker congestionado long ~máximo inventario (49 XRP @ 0.5 = 24.5).
+        # Debe PODER hacer SELL para desarmar, aunque current+notional supere el
+        # tope bruto: la orden REDUCE la exposición (run3: bug de congelamiento).
         eng = risk_engine.RiskEngine(max_order_size_override=10.0)
         allowed, reasons = eng.check_order(
             config.SYMBOL, "ask", 4.0, 0.5, 2.0, 0,
             _snapshot(current_position_notional=24.5, inventory=49.0),
         )
-        self.assertFalse(allowed)
-        self.assertIn(risk_engine.REASON_EXPOSURE, reasons)
+        self.assertTrue(allowed, reasons)
 
     def test_allows_order_within_limits(self):
         allowed, reasons = self.engine.check_order(
