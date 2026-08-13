@@ -225,3 +225,13 @@ Cambios aplicados y validados (74/74 tests OK + smoke tests):
 **Pendiente (acción con fondos reales — requiere autorización §0.2)**: re-corrida mainnet corta (30–60 min) con `monitor_mainnet.py` para medir PnL real con 12 ticks. Criterio de éxito: NET > 0. Si tras el cambio sigue ≤ 0, subir a 16 (ver comentario en config.py).
 
 **Nota deploy**: `vps_upload/strategy/config.py` y `vps_upload/strategy/alpha_model.py` siguen en 8 ticks (espejo de deploy). Si el bot corre desde `vps_upload/`, debe actualizarse también antes de la medición.
+
+## 2026-08-12 22:10 — Medición con 12 ticks: NO alcanza. Causa raíz distinta.
+
+**Run mainnet (PID 46560, --cycles 600) pausado tras ~25 min**: 6 fills reales, 2 RTs limpios (ventana run UTC 00:46+), ambos **negativos** (pnl −0.001 / −0.003, holds 258s/798s). Muestra más amplia del run: 8 RTs, net −0.0255, win 37.5%, avgLoss −0.007 ≫ avgWin +0.003.
+
+**Hallazgo crítico — el piso NO era la palanca correcta**: el precio promedio de un round-trip histórico era ~0.00409 (≈40 ticks) mientras el spread cotizado es 0.0008–0.0012 (8–12 ticks). El bot **NO captura el spread**: compra a 1.00390 y vende a 1.00370 (precio cae tras llevar inventario). La guarda `below_min_notional` del skew hace que un lado se rechace (solo el bid se coloca cuando está short −5), así que el bot no cierra two-sided y lleva exposición direccional ~14 ticks en contra por RT. Ensanchar el piso 8→12 suma +4 ticks pero el adverse selection es ~14 ticks/RT → sigue perdiendo.
+
+**Conclusión**: el driver de pérdida es el **turnover de inventario / ejecución**, no el ancho del piso. Próximo fix (a decidir): mantener ambos lados cotizando (no rechazar el lado min_notional; en su lugar reducir el tamaño del lado corto para cumplir notional, p.ej. 5/5 siempre, o escalar size) para capturar el spread simétricamente; y/o subir a 16 ticks como parche. Requiere validación testnet primero.
+
+**Run detenido** (PID 46560 kill /F; lock removido; bots del VPS intactos). Pendiente decisión de diseño antes de relanzar mainnet.
