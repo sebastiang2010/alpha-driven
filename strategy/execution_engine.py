@@ -584,6 +584,101 @@ class ExecutionEngine:
             }
         return result
 
+    def _order_status_rest(self, client_order_id):
+        """Estado de la orden vía REST (futures_get_order). None si no se pudo leer."""
+        if api is None:
+            return None
+        result = api.get_order_status(self.symbol, orig_client_id=client_order_id)
+        if isinstance(result, dict):
+            return result.get("status")
+        return None
+
+    def flatten_position(self, maker_timeout: float = 12.0):
+        """Aplana la posición al detener (flatten-on-stop, §0.1/§21, clave en stop()).
+
+        Prioriza ORDEN MAKER (post-only GTX reduceOnly) por la promo 0-fee de
+        XRPUSDC: coloca un límite 1 tick DENTRO del spread (best_bid+tick para
+        SELL, best_ask-tick para BUY) y re-coloca cada ~1s hasta que la API
+        confirma FILLED vía REST (el WS ya está cerrado en stop()). NUNCA usa
+        taker: si no llena en `maker_timeout` se DEJA la última orden maker
+        resting (0-fee) y se retorna su id; la posición puede quedar abierta
+        hasta que llene o se haga flatten manual (no pagar fee respeta la
+        promo §0 — corrección 2026-08-21).
+
+        Solo en modo real (Nivel >=1). Devuelve el client_order_id del maker
+        (o 1), 0 si no había posición, None si no pudo cerrarse.
+        """
+        if self.dry_run or api is None or not getattr(api, "client", None):
+            return 0
+
+        pos = None
+        for _ in range(3):
+            pos = self.reconcile_position()
+            if pos is not None:
+                break
+            time.sleep(1.0)
+        if pos is None:
+            logger.error("ExecutionEngine: flatten_position: no se pudo leer la "
+                         "posición tras reintentos (endpoint flaky). POSICIÓN PUEDE "
+                         "QUEDAR ABIERTA — requiere flatten manual.")
+            return None
+
+        amt = float(pos.get("positionAmt") or 0.0)
+        if abs(amt) < 1e-9:
+            return 0
+
+        side = "SELL" if amt > 0 else "BUY"
+        info = self.symbol_info or {}
+        step = info.get("step_size")
+        qty = abs(amt)
+        if step:
+            qty = _round_to_step(qty, step, ROUND_DOWN)
+        if qty <= 0:
+            logger.warning("ExecutionEngine: flatten_position: qty %.8g inválida "
+                           "tras redondeo; posición %.8g NO cerrada.", qty, amt)
+            return None
+
+        tick = info.get("tick_size") or 1e-9
+
+        # ── Intento MAKER (post-only GTX, 0 fee) ─────────────────────────────
+        deadline = time.time() + maker_timeout
+        oid = None
+        last_target = None
+        while time.time() < deadline:
+            book = api.get_order_book_top(self.symbol) if api else None
+            bb = book.get("best_bid") if isinstance(book, dict) else None
+            ba = book.get("best_ask") if isinstance(book, dict) else None
+            if bb is not None and ba is not None:
+                target = (bb + tick) if side == "SELL" else (ba - tick)
+                target = _round_to_step(target, tick, ROUND_HALF_UP)
+                if oid is None or target != last_target:
+                    if oid is not None:
+                        self.cancel_order_by_id(oid)
+                    r_oid, ok, _reason = self.place_maker_order(
+                        side, qty, target, reduce_only=True)
+                    if ok:
+                        oid = r_oid
+                        last_target = target
+            status = self._order_status_rest(oid) if oid else None
+            if status == "FILLED":
+                logger.warning("ExecutionEngine: FLATTEN MAKER llenó (posición "
+                               "cerrada, orderId=%s, reduceOnly GTX 0-fee).", oid)
+                return oid
+            time.sleep(1.0)
+
+        # ── Solo MAKER: nunca taker (promo 0-fee, §0) ──────────────────────────
+        if oid is None:
+            logger.error("ExecutionEngine: FLATTEN MAKER: no se colocó ninguna "
+                         "orden (book vacío). POSICIÓN PUEDE QUEDAR ABIERTA.")
+            return None
+        # Dejar la última orden maker resting (0-fee). No cancelar: debe poder
+        # llenar cuando el libro vuelva. Si no llena, requiere flatten manual.
+        logger.warning("ExecutionEngine: FLATTEN MAKER no llenó en %.1fs; se "
+                       "DEJA orden maker resting (orderId=%s, reduceOnly GTX "
+                       "0-fee). Posición puede quedar abierta hasta que llene o "
+                       "flatten manual.", maker_timeout, oid)
+        return oid
+
     # ── Leverage ─────────────────────────────────────────────────────────
     def set_leverage(self, leverage: int):
         """Aplica leverage al símbolo vía api.mod_leverage (con try/except)."""
