@@ -597,13 +597,15 @@ class ExecutionEngine:
         """Aplana la posición al detener (flatten-on-stop, §0.1/§21, clave en stop()).
 
         Prioriza ORDEN MAKER (post-only GTX reduceOnly) por la promo 0-fee de
-        XRPUSDC: coloca un límite 1 tick DENTRO del spread (best_bid+tick para
-        SELL, best_ask-tick para BUY) y re-coloca cada ~1s hasta que la API
-        confirma FILLED vía REST (el WS ya está cerrado en stop()). NUNCA usa
-        taker: si no llena en `maker_timeout` se DEJA la última orden maker
-        resting (0-fee) y se retorna su id; la posición puede quedar abierta
-        hasta que llene o se haga flatten manual (no pagar fee respeta la
-        promo §0 — corrección 2026-08-21).
+        XRPUSDC: coloca un límite EXACTAMENTE en el touch (best_bid para SELL,
+        best_ask para BUY) y re-coloca cada ~1s hasta que la API confirma
+        FILLED vía REST (el WS ya está cerrado en stop()). NUNCA usa taker: si
+        no llena en `maker_timeout` se DEJA la última orden maker resting
+        (0-fee) y se retorna su id; la posición puede quedar abierta hasta que
+        llene o se haga flatten manual (manual respeta la promo §0 —
+        corrección 2026-08-21). El precio al touch (no bb+tick/ba-tick) EVITA
+        que el maker-check §10 rechace la orden como "cruzaría el spread"
+        durante caídas rápidas del precio.
 
         Solo en modo real (Nivel >=1). Devuelve el client_order_id del maker
         (o 1), 0 si no había posición, None si no pudo cerrarse.
@@ -649,7 +651,7 @@ class ExecutionEngine:
             bb = book.get("best_bid") if isinstance(book, dict) else None
             ba = book.get("best_ask") if isinstance(book, dict) else None
             if bb is not None and ba is not None:
-                target = (bb + tick) if side == "SELL" else (ba - tick)
+                target = bb if side == "SELL" else ba
                 target = _round_to_step(target, tick, ROUND_HALF_UP)
                 if oid is None or target != last_target:
                     if oid is not None:
