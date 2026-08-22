@@ -125,12 +125,22 @@ class MarketMaker:
         # Kill switch (§13): una vez disparado, se bloquean nuevas entradas
         # (disable_new_entries) además de cancelar/reducir lo existente.
         self.disable_new_entries: bool = False
-
-        # Contexto de ciclo para el risk engine / re-cotización.
         self._last_snapshot: dict | None = None
         self._last_mid: float | None = None
 
-        # Adverse selection (§14): fills registrados y historial de precios.
+    @staticmethod
+    def apply_inventory_penalty(inventory: float) -> float:
+        """Calcula el skew de precio basado en el inventario (Avellaneda‑Stoikov)."""
+        skew = inventory * config.INVENTORY_GAMMA
+        max_skew = config.MAX_SKU_SKEW
+        # Limita el skew a ±max_skew
+        if skew > max_skew:
+            skew = max_skew
+        elif skew < -max_skew:
+            skew = -max_skew
+        return skew
+
+
         self._adverse_fills: deque = deque(maxlen=_ADVERSE_MAXLEN)
         self._price_history: deque = deque(maxlen=_PRICE_HISTORY_MAXLEN)
 
@@ -268,8 +278,9 @@ class MarketMaker:
             else:  # short: el bid reduce
                 bid_size = min(bid_size, reduce_cap)
 
-        bid_price = r - bid_dist
-        ask_price = r + ask_dist
+        skew = self.apply_inventory_penalty(inventory)
+        bid_price = r - bid_dist + skew
+        ask_price = r + ask_dist - skew
 
         # Filtro asimétrico de Adverse Selection (Familia C)
         buy_vol = float(snapshot.get("buy_volume_60s", 0.0) or 0.0)

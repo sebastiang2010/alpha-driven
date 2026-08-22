@@ -28,7 +28,10 @@ SYMBOL: str = "XRPUSDC"
 # MAINNET autorizada por humano §0.2 (2026-08-10). No llamar
 # init_client(real=True) ni set_testnet(False) en ningun modulo sin esa
 # autorizacion explicita (§0.1).
-REAL: bool = True
+# DEFAULT = False (TESTNET): por §0.1 el entorno seguro por defecto es
+# testnet/dry-run. Para operar en mainnet hay que optar explícitamente
+# (REAL=True Y EXPOSURE_LEVEL>=1, ambos requieren autorización humana §0.2).
+REAL: bool = False
 
 # ---------------------------------------------------------------------------
 # Presupuesto de riesgo (§0.4) — PROPUESTA pendiente de confirmacion
@@ -38,7 +41,7 @@ REAL: bool = True
 MAX_DAILY_LOSS_USDC: float = 10.0
 
 # Tamaño de posición nocional máximo permitido, en USDC.
-MAX_POSITION_NOTIONAL_USDC: float = 25.0
+MAX_POSITION_NOTIONAL_USDC: float = 15.0
 
 # Drawdown máximo permitido desde el pico de equity (5%).
 MAX_DRAWDOWN_PCT: float = 0.05
@@ -68,8 +71,16 @@ BUDGETS_CONFIRMED: bool = True
 # El bot ya fue rentable en régimen range-bound (día 11: +0.0045 USDC / 66
 # trades), así que este umbral NO corta el funcionamiento normal: solo frena
 # cuando effectivemente está perdiendo.
-# PROPUESTA pendiente de confirmación (§0.4): umbral ajustado a 2 céntimos.
-LOSS_GUARD_USDC: float = 0.02
+# CORREGIDO (autorizado por humano 2026-08-21): el valor anterior de 0.02 USDC
+# (2 céntimos) disparaba el kill switch con el ruido maker normal. Ahora 1.0
+# USDC = 10% de MAX_DAILY_LOSS_USDC: tolera el ruido de maker en régimen
+# range-bound pero frena una racha adveersa real antes de -MAX_DAILY_LOSS_USDC.
+LOSS_GUARD_USDC: float = 1.0
+
+# Equity de referencia inicial (USDC) para drawdown/PnL. PROPUESTA pendiente
+# de confirmación (§0.4): el Market Maker la lee de acá en vez de hardcodear
+# 1000.0. Default 1000.0 preserva el comportamiento previo.
+STARTING_EQUITY_USDC: float = 1000.0
 
 # ---------------------------------------------------------------------------
 # Niveles de exposición (§21)
@@ -77,8 +88,9 @@ LOSS_GUARD_USDC: float = 0.02
 
 # Nivel actual de exposición. Nivel 0 = dry-run (no enviar órdenes reales).
 # Subir de nivel requiere autorización humana (§0.2).
-# Autorizado por humano §0.2 (2026-08-09): Nivel 1 mainnet mínimo.
-EXPOSURE_LEVEL: int = 1
+# DEFAULT = 0 (dry-run): entorno seguro por defecto (§0.1/§21). El bot
+# simula órdenes vía SIMULATION_QUOTE_MULTIPLIER sin enviar nada real.
+EXPOSURE_LEVEL: int = 0
 
 # Multiplicador de tamaño por nivel. La exposición efectiva se calcula
 # multiplicando el tamaño base por este multiplicador.
@@ -107,8 +119,14 @@ def effective_exposure_multiplier() -> float:
     return float(EXPOSURE_MULTIPLIERS.get(level, 0.0))
 
 # ---------------------------------------------------------------------------
-# Tamaños de orden (§3)
+# Tamaño de orden (§3)
 # ---------------------------------------------------------------------------
+
+# Parámetros nuevos para control de inventario y filtro anti‑adverse
+INVENTORY_GAMMA: float = 0.0015  # factor de skew por unidad de inventario (Avellaneda‑Stoikov)
+MAX_SKU_SKEW: float = 0.02       # límite máximo de desplazamiento de precio (±2 %)
+ADVERSE_FILTER_THRESHOLD: float = 0.6  # umbral de desequilibrio de flujo para desactivar el lado con alta adverse selection
+
 
 # Cantidad mínima para XRPUSDC futures. El execution_engine la valida contra
 # los filtros reales del símbolo consultados dinámicamente (§3).
@@ -155,6 +173,12 @@ STATE_SYNC_INTERVAL_SEC: int = 30
 # Máximo de reintentos de conexión antes de activar el kill switch (§13).
 WS_MAX_RECONNECT_ATTEMPTS: int = 5
 
+# Gracia de desconexión de WebSocket (§13): el kill switch por WS caído NO se
+# dispara hasta que el WS haya estado DESCONECTADO de forma continua por al
+# menos este tiempo (segundos). Evita falsos positivos por reconexiones breves
+# del WS (backoff de 5 s). PROPUESTA pendiente de confirmación (§0.4).
+WS_KILL_GRACE_SEC: float = 120.0
+
 # ---------------------------------------------------------------------------
 # Volatilidad y re-cotización
 # ---------------------------------------------------------------------------
@@ -194,7 +218,7 @@ TICK_SIZE_XRPUSDC: float = 0.0001
 # Subir a 12 ticks (+4 ticks = +0.002 USDC/RT) vuelca la media a ~+0.0018/RT
 # (claramente positivo). Piso efectivo en momentum = 12 * 2 = 24 ticks.
 # Criterio de revisión: si tras el cambio el NET sigue <= 0, subir a 16.
-MIN_SPREAD_TICKS: int = 12
+MIN_SPREAD_TICKS: int = 20
 
 # ---------------------------------------------------------------------------
 # Filtro de momentum anti-adverse-selection (§14) — PROPUESTA pendiente de
@@ -206,7 +230,7 @@ MIN_SPREAD_TICKS: int = 12
 # (RTs -0.0118 y -0.0128 USDC). En mercado tranquilo el piso da
 # +0.0004..+0.0014 neto. Este filtro detecta movimiento direccional del mid
 # y ENSANCHA EL PISO (no solo el spread calculado): si hay momentum, el piso
-# efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER (12 -> 24
+# efectivo pasa a MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER (20 -> 40
 # ticks). Es SIMETRICO (no direccional): no asume hacia dónde va el precio,
 # solo que un movimiento >= MOMENTUM_MAX_TICKS en la ventana hace más
 # probable que un fill inmediato sea adverso. El cooldown evita alternar
@@ -226,7 +250,7 @@ MOMENTUM_WINDOW_SECONDS: float = 30.0
 MOMENTUM_MAX_TICKS: float = 8.0
 
 # Multiplicador del piso cuando hay momentum: piso efectivo =
-# MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER = 24 ticks (12 * 2, cubriendo
+# MIN_SPREAD_TICKS * MOMENTUM_SPREAD_MULTIPLIER = 40 ticks (20 * 2, cubriendo
 # el gap típico observado de 19 ticks entre entrada y salida en el RT
 # adverso del 2026-08-10).
 MOMENTUM_SPREAD_MULTIPLIER: float = 2.0

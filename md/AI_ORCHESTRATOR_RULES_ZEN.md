@@ -5,7 +5,7 @@
 Este proyecto utiliza una arquitectura de trabajo con dos modelos de IA:
 
 - **Agente principal / implementador:** `opencode/hy3-free`
-- **Agente revisor / auditor:** `opencode/code-reviewer`
+- **Agente revisor / auditor:** `code-reviewer`
 
 La finalidad es que las tareas complejas no dependan de una única respuesta de un modelo.
 
@@ -22,7 +22,7 @@ Implementa
    ↓
 Ejecuta verificaciones
    ↓
-opencode/code-reviewer
+code-reviewer
    ↓
 Revisa
    ↓
@@ -40,14 +40,14 @@ Continuar      Devolver hallazgos
                   ↓
               Verificar
                   ↓
-            opencode/code-reviewer revisar
+            code-reviewer revisar
                   ↓
                 repetir
 ```
 
 La regla central es:
 
-> **HY3 implementa. opencode/code-reviewer revisa. Si hay problemas, HY3 corrige y opencode/code-reviewer vuelve a revisar.**
+> **HY3 implementa. code-reviewer revisa. Si hay problemas, HY3 corrige y code-reviewer vuelve a revisar.**
 
 El objetivo no es terminar rápidamente. El objetivo es terminar **correctamente y con evidencia de verificación**.
 
@@ -81,7 +81,7 @@ HY3 es el único agente responsable de la implementación normal.
 ## 2.2. Modelo reviewer
 
 ```text
-opencode/code-reviewer
+code-reviewer
 ```
 
 Responsabilidades:
@@ -96,7 +96,7 @@ Responsabilidades:
 - detectar soluciones que oculten síntomas en lugar de corregir causas;
 - determinar si el trabajo está listo para continuar o finalizar.
 
-opencode/code-reviewer debe actuar como **revisor independiente**, no como segundo implementador por defecto.
+code-reviewer debe actuar como **revisor independiente**, no como segundo implementador por defecto.
 
 ---
 
@@ -125,7 +125,7 @@ HY3 corrige
  ↓
 verifica nuevamente
  ↓
-opencode/code-reviewer vuelve a revisar
+code-reviewer vuelve a revisar
 ```
 
 Este ciclo debe continuar mientras existan problemas reales, tests fallidos, requisitos incompletos o evidencia insuficiente.
@@ -197,7 +197,7 @@ Una orden explícita del usuario tiene prioridad.
 
 # 6. Reviewer obligatorio
 
-Para toda tarea de ingeniería relevante, opencode/code-reviewer debe revisar el resultado de HY3.
+Para toda tarea de ingeniería relevante, code-reviewer debe revisar el resultado de HY3.
 
 Esto incluye:
 
@@ -280,7 +280,7 @@ Si una prueba falla, la tarea **no está terminada**.
 
 ## Fase E — Revisión independiente
 
-opencode/code-reviewer recibe el resultado actual y debe revisarlo.
+code-reviewer recibe el resultado actual y debe revisarlo.
 
 Debe considerar:
 
@@ -298,7 +298,7 @@ No debe asumir que las conclusiones de HY3 son correctas.
 
 ## Fase F — Corrección
 
-Si opencode/code-reviewer devuelve `FAIL`:
+Si code-reviewer devuelve `FAIL`:
 
 1. HY3 debe leer todos los hallazgos;
 2. determinar cuáles son válidos;
@@ -312,7 +312,7 @@ No finalizar después de responder simplemente al comentario del reviewer.
 
 # 8. Formato obligatorio del reviewer
 
-opencode/code-reviewer debe producir una revisión estructurada.
+code-reviewer debe producir una revisión estructurada.
 
 Formato:
 
@@ -581,7 +581,7 @@ Cada iteración debe aportar:
 
 # 17. Reviewer como adversario constructivo
 
-opencode/code-reviewer debe asumir el rol de un revisor técnico escéptico.
+code-reviewer debe asumir el rol de un revisor técnico escéptico.
 
 Debe preguntar internamente:
 
@@ -817,13 +817,13 @@ HY3 puede utilizar las herramientas disponibles para:
 - ejecutar MATLAB cuando esté disponible;
 - generar scripts de diagnóstico.
 
-opencode/code-reviewer puede utilizar herramientas de lectura/verificación cuando el entorno lo permita.
+code-reviewer puede utilizar herramientas de lectura/verificación cuando el entorno lo permita.
 
 El acceso a herramientas no debe interpretarse como permiso para ejecutar operaciones destructivas.
 
 ---
 
-# 27. Handoff entre HY3 y opencode/code-reviewer
+# 27. Handoff entre HY3 y code-reviewer
 
 Antes de enviar una tarea al reviewer, HY3 debe proporcionar suficiente contexto para una revisión independiente.
 
@@ -862,9 +862,9 @@ sin contexto.
 
 ---
 
-# 28. Handoff de opencode/code-reviewer hacia HY3
+# 28. Handoff de code-reviewer hacia HY3
 
-Cuando opencode/code-reviewer devuelve `FAIL`, los hallazgos deben ser accionables.
+Cuando code-reviewer devuelve `FAIL`, los hallazgos deben ser accionables.
 
 Ejemplo:
 
@@ -895,7 +895,7 @@ HY3 debe traducir estos hallazgos en acciones concretas.
 
 # 29. Regla de aprobación
 
-opencode/code-reviewer solamente puede devolver:
+code-reviewer solamente puede devolver:
 
 ```text
 REVIEW_STATUS: PASS
@@ -1002,7 +1002,7 @@ stack trace apunta a una función interna de App Designer
 → investigar la nueva evidencia
 ```
 
-No defender una hipótesis simplemente porque fue propuesta inicialmente por HY3 o opencode/code-reviewer.
+No defender una hipótesis simplemente porque fue propuesta inicialmente por HY3 o code-reviewer.
 
 ---
 
@@ -1051,7 +1051,7 @@ La configuración conceptual debe ser:
                             │
                             ▼
                   ┌────────────────────┐
-                  │ opencode/code-reviewer /     │
+                  │ code-reviewer /     │
                   │ ZEN REVIEWER    │
                   └─────────┬──────────┘
                             │
@@ -1113,7 +1113,7 @@ HY3:
   ↓
   corregir
 
-opencode/code-reviewer:
+code-reviewer:
   revisar
   ↓
   detectar problemas
@@ -1127,7 +1127,7 @@ si FAIL:
   ↓
   verificar
   ↓
-  volver a opencode/code-reviewer
+  volver a code-reviewer
 
 si PASS:
   finalizar
@@ -1149,9 +1149,9 @@ en cada iteración.
 
 > **No finalizar solamente porque el código parece correcto.**
 
-> **HY3 debe implementar y verificar. opencode/code-reviewer debe revisar de forma independiente.**
+> **HY3 debe implementar y verificar. code-reviewer debe revisar de forma independiente.**
 
-> **Cuando opencode/code-reviewer encuentre un problema, HY3 debe corregirlo y repetir el ciclo.**
+> **Cuando code-reviewer encuentre un problema, HY3 debe corregirlo y repetir el ciclo.**
 
 > **El ciclo continúa automáticamente mientras exista una acción técnica razonable que permita avanzar hacia una solución verificable.**
 
@@ -1175,12 +1175,12 @@ VELOCIDAD
 El reviewer principal del proyecto es:
 
 ```text
-opencode/code-reviewer
+code-reviewer
 ```
 
 El reviewer debe ejecutarse mediante **OpenCode Zen**.
 
-El reviewer principal es `opencode/code-reviewer`, el mejor reviewer disponible dentro de **OpenCode Zen** (reemplaza a `opencode/deepseek-v4-flash`, que ya no está disponible). No se depende de endpoints externos gratuitos: el circuito crítico de revisión usa una ruta definida como principal dentro de Zen. No se utiliza ningún fallback externo para completar el ciclo normal.
+El reviewer principal es el subagente `code-reviewer`, que usa el modelo `opencode/nemotron-3-ultra-free` (el modelo más capaz disponible en **OpenCode Zen**). Reemplaza a `opencode/deepseek-v4-flash`, que ya no existe en el proveedor Zen. No se depende de endpoints externos: el circuito crítico de revisión usa una ruta definida como principal dentro de Zen. No se utiliza ningún fallback externo para completar el ciclo normal.
 
 ## 40. Configuración conceptual
 
@@ -1193,15 +1193,15 @@ El reviewer principal es `opencode/code-reviewer`, el mejor reviewer disponible 
     },
     "reviewer": {
       "mode": "subagent",
-      "model": "opencode/code-reviewer"
+      "model": "opencode/nemotron-3-ultra-free"
     }
   }
 }
 ```
 
-Este bloque es conceptual. No reemplazar el `opencode.json` existente: conservar su configuración y añadir solamente lo necesario.
+Este bloque está **implementado** en `opencode.json` (raíz del proyecto): define `agent.build` (HY3, `opencode/hy3-free`, primario) y `agent.code-reviewer` (subagente, `code-reviewer`, modo `subagent`, solo lectura). El reviewer se invoca como subagente `code-reviewer`. No reemplazar `opencode.json` sin conservar estas entradas.
 
-OpenCode permite definir subagentes con un modelo específico, y un subagente puede quedar oculto para que se utilice internamente. Esto permite mantener a HY3 como agente principal y a opencode/code-reviewer como reviewer especializado. citeturn915683search0turn915683search4
+OpenCode permite definir subagentes con un modelo específico, y un subagente puede quedar oculto para que se utilice internamente. Esto permite mantener a HY3 como agente principal y a code-reviewer como reviewer especializado. citeturn915683search0turn915683search4
 
 ## 41. Automatización real
 
@@ -1214,7 +1214,7 @@ implementación
  ↓
 verificación
  ↓
-opencode/code-reviewer
+code-reviewer
  ↓
 PASS / FAIL
  ↓
@@ -1222,26 +1222,27 @@ FAIL → HY3 corrige
  ↓
 verificación
  ↓
-opencode/code-reviewer vuelve a revisar
+code-reviewer vuelve a revisar
 ```
 
 OpenCode soporta subagentes mediante la herramienta de tareas y también dispone de plugins/hooks que pueden interceptar operaciones de sesión, requests y ejecución de herramientas. Por ello, el proyecto puede implementar el ciclo obligatorio mediante configuración de agentes o, si se necesita imponerlo independientemente de la decisión del modelo, mediante un orquestador/plugin. citeturn915683search0turn915683search1
 
 ## 42. Fallback
 
-`opencode/deepseek-v4-flash` fue eliminado permanentemente del proyecto; `opencode/code-reviewer` es ahora el reviewer principal (proveedor Zen).
+`opencode/deepseek-v4-flash` fue eliminado permanentemente del proyecto; el subagente `code-reviewer` (modelo `opencode/nemotron-3-ultra-free`, Zen) es ahora el reviewer principal. Los modelos de Zen rotan y desaparecen: ver **§45** para el orden de preferencia y el procedimiento ante caídas.
 
-Si `opencode/code-reviewer` no está disponible temporalmente:
+Si el modelo del reviewer no está disponible temporalmente:
 
 1. no marcar la tarea como `PASS` sin revisión;
 2. conservar el trabajo actual;
-3. registrar que el reviewer principal no estuvo disponible;
-4. indicar qué reviewer se utilizó realmente.
+3. correr `select_reviewer.py` para migrar al siguiente modelo Zen disponible del orden de §45;
+4. si ninguno del fallback está disponible, bloquear y escalar al usuario;
+5. indicar qué modelo se utilizó realmente en `OPEN_QUESTIONS`.
 
 Formato:
 
 ```text
-PRIMARY_REVIEWER: opencode/code-reviewer
+PRIMARY_REVIEWER: code-reviewer
 STATUS: <disponible | unavailable>
 FALLBACK_REVIEWER: <modelo usado>
 ```
@@ -1250,6 +1251,88 @@ Nunca cambiar silenciosamente el reviewer principal.
 
 ## 43. Independencia del reviewer
 
-opencode/code-reviewer debe revisar de forma crítica el resultado de HY3 aunque ambos funcionen mediante Zen.
+code-reviewer debe revisar de forma crítica el resultado de HY3 aunque ambos funcionen mediante Zen.
 
 No asumir que una implementación es correcta porque HY3 la considera terminada. Validar requisitos, cambios, tests, regresiones y evidencia.
+
+---
+
+## 44. Consulta al reviewer (preguntas de HY3)
+
+El flujo no es solo unidireccional. Cuando HY3 tenga dudas, debe poder consultar al otro modelo y este debe contestarlas.
+
+HY3 puede invocar a `code-reviewer` en **modo consulta** (no solo en modo revisión) para:
+
+- resolver ambigüedades de requisitos;
+- validar un enfoque antes de implementarlo;
+- interpretar errores, logs o comportamiento del mercado;
+- cuestionar una decisión de diseño;
+- pedir una segunda opinión sobre una hipótesis;
+- aclarar restricciones del proyecto (AGENTS.md, especificación).
+
+Reglas de la consulta:
+
+1. HY3 plantea la pregunta con el contexto mínimo necesario (objetivo, archivos, evidencia, qué se duda).
+2. `code-reviewer` responde de forma directa, separando confirmado de hipótesis.
+3. No se marca la tarea como terminada solo por la respuesta; la respuesta alimenta la decisión de HY3.
+4. Si la duda es de seguridad, riesgo o autorización humana (§0 de AGENTS.md), el reviewer lo señala y HY3 lo escala al usuario; no se autoriaiza nada irreversible.
+
+El reviewer sigue siendo independiente: puede coincidir o disentir con HY3. Su función en consulta es aportar juicio crítico, no validar automáticamente.
+
+Invocación estructurada (sobre `REVIEW_REQUEST`)
+
+Para que el reviewer "vea" qué analizar y desde qué punto de vista, HY3 lo invoca siempre con este sobre. El reviewer lee `TARGET` (qué código) y `LENS` (punto de vista) y responde en consecuencia; no adivina el objetivo.
+
+```text
+REVIEW_REQUEST:
+  MODE: review | consulta | analisis
+  TARGET: <archivo / función / código concreto a analizar>
+  LENS: trading | seguridad | rendimiento | general
+  CONTEXT: <estado, cambios hechos, evidencia, restricciones>
+  QUESTION: <qué necesita HY3>
+```
+
+- `MODE=review`: cambio implementado y verificado → formato `REVIEW_STATUS` (§2.2).
+- `MODE=consulta`: HY3 tiene una duda → el reviewer la responde.
+- `MODE=analisis`: el reviewer analiza `TARGET` desde la `LENS` indicada. `TARGET` es obligatorio.
+
+Regla de ciclo: **una vez completada una implementación, HY3 debe invocar al reviewer con `MODE=analisis` (o `review`) y `LENS=trading`** antes de marcar la tarea como terminada. Ejemplo real para este proyecto:
+
+```text
+REVIEW_REQUEST:
+  MODE: analisis
+  TARGET: strategy/risk_engine.py
+  LENS: trading
+  CONTEXT: se agregó el chequeo de MAX_POSITION_NOTIONAL_USDC; pasan los tests unitarios
+  QUESTION: ¿el cálculo de tamaño e inventario es correcto para market making en XRPUSDC y no rompe el piso de spread ni la promo de 0 fees?
+```
+
+Cuando `LENS=trading` el reviewer analiza desde el punto de vista del trading (market making sobre XRPUSDC): corrección de la estrategia y del flujo maker (GTX/post-only), límites de riesgo de `config.py`, spread mínimo e inventario, priorización de órdenes MAKER y promo de 0 fees (§0), latencia de fills y reconciliación de posición (§13), kill switch, manejo de `BinanceAPIException` como retorno, y el impacto en `NetPnL = GrossPnL − fees − funding − slippage` (§18). Debe señalar riesgos de pérdida y desvíos de la especificación.
+
+El mismo subagente `code-reviewer` (Zen) atiende revisión, consulta y análisis por lente.
+
+---
+
+## 45. Cambio y desaparición de modelos en Zen
+
+Los modelos de OpenCode Zen rotan y desaparecen con frecuencia. El modelo asignado como reviewer puede dejar de existir sin aviso. Esto debe estar contemplado, no ser un error manual.
+
+Orden de preferencia (fallback) entre los modelos reales de Zen, de mayor a menor calidad de revisión:
+
+1. `opencode/nemotron-3-ultra-free`
+2. `opencode/nemotron-3.5-lightning-free`
+3. `opencode/big-pickle`
+4. `opencode/mimo-v2.5-free`
+5. `opencode/x-preview-f-free`
+6. `opencode/muse-spark-1.2-contributor-free`
+
+`opencode/hy3-free` se excluye a propósito: es el implementador (HY3) y usarlo como reviewer rompe la independencia (§43).
+
+Reglas:
+
+1. Antes de revisar o consultar, verificar qué modelos de Zen están disponibles (`opencode models`).
+2. Si el modelo primario no está, usar el siguiente disponible del orden anterior. No inventar ids ni usar un modelo externo sin decirlo.
+3. Si ninguno del fallback está disponible: NO marcar la tarea como terminada. Bloquear y escalar al usuario (reviewer no disponible).
+4. `select_reviewer.py` aplica este orden automáticamente: elige el mejor Zen disponible y actualiza SOLO `agent.code-reviewer.model` en `opencode.json`. Correrlo cuando se sospeche un cambio de modelo o tras un error de "modelo no encontrado".
+5. Si la desaparición es permanente, el nuevo modelo queda fijado en `opencode.json` tras correr el script; no hace falta editar a mano.
+6. El doc (esta sección) es la fuente de verdad del orden de preferencia; `select_reviewer.py` y `opencode.json` deben coincidir con él.
