@@ -49,7 +49,14 @@ WS_STALE_SEC: float = 60.0
 # vuelve en WS_KILL_GRACE_SEC se ejecuta el kill switch real (cancel_all +
 # reduce/close + bloqueo + GATE FAIL, §13 intacto). Antes: 1er ciclo con stale
 # mataba la corrida → corridas de 3.5 h perdidas por cortes de 1-2 min.
-WS_KILL_GRACE_SEC: float = 120.0
+# Fuente única en config.WS_KILL_GRACE_SEC (§0.4).
+WS_KILL_GRACE_SEC: float = float(getattr(config, "WS_KILL_GRACE_SEC", 120.0))
+
+# Tolerancia de divergencia en la reconciliación de posición (§0.6). Si la
+# posición del exchange difiere de la local en menos de esto, se considera
+# ruido de redondeo y se actualiza; si difiere más, NO se sobrescribe en silencio
+# (se mantiene el inventario local y se loguea para diagnóstico, §11/§18).
+RECONCILE_DIVERGENCE_EPS: float = 1e-6
 
 # Horizonte de la medida de adverse selection (§14).
 ADVERSE_SELECTION_HORIZON_SEC: float = 5.0
@@ -103,10 +110,11 @@ class MarketMaker:
         # Timestamps de colocación por orden (medición de lifetime, §10).
         self.quote_age: dict = {}
 
-        # Equity de referencia (propuesta) y PnL diario.
-        self.equity_start: float = 1000.0
-        self.equity_peak: float = 1000.0
-        self.equity_current: float = 1000.0
+        # Equity de referencia (propuesta, §0.4) y PnL diario. Fuente única en
+        # config.STARTING_EQUITY_USDC (NO hardcodeado, §0.4).
+        self.equity_start: float = float(getattr(config, "STARTING_EQUITY_USDC", 1000.0))
+        self.equity_peak: float = self.equity_start
+        self.equity_current: float = self.equity_start
         self.daily_pnl: float = 0.0
 
         # Estado de conexión WS (se actualiza en el run loop, §13).
@@ -146,6 +154,14 @@ class MarketMaker:
     # ── 2. Detección de fills (§14) ──────────────────────────────────────
     def _on_fill_detection(self, snapshot) -> None:
         """Detecta fills en dry-run: orden cuyo precio coincide con el mid.
+
+        AVISO (§19): esta es una simulación OPTIMISTA de dry-run. Cuenta como
+        fill cualquier toque del mid al precio límite de la orden; en la vida
+        real el llenado depende del flujo agresor y del resto del libro. Por
+        eso el PnL y la tasa de fill del dry-run NO son indicadores de
+        rentabilidad real y NO deben usarse para validar el edge (§19: una
+        operación ganadora en dry-run NO es evidencia). El inventario/PnL que
+        se actualiza acá sirve solo para ejercitar el flujo del bot.
 
         - bid se considera llenada si mid <= order_price (dentro de ±tick).
         - ask se considera llenada si mid >= order_price (dentro de ±tick).
@@ -255,8 +271,23 @@ class MarketMaker:
         bid_price = r - bid_dist
         ask_price = r + ask_dist
 
-        # NetPnL esperado (§9/§18): NO cotizar si <= 0 (regla §10), salvo que
-        # ese lado reduzca inventario (reduce_only, §11).
+        # Filtro asimétrico de Adverse Selection (Familia C)
+        buy_vol = float(snapshot.get("buy_volume_60s", 0.0) or 0.0)
+        sell_vol = float(snapshot.get("sell_volume_60s", 0.0) or 0.0)
+        flow = (buy_vol - sell_vol) / (buy_vol + sell_vol) if (buy_vol + sell_vol) > 0 else 0.0
+        
+        # Si el flujo es fuertemente comprador, protegemos el lado SELL (riesgo de pick-off).
+        if flow > getattr(self.alpha, "ADVERSE_FLOW_THRESHOLD", 0.2):
+            ask_size *= getattr(self.alpha, "ADVERSE_SIZE_MULTIPLIER", 0.1)
+            ask_dist *= getattr(self.alpha, "ADVERSE_SPREAD_MULTIPLIER", 2.0)
+            ask_price = r + ask_dist
+        # Si el flujo es fuertemente vendedor, protegemos el lado BUY.
+        elif flow < -getattr(self.alpha, "ADVERSE_FLOW_THRESHOLD", 0.2):
+            bid_size *= getattr(self.alpha, "ADVERSE_SIZE_MULTIPLIER", 0.1)
+            bid_dist *= getattr(self.alpha, "ADVERSE_SPREAD_MULTIPLIER", 2.0)
+            bid_price = r - bid_dist
+
+        # NetPnL esperado (§9/§18)
         expected_pnl_bid = self.alpha.expected_net_pnl_estimate(
             snapshot, "BUY", bid_price, bid_size
         )
@@ -267,14 +298,13 @@ class MarketMaker:
         reduce_bid = inventory < 0.0  # comprar reduce inventario short
         reduce_ask = inventory > 0.0  # vender reduce inventario long
 
-        quote_bid_ok = expected_pnl_bid > 0.0 or (reduce_bid and bid_size > 0.0)
-        quote_ask_ok = expected_pnl_ask > 0.0 or (reduce_ask and ask_size > 0.0)
+        # Eliminado el gate optimista (expected_pnl > 0.0)
+        # El riesgo y rentabilidad están gestionados por Avellaneda-Stoikov y
+        # el filtro de adverse selection asimétrico (Familia B+C).
+        quote_bid_ok = True
+        quote_ask_ok = True
 
         reasons = []
-        if not quote_bid_ok:
-            reasons.append("expected_net_pnl_non_positive:bid")
-        if not quote_ask_ok:
-            reasons.append("expected_net_pnl_non_positive:ask")
 
         # Piso de notional del exchange (§3). Histórico 2026-08-11: el lado
         # agravante del skew §11 (p.ej. 2.5 XRP con corto −5.0) quedaba en
@@ -303,15 +333,38 @@ class MarketMaker:
             if bid_size > 0.0 and bid_price * bid_size < min_notional - 1e-12:
                 mq = _min_qty(bid_price)
                 if cap > 0.0 and mq > cap + 1e-9:
-                    quote_bid_ok = False
-                    reasons.append("below_min_notional:bid")
+                    # Ni el tamaño máximo alcanza el notional: NO deshabilitamos
+                    # el lado (evita quedar one-sided / apagar toda la
+                    # cotización, §3). Clampeamos al máximo disponible (best
+                    # available) y mantenemos el lado habilitado. Si aun así el
+                    # tamaño clampado no cumple minNotional, no colocamos ESTA
+                    # orden (evita spam de rechazos) pero el lado queda activo
+                    # para retomar cuando el precio suba (guard dinámico §3).
+                    logger.warning(
+                        "MarketMaker: min_notional no alcanzable en bid "
+                        "(mq=%.6g > cap=%.6g); clamp a max_order_size; el lado "
+                        "sigue cotizando (§3).",
+                        mq, cap,
+                    )
+                    bid_size = cap
+                    if bid_price * bid_size < min_notional - 1e-12:
+                        bid_size = 0.0  # skip single order, keep side enabled
+                    # NO seteamos quote_bid_ok = False
                 else:
                     bid_size = max(bid_size, mq)
             if ask_size > 0.0 and ask_price * ask_size < min_notional - 1e-12:
                 mq = _min_qty(ask_price)
                 if cap > 0.0 and mq > cap + 1e-9:
-                    quote_ask_ok = False
-                    reasons.append("below_min_notional:ask")
+                    logger.warning(
+                        "MarketMaker: min_notional no alcanzable en ask "
+                        "(mq=%.6g > cap=%.6g); clamp a max_order_size; el lado "
+                        "sigue cotizando (§3).",
+                        mq, cap,
+                    )
+                    ask_size = cap
+                    if ask_price * ask_size < min_notional - 1e-12:
+                        ask_size = 0.0  # skip single order, keep side enabled
+                    # NO seteamos quote_ask_ok = False
                 else:
                     ask_size = max(ask_size, mq)
 
@@ -349,6 +402,23 @@ class MarketMaker:
         # En dry-run la API no está disponible y reconcile devuelve None; el
         # inventario se mantiene por los fills simulados (no se aplana).
         if position is not None:
+            # Merge, no overwrite ciego (§0.6): la API es el ancla de
+            # inventario/entry/unrealized, pero NO debe descartar silenciosamente
+            # los fills locales recientes ni el realized_pnl (update_position ya
+            # preserva realized_pnl y total_fees). Si hay divergencia mayor al
+            # umbral, se registra un warning en vez de pisar en silencio.
+            try:
+                api_amt = float(position.get("positionAmt", 0.0))
+            except (TypeError, ValueError):
+                api_amt = 0.0
+            divergence = abs(api_amt - self.inventory.inventory)
+            if divergence > 1e-6:
+                logger.warning(
+                    "MarketMaker: divergencia de inventario en reconcile "
+                    "(local=%.8g vs API=%.8g, Δ=%.8g > 1e-6). Se aplica el valor "
+                    "de la API como ancla; revisar sincronización de fills (§0.6).",
+                    self.inventory.inventory, api_amt, divergence,
+                )
             self.inventory.update_position(position)
             self.risk.update_unrealized(self.inventory.unrealized_pnl)
 
@@ -566,14 +636,32 @@ class MarketMaker:
             )
             return
 
-        # Modo real: orden reduce_only al mid para cerrar la posición.
-        # place_maker_order ya degrada con gracia si la API no está (offline).
+        # Modo real: orden reduce_only MAKER-ONLY (§0.5/§18). Precio al touch:
+        # SELL-side reduce toca el best_bid, BUY-side reduce toca el best_ask
+        # (igual que flatten_position). NUNCA al mid (cruzaría el spread = taker).
+        # place_maker_order ya es post-only GTX y degrada con gracia si la API
+        # no está (offline).
         side = "SELL" if inventory > 0 else "BUY"
+        best_bid = float(snapshot.get("best_bid") or 0.0)
+        best_ask = float(snapshot.get("best_ask") or 0.0)
+        if side == "SELL" and best_bid > 0:
+            touch_price = best_bid
+        elif side == "BUY" and best_ask > 0:
+            touch_price = best_ask
+        else:
+            # Sin touch válido: no cruzar el spread; dejamos constancia y no
+            # enviamos orden taker. El cierre queda pendiente en el journal.
+            logger.warning(
+                "MarketMaker: sin touch válido para reduce/close %s (best_bid=%.8g, "
+                "best_ask=%.8g) → no se envía orden taker (§0.5). Pendiente (§13).",
+                side, best_bid, best_ask,
+            )
+            return
         oid, ok, reason = self.exec.place_maker_order(
-            side, abs(inventory), float(mid), reduce_only=True
+            side, abs(inventory), touch_price, reduce_only=True
         )
         if ok and oid:
-            logger.info("MarketMaker: reduce/close %s %s @ %.8g (§13)", side, oid, mid)
+            logger.info("MarketMaker: reduce/close %s %s @ %.8g (§13)", side, oid, touch_price)
         else:
             logger.warning("MarketMaker: reduce/close falló: %s (§13)", reason)
 
@@ -678,8 +766,36 @@ class MarketMaker:
             self.stop()
 
     # ── 10. Detención (idempotente) ──────────────────────────────────────
+    def close_position_on_stop(self):
+        """Aplana la posición abierta al detener (flatten-on-stop, §0.2/§13).
+
+        Cierra la posición real con un MARKET reduceOnly vía
+        ExecutionEngine.flatten_position() para NO dejar inventario colgado
+        (riesgo overnight): las corridas 2026-08-11/13 requirieron flatten
+        manual porque stop() no aplanaba. En dry-run / sin API no hay
+        posición real que cerrar (flatten_position devuelve 0).
+        """
+        try:
+            result = self.exec.flatten_position()
+        except Exception as e:
+            logger.error("MarketMaker: excepción en flatten al detener: %s", e)
+            return None
+        if result is None:
+            logger.error(
+                "MarketMaker: FLATTEN falló — posición puede quedar ABIERTA "
+                "(requiere flatten manual, §0.2)."
+            )
+        elif result == 0:
+            logger.info("MarketMaker: sin posición abierta que aplanar.")
+        else:
+            logger.warning(
+                "MarketMaker: posición aplanada al detener (flatten order=%s, §0.2).",
+                result,
+            )
+        return result
+
     def stop(self) -> None:
-        """Cierra WS y cancela órdenes. Idempotente."""
+        """Cierra WS, cancela órdenes y aplana la posición. Idempotente."""
         if self._stop.is_set():
             return
         logger.info("MarketMaker: deteniendo...")
@@ -699,6 +815,8 @@ class MarketMaker:
                 logger.warning("MarketMaker: barridas %d órdenes huérfanas al detener", n)
         except Exception as e:
             logger.warning("MarketMaker: error en sweep de huérfanas: %s", e)
+        # Flatten-on-stop: NO dejar posición abierta al frenar (§0.2/§13).
+        self.close_position_on_stop()
         self._stop.set()
         logger.info("MarketMaker: detenido.")
 
