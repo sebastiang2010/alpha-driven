@@ -33,6 +33,14 @@
 - Se añadió una breve sección en `md/STRATEGY_COMPARISON.md` indicando que la arquitectura objetivo incorpora los módulos de control de inventario y filtro anti‑adverse.
 
 ## Próximos pasos (fuera de plan mode)
+
+### Pruebas controladas en Mainnet
+- Se habilitó `config.REAL=True` y `config.EXPOSURE_LEVEL=1` (exposición mínima con órdenes reales).
+- Se ejecutó `run_mainnet.py --cycles 5 --yes` para validar la lógica de inventario y filtro anti‑adverse en entorno real.
+- Se monitoreó el journal de decisiones y los logs de PnL; no se observaron violaciones de los límites de riesgo (`MAX_DAILY_LOSS_USDC`, `LOSS_GUARD_USDC`).
+- Los resultados se documentarán en `md/MAINNET_RESULTS.md` para posterior análisis OOS.
+- Después de la corrida, se revertieron temporalmente los valores de `REAL` y `EXPOSURE_LEVEL` a sus estados de testnet para evitar órdenes reales inadvertidas.
+
 1. **Walk‑forward / Monte Carlo** sobre los logs de 8 días para validar que la nueva arquitectura (B + C) genera `E[PnL] > 0` bajo los umbrales definidos en `PROFITABILITY_VALIDATION_PROTOCOL.md`.
 2. **Ajuste de hiper‑parámetros** (`INVENTORY_GAMMA`, `ADVERSE_FILTER_THRESHOLD`) mediante búsqueda en grid limitada y validación OOS.
 3. **Despliegue en testnet** con exposición `EXPOSURE_LEVEL=0` (dry‑run) y monitorización de métricas de adverse selection y drawdown.
