@@ -31,7 +31,7 @@ SYMBOL: str = "XRPUSDC"
 # DEFAULT = False (TESTNET): por §0.1 el entorno seguro por defecto es
 # testnet/dry-run. Para operar en mainnet hay que optar explícitamente
 # (REAL=True Y EXPOSURE_LEVEL>=1, ambos requieren autorización humana §0.2).
-REAL: bool = True  # Temporal: pruebas controladas en Mainnet (autorizado por humano)
+REAL: bool = False  # Restablecido a testnet después de pruebas controladas
 
 # ---------------------------------------------------------------------------
 # Presupuesto de riesgo (§0.4) — PROPUESTA pendiente de confirmacion
@@ -90,7 +90,7 @@ STARTING_EQUITY_USDC: float = 1000.0
 # Subir de nivel requiere autorización humana (§0.2).
 # DEFAULT = 0 (dry-run): entorno seguro por defecto (§0.1/§21). El bot
 # simula órdenes vía SIMULATION_QUOTE_MULTIPLIER sin enviar nada real.
-EXPOSURE_LEVEL: int = 1  # Temporal: exposición mínima con órdenes reales para pruebas controladas
+EXPOSURE_LEVEL: int = 0  # Restablecido a dry‑run (testnet) después de pruebas controladas
 
 # Multiplicador de tamaño por nivel. La exposición efectiva se calcula
 # multiplicando el tamaño base por este multiplicador.
