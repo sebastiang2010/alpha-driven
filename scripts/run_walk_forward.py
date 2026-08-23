@@ -359,9 +359,15 @@ def run_strategy_walk_forward(
     }
 
 
-def write_walk_forward_report(results: Dict[str, Any], path: pathlib.Path) -> None:
+def write_walk_forward_report(
+    results: Dict[str, Any], path: pathlib.Path, data_source: str = "synthetic"
+) -> None:
     """Escribe el informe walk‑forward a ``path`` con secciones
-    Resultados / Criterios / Qué falta."""
+    Resultados / Criterios / Qué falta.
+
+    ``data_source`` es ``"synthetic"`` o ``"real"`` y ajusta la nota aclaratoria.
+    """
+    is_real = data_source == "real"
     lines: List[str] = []
     lines.append("# WALK_FORWARD_RESULTS.md")
     lines.append("")
@@ -372,14 +378,25 @@ def write_walk_forward_report(results: Dict[str, Any], path: pathlib.Path) -> No
     lines.append(
         f"- base_size (XRP, nivel de exposición actual): `{results['base_size']}`"
     )
+    lines.append(f"- fuente de datos: **{'REAL (Binance 1m closes)' if is_real else 'sintética sembrada (placeholder)'}**")
     lines.append("")
-    lines.append(
-        "> **NOTA**: La serie de precios usada es **sintética sembrada** "
-        "(placeholder). No hay datos de micro‑estructura OOS reales disponibles "
-        "y el testnet no es realista (nota del usuario). Esto valida la "
-        "*estructura* del motor y el cálculo de métricas, **NO** es un veredicto "
-        "de rentabilidad."
-    )
+    if is_real:
+        lines.append(
+            "> **NOTA**: La serie de precios es **real** (cierres 1m de XRPUSDC "
+            "desde Binance, no testnet). Valida la lógica de la estrategia B+C "
+            "sobre un camino de precios real, **pero** usa solo el precio de "
+            "cierre como proxy de mid: no incluye micro‑estructura completa de "
+            "order book ni flujo real de volumen. **NO** es un veredicto final "
+            "de rentabilidad (falta Monte‑Carlo y validación en mainnet)."
+        )
+    else:
+        lines.append(
+            "> **NOTA**: La serie de precios usada es **sintética sembrada** "
+            "(placeholder). No hay datos de micro‑estructura OOS reales disponibles "
+            "y el testnet no es realista (nota del usuario). Esto valida la "
+            "*estructura* del motor y el cálculo de métricas, **NO** es un veredicto "
+            "de rentabilidad."
+        )
     lines.append("")
     lines.append("### Métricas por ventana")
     lines.append("")
@@ -451,9 +468,11 @@ def write_walk_forward_report(results: Dict[str, Any], path: pathlib.Path) -> No
     lines.append("### Qué falta")
     lines.append("")
     lines.append(
-        "- **Datos reales OOS**: no hay micro‑estructura real disponible; el "
-        "testnet no es representativo (nota del usuario). Se requiere serie "
-        "histórica real de XRPUSDC (varios días) para validación concluyente."
+        "- **Micro‑estructura completa**: se usa la serie de **cierres 1m reales** "
+        "de XRPUSDC (Binance, no testnet) como proxy de mid. Falta el libro de "
+        "órdenes real (profundidad, spread dinámico) y el flujo de volumen "
+        "(`buy/sell_volume_60s`) para una validación de micro‑estructura "
+        "concluyente. El testnet no es representativo (nota del usuario)."
     )
     lines.append(
         "- **Monte‑Carlo**: 1000 simulaciones con la distribución de retornos "
@@ -552,8 +571,9 @@ def main(argv: List[str] | None = None) -> int:
             prices, args.n_windows, args.train_len, args.oos_len
         )
         if args.report is not None:
-            write_walk_forward_report(results, args.report)
-            print(f"[run_walk_forward] Reporte escrito en {args.report}")
+            src = "real" if args.price_file is not None else "synthetic"
+            write_walk_forward_report(results, args.report, data_source=src)
+            print(f"[run_walk_forward] Reporte escrito en {args.report} (fuente={src})")
         else:
             print(json.dumps(results, indent=2, default=str))
         return 0

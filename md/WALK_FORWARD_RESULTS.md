@@ -5,26 +5,27 @@
 - Ventanas walk‑forward: **5**
 - tick_size usado: `0.0001`
 - base_size (XRP, nivel de exposición actual): `5.0`
+- fuente de datos: **REAL (Binance 1m closes)**
 
-> **NOTA**: La serie de precios usada es **sintética sembrada** (placeholder). No hay datos de micro‑estructura OOS reales disponibles y el testnet no es realista (nota del usuario). Esto valida la *estructura* del motor y el cálculo de métricas, **NO** es un veredicto de rentabilidad.
+> **NOTA**: La serie de precios es **real** (cierres 1m de XRPUSDC desde Binance, no testnet). Valida la lógica de la estrategia B+C sobre un camino de precios real, **pero** usa solo el precio de cierre como proxy de mid: no incluye micro‑estructura completa de order book ni flujo real de volumen. **NO** es un veredicto final de rentabilidad (falta Monte‑Carlo y validación en mainnet).
 
 ### Métricas por ventana
 
 | Ventana | NetPnL_OOS | MaxDD_OOS | Std_Inv | Adverse | Fills | Decisions | Reduction_vs_Baseline |
 |---|---|---|---|---|---|---|---|
-| 1 | -0.089964 | 0.097197 | 2.5975 | 4 | 19 | 20 | +1.7418 |
-| 2 | 0.198582 | 0.008300 | 2.5937 | 3 | 19 | 20 | -0.2487 |
-| 3 | 0.319315 | 0.020854 | 2.1522 | 2 | 19 | 20 | -7.5526 |
-| 4 | 0.154327 | 0.014781 | 2.5558 | 2 | 19 | 20 | +0.0776 |
-| 5 | -0.176315 | 0.193479 | 2.3424 | 4 | 19 | 20 | +2.9051 |
+| 1 | 0.152964 | 0.026312 | 2.7013 | 4 | 19 | 20 | -2.6420 |
+| 2 | 0.012676 | 0.038748 | 2.4863 | 4 | 18 | 20 | -1.9390 |
+| 3 | 0.041243 | 0.042940 | 2.4341 | 3 | 19 | 20 | +0.2764 |
+| 4 | -0.226080 | 0.242506 | 2.4611 | 8 | 19 | 20 | +0.8607 |
+| 5 | 0.294337 | 0.024820 | 2.8039 | 2 | 17 | 20 | -0.9888 |
 
 ### Agregados (suma / promedio)
 
-- **NetPnL_OOS total estrategia**: `0.405945`
-- **NetPnL_OOS total baseline**: `0.577492`
-- **Reducción promedio vs baseline**: `-0.6154`
-- **Fills totales (estrategia)**: `95`
-- **Adverse‑selection total (estrategia)**: `15`
+- **NetPnL_OOS total estrategia**: `0.275141`
+- **NetPnL_OOS total baseline**: `0.112000`
+- **Reducción promedio vs baseline**: `-0.8865`
+- **Fills totales (estrategia)**: `92`
+- **Adverse‑selection total (estrategia)**: `21`
 
 ### Criterios de aceptación (PROFITABILITY_VALIDATION_PROTOCOL.md)
 
@@ -38,7 +39,7 @@ Estos criterios se listan como referencia; **no** se evalúan ni se emite veredi
 
 ### Qué falta
 
-- **Datos reales OOS**: no hay micro‑estructura real disponible; el testnet no es representativo (nota del usuario). Se requiere serie histórica real de XRPUSDC (varios días) para validación concluyente.
+- **Micro‑estructura completa**: se usa la serie de **cierres 1m reales** de XRPUSDC (Binance, no testnet) como proxy de mid. Falta el libro de órdenes real (profundidad, spread dinámico) y el flujo de volumen (`buy/sell_volume_60s`) para una validación de micro‑estructura concluyente. El testnet no es representativo (nota del usuario).
 - **Monte‑Carlo**: 1000 simulaciones con la distribución de retornos para obtener intervalos de confianza (NO ejecutado aquí, a propósito).
 - **Umbrales formales**: definir y codificar los umbrales numéricos de aceptación del protocolo.
 - **Validación en mainnet**: requiere autorización humana explícita (§0.2) y presupuestos de riesgo confirmados.
