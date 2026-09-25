@@ -3,6 +3,12 @@
 Fecha: 2026-09-25.
 Estado: **DISEÑO PENDIENTE DE REVISIÓN; INTEGRACIÓN AÚN NO IMPLEMENTADA**.
 
+Actualización 2026-09-25: la primera revisión dictaminó `CHANGES_REQUESTED`.
+Para la segunda revisión leer también `md/AS_INTEGRATION_DESIGN_V2.md`, que
+concreta y sustituye las propuestas abiertas de tiempo, interfaz, inventario y
+volatilidad de este documento. Conservar el primer dictamen; guardar el nuevo
+en `md/AS_INTEGRATION_DESIGN_REVIEW_V2.md`. V2 sigue pendiente de aprobación.
+
 ## Pedido para el modelo revisor en OpenCode
 
 Revisa este diseño para conectar las cotizaciones del bot A-S con el motor
