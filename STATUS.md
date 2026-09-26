@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **508 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **513 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes del veredicto + F1.1 + F1.2**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (9/9) + `test_as_calendar.py` (F1.2, 5/5) → **86/86 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (11/11) + `test_as_calendar.py` (F1.2, 8/8) → **91/91 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -34,11 +34,13 @@
 - Tests sintéticos nuevos `strategy/tests/test_offline_coordinator.py` (9/9): protocolo flatten, varios libros mismo ts en orden, submit→fill→finish end-to-end, `run_full` con policy_fn, factory desde filas crudas, rechazo de claves reservadas (`ts_ms`/`kind` en data → `ValueError` antes de tocar el motor).
 - Sin regresiones: mismos 9 fallos pre-existentes. Sin simulaciones de mercado, sin push (F1.2+ pendientes de revisión).
 
-## F1.2 — calendario 5s, ciclos sin eventos, drenado de timers (2026-09-26, hecho — 86/86 área, 508/9 suite)
+## F1.2 — calendario 5s, ciclos sin eventos, drenado de timers (2026-09-26, hecho + 4 ajustes — 91/91 área, 513/9 suite)
 - `strategy/as_coordinator.py`: default `decision_interval_ms` 1000→5000 (`__init__` y `ASCoordinatorConfig`); `run()` recorre el calendario fusionado (ciclos `t0+k*D` dentro de cobertura ∪ timestamps de eventos, ascendente, sin duplicados): los ciclos sin eventos avanzan con lista vacía y deciden si hay warm-up; ningún trade/libro se salta. `_check_gap` ahora solo entre EVENTOS consecutivos (`_last_event_ts`; los pasos de ciclo no cuentan); `_cycle_grid()` genera la grilla.
 - `strategy/execution_reconstruction.py` (`advance_to`): drena timers con `timer_ts < ts_ms` antes de los eventos (equivale al interleave cuando hay eventos; habilita avances vacíos). Cada timer se despacha en su propio ts; prioridades y `finish()` intactos.
 - Tests: `TestCycleTimerDrain` (2, motor: avance vacío dispara arrival@1040; cronología preservada con eventos posteriores) + `strategy/tests/test_as_calendar.py` (5: default 5s, pasos fusionados exactos `[1000,2000,3000,6000,7000,11000,12000]` con `observed_end=12000`, decisión en ciclo vacío sin pendientes, trade off-grid consumido, hueco entre eventos invalida sin reset).
 - `finish()` sigue cerrando en el último ts con eventos (límite de fin de datos). Sin simulaciones de mercado, sin push. Tests existentes con `decision_interval_ms=1000` explícito: intactos.
+- **4 ajustes del veredicto**: (1) `strategy/calendar.py` nuevo — `validate_interval_ms` / `cycle_grid` / `merged_steps` / `check_book_coverage`, una sola implementación para ambas rutas; `OfflineCoordinator` camina pasos fusionados (`_steps`) y valida su intervalo en el ctor; (2) `ASCoordinator._t0` = primer LIBRO (trades previos se procesan igual); (3) intervalo no entero-positivo (0, negativo, fraccionario, str, bool, None) → `ValueError` antes de la grilla, en ambas rutas; (4) cobertura de libro validada antes de la política en cada ciclo (vacío o no, haya comandos o no) — libro ausente/obsoleto invalida.
+- Tests: trade@500 previo al primer libro (t0=1000, trade consumido); intervalos inválidos ×6 en ambas rutas; ciclo vacío con libro obsoleto y política muda (invalida antes de llamarla, `calls==[]`); no-reset con inventario 5 (detectaría un reset; el 0 no); segunda ruta camina ciclo vacío 1500 y cierra en 2000.
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**

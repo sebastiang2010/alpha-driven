@@ -25,6 +25,11 @@ from strategy.execution_reconstruction import (
     ExecutionSnapshot,
     FinalResult,
 )
+from strategy.calendar import (
+    check_book_coverage,
+    merged_steps,
+    validate_interval_ms,
+)
 from strategy import config
 
 
@@ -118,6 +123,10 @@ class OfflineCoordinator:
     
     def __init__(self, coordinator_config: CoordinatorConfig):
         self.cfg = coordinator_config
+        # F1.2: mismo calendario validado que ASCoordinator (falla rápido
+        # con intervalo no entero-positivo en vez de colgar la grilla).
+        validate_interval_ms(coordinator_config.cycle_interval_ms,
+                             "cycle_interval_ms")
         self.reconstructor_config = ReconstructionConfig(
             tick_size=coordinator_config.tick_size,
             qty_step=coordinator_config.qty_step,
@@ -159,27 +168,37 @@ class OfflineCoordinator:
                 raise ValueError(f'Negative command timestamp: {c.ts_ms}')
             self._commands_by_ts.setdefault(c.ts_ms, []).append(c)
         
-        # Combinar y ordenar todos los timestamps únicos
+        # Combinar y ordenar todos los timestamps únicos con eventos/comandos
         all_ts = set(self._market_events_by_ts.keys()) | set(self._commands_by_ts.keys())
         self._all_timestamps = sorted(all_ts)
-        
+
         if not self._all_timestamps:
             raise ValueError('No events to process')
-        
+
         # Validar que no hay gaps en los timestamps de mercado (solo para libros)
         book_ts = sorted([ts for ts, evs in self._market_events_by_ts.items() 
-                         if any(e.kind == 'book' for e in evs)])
+                          if any(e.kind == 'book' for e in evs)])
         for i in range(1, len(book_ts)):
             gap = book_ts[i] - book_ts[i-1]
             if gap > self.cfg.max_gap_ms:
                 raise ValueError(f'Depth time gap: {gap}ms > {self.cfg.max_gap_ms}ms '
-                               f'between {book_ts[i-1]} and {book_ts[i]}')
+                                 f'between {book_ts[i-1]} and {book_ts[i]}')
         
         # Establecer t0 como el primer libro válido
         if book_ts:
             self._t0 = book_ts[0]
         else:
             self._t0 = self._all_timestamps[0]
+
+        # F1.2: pasos fusionados con el MISMO calendario compartido que
+        # ASCoordinator (ciclos t0+k*D dentro de cobertura ∪ ts con datos).
+        # Los ciclos sin eventos avanzan igual (drenan timers, pueden decidir).
+        # t0 ya quedó fijado al primer libro arriba.
+        market_ts = sorted(self._market_events_by_ts.keys())
+        coverage_end = market_ts[-1] if market_ts else self._all_timestamps[-1]
+        assert self._t0 is not None
+        self._steps = merged_steps(self._all_timestamps, self._t0,
+                                   self.cfg.cycle_interval_ms, coverage_end)
     
     def _is_cycle_timestamp(self, ts_ms: int) -> bool:
         """Verifica si ts_ms corresponde a un ciclo programado t0 + k*D."""
@@ -253,18 +272,21 @@ class OfflineCoordinator:
     
     def advance_to_next_timestamp(self) -> Tuple[ExecutionDelta, Optional[ExecutionDelta]]:
         """
-        Avanza al siguiente timestamp en el calendario.
-        
+        Avanza al siguiente paso del calendario fusionado (F1.2: ciclos
+        programados ∪ timestamps con datos; los ciclos sin eventos avanzan
+        con lista vacía y drenan timers vencidos en el motor).
+
         Returns:
             (market_delta, cycle_delta) donde cycle_delta es None si no hay ciclo en este ts.
             El cycle_delta contiene el resultado de apply_commands si la política emitió comandos.
         """
         if self._finished:
             raise ValueError('Coordinator already finished')
-        if self._current_idx >= len(self._all_timestamps):
+        steps = getattr(self, "_steps", self._all_timestamps)
+        if self._current_idx >= len(steps):
             raise ValueError('No more timestamps to process')
-        
-        ts_ms = self._all_timestamps[self._current_idx]
+
+        ts_ms = steps[self._current_idx]
 
         # Validar timestamp no regresivo
         if ts_ms < self._last_processed_ts:
@@ -334,24 +356,31 @@ class OfflineCoordinator:
     def run_full(self, policy_fn) -> FinalResult:
         """
         Ejecución completa con una función de política.
-        
+
+        Recorre el calendario fusionado (cliclos ∪ datos). La cobertura del
+        libro se valida antes de llamar a la política en cada ciclo, haya
+        comandos o no.
+
         policy_fn(ts_ms: int, snapshot: ExecutionSnapshot) -> List[Command]
         """
-        while self._current_idx < len(self._all_timestamps):
+        steps = getattr(self, "_steps", self._all_timestamps)
+        while self._current_idx < len(steps):
             market_delta, _ = self.advance_to_next_timestamp()
             ts_ms = self._last_processed_ts
-            
+
             # Obtener snapshot para la política
             snapshot = self.get_state()
-            
+
             # Llamar a la política solo si warm-up completo y es timestamp de ciclo
             commands = []
             if self.warmup.warmup_complete and self._is_cycle_timestamp(ts_ms):
+                check_book_coverage(
+                    self.engine.book, ts_ms, self.cfg.max_book_age_ms)
                 commands = policy_fn(ts_ms, snapshot)
-            
+
             if commands:
                 self.apply_policy_commands(ts_ms, commands)
-        
+
         return self.finish()
 
 

@@ -13,6 +13,12 @@ from strategy.execution_reconstruction import (
     FinalResult,
     ReconstructionConfig,
 )
+from strategy.calendar import (
+    check_book_coverage,
+    cycle_grid,
+    merged_steps,
+    validate_interval_ms,
+)
 from strategy.alpha_model import AlphaModel
 
 
@@ -56,20 +62,24 @@ class ASCoordinator:
     ):
         self.config = config
         self.engine = engine
-        self.decision_interval_ms = decision_interval_ms
+        self.decision_interval_ms = validate_interval_ms(decision_interval_ms)
         self.warmup_intervals = warmup_intervals
         self._cfg = ASCoordinatorConfig(
             decision_interval_ms=decision_interval_ms,
             warmup_intervals=warmup_intervals,
         )
 
-        # Load and unify events from CSVs into a sorted list (plain dicts,
-        # format expected by ExecutionReconstructor.advance_to).
+        # Derive t0 from the FIRST BOOK (F1.2): a leading trade must not shift
+        # the decision grid. Earlier trades are still loaded and processed.
         # Each event dict has keys: ts_ms (int), kind (str: "book"|"trade"), data (dict).
         self._market_events = self._load_market_events(depth_csv, trades_csv)
-
-        # Derive t0 from the first event timestamp
-        self._t0: int = self._market_events[0]["ts_ms"] if self._market_events else 0
+        books = [e["ts_ms"] for e in self._market_events if e["kind"] == "book"]
+        if books:
+            self._t0: int = books[0]
+        elif self._market_events:
+            self._t0 = self._market_events[0]["ts_ms"]
+        else:
+            self._t0 = 0
         self._last_processed_ts: int = -1
         self._current_ts: int = self._t0
         self._cycle_counter: int = 0
@@ -419,19 +429,9 @@ class ASCoordinator:
                 )
 
     def _cycle_grid(self, last_event_ts: int) -> List[int]:
-        """Scheduled cycle timestamps t0 + k*D within data coverage (<= last event)."""
-        grid: List[int] = []
-        if not self._market_events:
-            return grid
-        t0 = self._t0
-        k = 0
-        while True:
-            ts = t0 + k * self.decision_interval_ms
-            if ts > last_event_ts:
-                break
-            grid.append(ts)
-            k += 1
-        return grid
+        """Scheduled cycle timestamps t0 + k*D within data coverage (delegates
+        to the shared calendar so both routes build the same grid)."""
+        return cycle_grid(self._t0, self.decision_interval_ms, last_event_ts)
 
     # ── Main run loop ───────────────────────────────────────────────────
 
@@ -470,13 +470,14 @@ class ASCoordinator:
         start_ts = self._last_processed_ts if self._last_processed_ts > 0 else -1
 
         # F1.2: scheduled cycles run even without market events; event
-        # timestamps are all consumed (never skip trades/books). Both sets
-        # strictly after warm-up consumption, ascending, no duplicates.
+        # timestamps are all consumed (never skip trades/books). Shared
+        # merged calendar (same implementation as OfflineCoordinator).
         event_ts = sorted({
             e["ts_ms"] for e in self._market_events if e["ts_ms"] > start_ts
         })
-        cycle_ts = [ts for ts in self._cycle_grid(last_event_ts) if ts > start_ts]
-        steps = sorted(set(event_ts) | set(cycle_ts))
+        steps = [ts for ts in merged_steps(
+            event_ts, self._t0, self.decision_interval_ms, last_event_ts)
+            if ts > start_ts]
         event_ts_set = set(event_ts)
 
         for ts_ms in steps:
@@ -513,8 +514,12 @@ class ASCoordinator:
             # Get authoritative snapshot (engine owns inventory/cash)
             snapshot = self.engine.state()
 
-            # A-S decision only on grid timestamps once warm-up is complete
+            # A-S decision only on grid timestamps once warm-up is complete.
+            # Coverage is validated BEFORE calling the policy, whether or not
+            # it would emit commands: no cycle decides on a stale/missing book.
             if self._is_decision_timestamp(ts_ms) and self._warmup_complete:
+                max_age = self.engine.config.max_book_age_ms
+                check_book_coverage(self.engine.book, ts_ms, max_age)
                 # Generate decision (respects _side_occupied for delayed replacement)
                 commands = self._as_decision(snapshot)
 

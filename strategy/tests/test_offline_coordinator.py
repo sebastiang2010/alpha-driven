@@ -180,6 +180,31 @@ class TestCoordinatorEngineCompatibility(unittest.TestCase):
         self.assertEqual(len(fills), 1)
         self.assertEqual(coord.engine.inventory_lots, 10)
 
+    def test_run_full_walks_empty_cycles_same_calendar(self):
+        """Segunda ruta, mismo calendario: ciclos sin eventos se caminan
+        (la política es llamada ahí) y finish cierra en el último evento."""
+        coord = OfflineCoordinator(_test_config(cycle_interval_ms=500))
+        coord.load_events([
+            _book(1000, 10000, 10001, 1, 0),
+            _book(1100, 10000, 10001, 2, 1),
+            _book(1200, 10000, 10001, 3, 2),
+            _book(2000, 10000, 10001, 4, 3),
+        ])
+        # Grilla t0=1000 D=500 → 1000,1500,2000; pasos: 1000,1100,1200,1500,2000
+        self.assertEqual(
+            coord._steps, [1000, 1100, 1200, 1500, 2000])
+        seen = []
+        result = coord.run_full(lambda ts, snap: seen.append(ts) or [])
+        self.assertIn(1500, seen)  # ciclo vacío: la política fue llamada
+        self.assertEqual(result.observed_end_ms, 2000)  # fin de datos, no grilla
+        self.assertNotIn(2500, seen)
+
+    def test_invalid_cycle_interval_rejected(self):
+        """Intervalo no entero-positivo se rechaza al construir el coordinador."""
+        for bad in (0, -500, 2.5, "500", True):
+            with self.assertRaises(ValueError, msg=f"interval={bad!r}"):
+                OfflineCoordinator(_test_config(cycle_interval_ms=bad))
+
 
 if __name__ == '__main__':
     unittest.main()
