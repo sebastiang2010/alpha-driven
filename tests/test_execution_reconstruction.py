@@ -1266,6 +1266,31 @@ class TestReduceOnlyLimits(unittest.TestCase):
         self.assertEqual(rec.orders["s1"]["status"], "pending")
         self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
 
+    def test_flip_excluded_from_bypass_under_excess(self):
+        """Con exceso previo el bypass NO cubre órdenes que invierten el signo:
+        inv +20 @ $1.30 ($26 > $25), vender 25 (quedaría -5) -> rechazada por
+        vía normal y sin evento submit_reduce_only. Espejo en corto."""
+        rec = self._rec(max_position_lots=100)
+        self._fill_buy(rec, 20, order_id="b", trade_id="t")
+        self._move_price_to(rec, 2000, 12999, 13001, 3, 2)  # $1.30: exceso nocional
+        rec.apply_commands(2000, [_submit(2000, "sflip", "SELL", 13002, 25)])
+        self.assertEqual(rec.orders["sflip"]["status"], "rejected_position_notional")
+        self.assertEqual(
+            [e for e in rec.journal
+             if e.get("event") == "submit_reduce_only" and e.get("order_id") == "sflip"],
+            [],
+        )
+        rec2 = self._rec(max_position_lots=100)
+        self._fill_sell(rec2, 20, order_id="s", trade_id="t")
+        self._move_price_to(rec2, 2000, 12999, 13001, 3, 2)
+        rec2.apply_commands(2000, [_submit(2000, "bflip", "BUY", 13000, 25)])
+        self.assertEqual(rec2.orders["bflip"]["status"], "rejected_position_notional")
+        self.assertEqual(
+            [e for e in rec2.journal
+             if e.get("event") == "submit_reduce_only" and e.get("order_id") == "bflip"],
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
