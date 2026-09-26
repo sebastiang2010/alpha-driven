@@ -626,10 +626,38 @@ class ExecutionReconstructor:
         # Projected position including the candidate order, side-aware.
         # Solo el extremo que la candidata puede empeorar incluye su qty:
         # SELL solo puede llevar el inventario hacia abajo, BUY hacia arriba.
-        # Una reducción (vender en largo, comprar en corto) nunca se bloquea.
         candidate_qty = d['qty_lots']
         existing_qty_se = sum(x['remaining_lots'] for x in existing if x['side'] == 'SELL')
         existing_qty_bu = sum(x['remaining_lots'] for x in existing if x['side'] == 'BUY')
+        same_side_pending = existing_qty_se if side == 'SELL' else existing_qty_bu
+        # Reduce-only: orden del lado opuesto al inventario que no puede
+        # invertir el signo ni siquiera si todos los pendientes del mismo
+        # lado se llenan. Sus fills solo acercan el inventario a cero.
+        is_reducer = (
+            (side == 'SELL' and self.inventory_lots > 0)
+            or (side == 'BUY' and self.inventory_lots < 0)
+        ) and candidate_qty + same_side_pending <= abs(self.inventory_lots)
+        # Precio actual (USDC/XRP) para el control nocional.
+        tick_size = float(self.config.tick_size)
+        qty_step = float(self.config.qty_step)
+        mid_ticks = 0.0
+        if self.book and self.book.get("bids") and self.book.get("asks"):
+            mid_ticks = (self.book["bids"][0][0] + self.book["asks"][0][0]) / 2.0
+        if mid_ticks <= 0:
+            mid_ticks = float(d.get('price_ticks', 0))
+        price_usdc = mid_ticks * tick_size
+        # Exceso previo (p. ej. el precio subió y el inventario existente ya
+        # supera el nocional): una reductora estricta se permite aunque los
+        # extremos sigan fuera de límite — reducir no aumenta el riesgo.
+        in_excess = (
+            abs(self.inventory_lots) > self.config.max_position_lots
+            or price_usdc * abs(self.inventory_lots) * qty_step > float(self.config.max_notional)
+        )
+        if in_excess and is_reducer:
+            self._log(ts_ms, 'submit_reduce_only', oid,
+                      inventory_lots=self.inventory_lots, qty_lots=candidate_qty)
+            self._timer(o['arrival_ts_ms'], 'arrival', oid)
+            return transitions
         if side == 'SELL':
             proj_inv_low = self.inventory_lots - (existing_qty_se + candidate_qty)
             proj_inv_high = self.inventory_lots + existing_qty_bu
@@ -643,17 +671,6 @@ class ExecutionReconstructor:
         # Notional limit (USDC) on the same directional extremes, using the
         # experiment config (max_notional), not the global budget.
         # Unidades: notional = lots * qty_step [XRP] * mid_ticks * tick_size [USDC/XRP].
-        # (Bug §0.6 corregido: antes se comparaba price_ticks*qty directo contra
-        # el límite en USDC, rechazando todo; luego sumaba |inv|+candidata,
-        # bloqueando reducciones.)
-        tick_size = float(self.config.tick_size)
-        qty_step = float(self.config.qty_step)
-        mid_ticks = 0.0
-        if self.book and self.book.get("bids") and self.book.get("asks"):
-            mid_ticks = (self.book["bids"][0][0] + self.book["asks"][0][0]) / 2.0
-        if mid_ticks <= 0:
-            mid_ticks = float(d.get('price_ticks', 0))
-        price_usdc = mid_ticks * tick_size
         worst_lots = max(abs(proj_inv_low), abs(proj_inv_high))
         if price_usdc * worst_lots * qty_step > float(self.config.max_notional):
             transitions.append(self._finish_order(oid, 'rejected_position_notional', ts_ms))

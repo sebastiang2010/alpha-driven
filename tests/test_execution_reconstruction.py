@@ -1217,6 +1217,55 @@ class TestReduceOnlyLimits(unittest.TestCase):
         self.assertEqual(rec.orders["s1"]["status"], "pending")
         self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
 
+    def _move_price_to(self, rec, ts_ms, bid, ask, update_id, pu):
+        """Mueve el mid (movimiento de precio) con secuencia encadenada."""
+        rec.advance_to(ts_ms, [_book(ts_ms, bid, ask, update_id, pu)])
+
+    def test_reducer_allowed_when_price_move_exceeds_notional_long(self):
+        """Inv +20 a $1.00 ($20 OK); el precio sube a $1.30 ($26 > $25):
+        vender 5 (reduce a 15, sin invertir) debe aceptarse; comprar 1
+        (aumenta a 21, $27.3) debe rechazarse por nocional."""
+        rec = self._rec(max_position_lots=100)  # nocional default 25.0
+        self._fill_buy(rec, 20, order_id="b", trade_id="t")
+        self.assertEqual(rec.inventory_lots, 20)
+        self._move_price_to(rec, 2000, 12999, 13001, 3, 2)  # mid 13000 -> $1.30
+        d = rec.apply_commands(2000, [_submit(2000, "s1", "SELL", 13002, 5)])
+        self.assertEqual(rec.orders["s1"]["status"], "pending")
+        self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
+        # Aumentar sí se bloquea: otro reconstructor para evitar side_busy
+        rec2 = self._rec(max_position_lots=100)
+        self._fill_buy(rec2, 20, order_id="b", trade_id="t")
+        self._move_price_to(rec2, 2000, 12999, 13001, 3, 2)
+        rec2.apply_commands(2000, [_submit(2000, "b1", "BUY", 13000, 1)])
+        self.assertEqual(rec2.orders["b1"]["status"], "rejected_position_notional")
+
+    def test_reducer_allowed_when_price_move_exceeds_notional_short(self):
+        """Espejo en corto: inv -20 a $1.30 ($26 > $25): comprar 5 debe
+        aceptarse; vender 1 (aumenta a -21) debe rechazarse por nocional."""
+        rec = self._rec(max_position_lots=100)
+        self._fill_sell(rec, 20, order_id="s", trade_id="t")
+        self.assertEqual(rec.inventory_lots, -20)
+        self._move_price_to(rec, 2000, 12999, 13001, 3, 2)  # mid 13000 -> $1.30
+        d = rec.apply_commands(2000, [_submit(2000, "b1", "BUY", 13000, 5)])
+        self.assertEqual(rec.orders["b1"]["status"], "pending")
+        self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
+        rec2 = self._rec(max_position_lots=100)
+        self._fill_sell(rec2, 20, order_id="s", trade_id="t")
+        self._move_price_to(rec2, 2000, 12999, 13001, 3, 2)
+        rec2.apply_commands(2000, [_submit(2000, "s1", "SELL", 13002, 1)])
+        self.assertEqual(rec2.orders["s1"]["status"], "rejected_position_notional")
+
+    def test_reducer_cannot_flip_position(self):
+        """Sin bypass si puede invertir el signo: inv +5, vender 6 no es
+        reductora estricta (podría quedar -1) -> va por vía normal."""
+        rec = self._rec(max_position_lots=100)
+        self._fill_buy(rec, 5, order_id="b", trade_id="t")
+        self._move_price_to(rec, 2000, 12999, 13001, 3, 2)  # $1.30: 5*1.3=$6.5 < 25
+        # Sin exceso no hay bypass; vía normal: low=5-6=-1, high=5 -> dentro de límites -> pending
+        d = rec.apply_commands(2000, [_submit(2000, "s1", "SELL", 13002, 6)])
+        self.assertEqual(rec.orders["s1"]["status"], "pending")
+        self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
+
 
 if __name__ == "__main__":
     unittest.main()
