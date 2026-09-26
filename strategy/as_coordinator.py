@@ -20,6 +20,7 @@ from strategy.calendar import (
     validate_interval_ms,
 )
 from strategy.alpha_model import AlphaModel
+from strategy.market_state import MarketState
 
 
 # ── Coordinator configuration ─────────────────────────────────────────
@@ -49,6 +50,15 @@ class ASCoordinator:
     - Event group closes completely before delivering; never filters future to policy
     - Delayed replacement: if a decision cancels a side, that side stays "occupied"
       until the next scheduled cycle (no immediate re-submit).
+    - Market signals (F1.3): owns a REAL MarketState (no WS started) fed with
+      the same causal events the engine consumes (books/trades from t0, prices
+      converted ticks→USDC, qty lots→XRP). The A-S policy reads
+      MarketState.get_snapshot() — the canonical AlphaModel input — so
+      imbalance/microprice/momentum/volatility use the exact production
+      formulas (no parallel estimators). Windows (TRADE/VOLATILITY/ALPHA) are
+      enforced by MarketState pruning against the simulated clock; with short
+      captures the estimators degrade best-effort via their own guards
+      (volatility 0.0 with <3 samples, momentum 0.0 with <2).
     """
 
     def __init__(
@@ -90,6 +100,18 @@ class ASCoordinator:
         self._warmup_mids: List[float] = []
         self._best_bid: float = 0.0
         self._best_ask: float = 0.0
+
+        # F1.3: real signal stack, driven by the SIMULATED clock. MarketState
+        # is fed exclusively from the causal event stream (never wall-clock,
+        # WS never started); one shared AlphaModel accumulates record_mid
+        # once per decision cycle (contract §14).
+        symbol = (
+            getattr(config, "symbol", None)
+            or getattr(getattr(engine, "config", None), "symbol", None)
+            or "xrpusdc"
+        )
+        self._market_state = MarketState(str(symbol))
+        self._alpha_model = AlphaModel()
 
         # Delayed replacement: track which sides are "occupied" after a cancel
         self._side_occupied: Dict[str, bool] = {}
@@ -168,6 +190,63 @@ class ASCoordinator:
         raw_events.sort(key=lambda e: e["ts_ms"])
         return raw_events
 
+    # ── Causal signal feed (F1.3) ────────────────────────────────────
+
+    def _feed_market_state(
+        self, ts_ms: int, events: Sequence[Dict[str, Any]]
+    ) -> None:
+        """Feed the owned MarketState with already-consumed causal events.
+
+        Must be called AFTER a successful engine.advance_to(ts, events): the
+        same flattened event dicts (book/trade with top-level keys). Unit
+        conversion with the ENGINE config (ticks→USDC via tick_size,
+        lots→XRP via qty_step — never unit ticks). Both bookticker (best
+        bid/ask → mid samples for volatility/momentum) and full depth
+        (levels → imbalance) are fed per book event.
+        """
+        eng_cfg = getattr(self.engine, "config", None)
+        tick_size = float(getattr(eng_cfg, "tick_size", 0.0001) or 0.0001)
+        qty_step = float(getattr(eng_cfg, "qty_step", 1.0) or 1.0)
+        for e in events:
+            kind = e.get("kind")
+            if kind == "book":
+                bids = e.get("bids", []) or []
+                asks = e.get("asks", []) or []
+                if not bids or not asks:
+                    continue
+                try:
+                    bb = float(bids[0][0]) * tick_size
+                    ba = float(asks[0][0]) * tick_size
+                    bq = float(bids[0][1]) * qty_step
+                    aq = float(asks[0][1]) * qty_step
+                except (IndexError, TypeError, ValueError):
+                    continue
+                self._market_state.update_bookticker(bb, bq, ba, aq, ts_ms)
+                try:
+                    bids_usdc = [
+                        [float(p) * tick_size, float(q) * qty_step]
+                        for p, q in bids
+                    ]
+                    asks_usdc = [
+                        [float(p) * tick_size, float(q) * qty_step]
+                        for p, q in asks
+                    ]
+                except (TypeError, ValueError):
+                    continue
+                self._market_state.update_depth(
+                    bids_usdc, asks_usdc, len(bids_usdc), ts_ms
+                )
+            elif kind == "trade":
+                try:
+                    price_usdc = float(e.get("price_ticks", 0)) * tick_size
+                    qty_xrp = float(e.get("qty_lots", 0)) * qty_step
+                except (TypeError, ValueError):
+                    continue
+                self._market_state.update_trade(
+                    price_usdc, qty_xrp,
+                    bool(e.get("is_buyer_maker", False)), ts_ms,
+                )
+
     # ── Warm-up phase ───────────────────────────────────────────────────
 
     def _warmup_phase(self) -> None:
@@ -218,6 +297,9 @@ class ASCoordinator:
             # Advance to this timestamp (no apply_commands during warmup)
             self.engine.advance_to(ts_ms, market_events_for_advance)
             self._warmup_last_ts = ts_ms
+            # Same causal events feed the signal stack (warm-up by count;
+            # window coverage comes from MarketState pruning best-effort)
+            self._feed_market_state(ts_ms, market_events_for_advance)
 
             # Update best bid/ask from the engine's internal book
             if getattr(self.engine, "book", None) and self.engine.book:
@@ -255,159 +337,117 @@ class ASCoordinator:
                 f"out of {len(self._warmup_mids)} sampled mids."
             )
 
-    # ── A-S decision using AlphaModel ─────────────────────────────────
+    # ── A-S decision with real signals (F1.3) ──────────────────────────
     def _as_decision(self, snapshot: ExecutionSnapshot) -> List[Dict[str, Any]]:
-        """Generate submit/cancel commands using real Avellaneda-Stoikov quotes.
+        """Generate submit/cancel commands using real Avellaneda-Stoikov quotes
+        driven by real causal signals.
 
-        Decision logic (per A-S spec):
-        - Compute reservation price r_t = mid + alpha - gamma * inv * sigma^2 * T
-        - Compute quote distances (bid_dist, ask_dist) with inventory skew
-        - Optimal bid = r_t - bid_dist, optimal ask = r_t + ask_dist
-        - Inventory side: if inventory > 0 reduce long (SELL only), < 0 reduce short (BUY only), = 0 both sides
-
-        Uses snapshot.inventory_lots, self.engine.book for mid/volatility,
-        and AlphaModel for the A-S calculations.
+        Pipeline (canonical AlphaModel usage, no parallel estimators):
+        - signals = self._market_state.get_snapshot() (USDC mid/spread/
+          microprice, dimensionless imbalance/momentum/volatility-sigma_ref,
+          XRP trade-flow volumes; windows pruned against the SIMULATED clock)
+        - alpha = AlphaModel.compute_alpha(signals)
+        - record_mid(now_sec, mid) once per decision cycle (contract §14),
+          THEN quote_distances(..., now_sec=simulated) — explicit sim time,
+          never wall-clock
+        - r = reservation_price(signals, alpha, inventory_XRP, sigma_ref);
+          bid = r - bid_dist, ask = r + ask_dist (USDC)
+        - USDC→ticks via engine tick_size (never bare round()); maker guard
+          against the engine's current bests (ticks); inventory side rule
+          (0→both, >0 SELL only, <0 BUY only) with delayed-replacement
+          occupancy.
         """
         commands: List[Dict[str, Any]] = []
         inventory_lots = snapshot.inventory_lots
+        eng_cfg = getattr(self.engine, "config", None)
+        tick_size = float(getattr(eng_cfg, "tick_size", 0.0001) or 0.0001)
+        qty_step = float(getattr(eng_cfg, "qty_step", 1.0) or 1.0)
+        # Explicit simulated time (seconds); quote_distances must never fall
+        # back to time.time() in offline replays.
+        now_sec = float(snapshot.ts_ms) / 1000.0
 
-        # Extract mid from engine's book if available, else fall back to bests
-        engine = getattr(self, "engine", None)
-        best_bid: float = 0.0
-        best_ask: float = 0.0
-        if engine and getattr(engine, "book", None) and engine.book:
-            bids = engine.book.get("bids", [])
-            asks = engine.book.get("asks", [])
-            if bids and asks:
-                best_bid = float(bids[0][0])
-                best_ask = float(asks[0][0])
-            mid = (best_bid + best_ask) / 2.0
-        else:
-            mid = 0.0
+        am = self._alpha_model
+        ms_snap = self._market_state.get_snapshot()
+        mid = ms_snap.get("mid") or 0.0
+        if mid <= 0:
+            return []
+        sigma_ref = max(float(ms_snap.get("volatility") or 0.0), 0.0)
 
-        # Inventory in XRP (not lots): lots * qty_step (default 1.0)
-        qty_step = getattr(self.config, "qty_step", 1.0) if self.config else 1.0
-        inventory_xrp = float(inventory_lots) * float(qty_step)
-
-        # Alpha model instance and calculations
-        am = AlphaModel()
-        alpha = 0.0
-        # Build snapshot dict for AlphaModel; use mid > 0 guard for safe compute
         snap_dict: Dict[str, object] = {
-            "mid": mid if mid > 0 else None,
-            "momentum": 0.0,
-            "imbalance": 0.0,
-            "microprice": 0.0,
-            "buy_volume_60s": 0.0,
-            "sell_volume_60s": 0.0,
-            "tick_size": getattr(self.config, "tick_size", 0.0001) if self.config else 0.0001,
-            "volatility": float(getattr(self.engine, "volatility", 0.0)) if engine and hasattr(engine, "volatility") else 0.0,
+            "mid": float(mid),
+            "spread": float(ms_snap.get("spread") or 0.0),
+            "momentum": float(ms_snap.get("momentum") or 0.0),
+            "imbalance": float(ms_snap.get("imbalance") or 0.0),
+            "microprice": float(ms_snap.get("microprice") or 0.0),
+            "buy_volume_60s": float(ms_snap.get("buy_volume_60s") or 0.0),
+            "sell_volume_60s": float(ms_snap.get("sell_volume_60s") or 0.0),
+            "tick_size": tick_size,
         }
-        if mid > 0:
-            try:
-                alpha = am.compute_alpha(snap_dict)
-            except Exception:
-                alpha = 0.0
-
-        # Reservation price and quote distances via A-S model
-        # V2: sigma already normalized to ref_s from market_state; alpha_model
-        # handles the √T scaling internally (never double √T per §0.6).
-        sigma = max(
-            float(getattr(self.engine, "volatility", 0.0)) if engine and hasattr(engine, "volatility") else 0.0,
-            1e-12,
+        inventory_xrp = float(inventory_lots) * qty_step
+        alpha = am.compute_alpha(snap_dict)
+        am.record_mid(now_sec, float(mid))
+        r = am.reservation_price(snap_dict, alpha, inventory_xrp, sigma_ref)
+        bid_dist, ask_dist = am.quote_distances(
+            snap_dict, alpha, inventory_xrp, sigma_ref, now_sec=now_sec
         )
-        r = am.reservation_price(snap_dict if mid > 0 else {}, alpha, inventory_xrp, sigma)
-        bid_dist, ask_dist = am.quote_distances(snap_dict if mid > 0 else {}, alpha, inventory_xrp, sigma)
+        as_bid_ticks = int(round((r - bid_dist) / tick_size))
+        as_ask_ticks = int(round((r + ask_dist) / tick_size))
 
-        # Optimal A-S prices: bid = r - bid_dist, ask = r + ask_dist
-        as_bid_price = r - bid_dist
-        as_ask_price = r + ask_dist
+        # Engine bests in ticks for the maker guard (post-only GTX:
+        # a quote that already crosses can never rest — don't emit it).
+        best_bid_ticks = 0
+        best_ask_ticks = 0
+        book = getattr(getattr(self, "engine", None), "book", None)
+        if book:
+            bids = book.get("bids", []) or []
+            asks = book.get("asks", []) or []
+            if bids and asks:
+                try:
+                    best_bid_ticks = int(bids[0][0])
+                    best_ask_ticks = int(asks[0][0])
+                except (IndexError, TypeError, ValueError):
+                    best_bid_ticks = 0
+                    best_ask_ticks = 0
 
-        # Helper: check if side is occupied (from previous cancel)
         def is_occupied(side: str) -> bool:
             return bool(self._side_occupied.get(side, False))
 
-        tick_size = (
-            getattr(self.config, "tick_size", 0.0001)
-            if self.config
-            else 0.0001
-        )
+        def emit(side: str, price_ticks: int) -> None:
+            commands.append(
+                {
+                    "ts_ms": int(snapshot.ts_ms),
+                    "kind": "submit",
+                    "order_id": f"{'buy' if side == 'BUY' else 'sell'}_{self._cycle_counter}",
+                    "side": side,
+                    "price_ticks": price_ticks,
+                    "qty_lots": 1,
+                }
+            )
 
-        # Build decisions using A-S prices
+        # Inventory side rule with maker guard per side.
         if inventory_lots == 0:
-            # Submit both sides at A-S optimal prices
-            if best_bid > 0 and not is_occupied("BUY") and as_bid_price > 0:
-                buy_price = int(round(as_bid_price))
-                commands.append(
-                    {
-                        "ts_ms": self._current_ts,
-                        "kind": "submit",
-                        "order_id": f"buy_{self._cycle_counter}",
-                        "side": "BUY",
-                        "price_ticks": buy_price,
-                        "qty_lots": 1,
-                    }
-                )
-            if best_ask > 0 and not is_occupied("SELL") and as_ask_price > 0:
-                sell_price = int(round(as_ask_price))
-                commands.append(
-                    {
-                        "ts_ms": self._current_ts,
-                        "kind": "submit",
-                        "order_id": f"sell_{self._cycle_counter}",
-                        "side": "SELL",
-                        "price_ticks": sell_price,
-                        "qty_lots": 1,
-                    }
-                )
+            if (best_bid_ticks > 0 and best_ask_ticks > 0
+                    and not is_occupied("BUY")
+                    and as_bid_ticks > 0 and as_bid_ticks < best_ask_ticks):
+                emit("BUY", as_bid_ticks)
+            if (best_bid_ticks > 0 and best_ask_ticks > 0
+                    and not is_occupied("SELL")
+                    and as_ask_ticks > 0 and as_ask_ticks > best_bid_ticks):
+                emit("SELL", as_ask_ticks)
         elif inventory_lots > 0:
-            # Only submit SELL (reduce long) at A-S optimal price
-            if best_ask > 0 and not is_occupied("SELL") and as_ask_price > 0:
-                sell_price = int(round(as_ask_price))
-                commands.append(
-                    {
-                        "ts_ms": self._current_ts,
-                        "kind": "submit",
-                        "order_id": f"sell_{self._cycle_counter}",
-                        "side": "SELL",
-                        "price_ticks": sell_price,
-                        "qty_lots": 1,
-                    }
-                )
-        elif inventory_lots < 0:
-            # Only submit BUY (reduce short) at A-S optimal price
-            if best_bid > 0 and not is_occupied("BUY") and as_bid_price > 0:
-                buy_price = int(round(as_bid_price))
-                commands.append(
-                    {
-                        "ts_ms": self._current_ts,
-                        "kind": "submit",
-                        "order_id": f"buy_{self._cycle_counter}",
-                        "side": "BUY",
-                        "price_ticks": buy_price,
-                        "qty_lots": 1,
-                    }
-                )
+            # Reduce long: SELL only.
+            if (best_bid_ticks > 0 and best_ask_ticks > 0
+                    and not is_occupied("SELL")
+                    and as_ask_ticks > 0 and as_ask_ticks > best_bid_ticks):
+                emit("SELL", as_ask_ticks)
+        else:
+            # Reduce short: BUY only.
+            if (best_bid_ticks > 0 and best_ask_ticks > 0
+                    and not is_occupied("BUY")
+                    and as_bid_ticks > 0 and as_bid_ticks < best_ask_ticks):
+                emit("BUY", as_bid_ticks)
 
         return commands
-        """Extract best bid from snapshot (fallback)."""
-        # The snapshot does not directly expose best_bid/best_ask;
-        # try the engine's internal book.
-        engine = getattr(self, "engine", None)
-        if engine and getattr(engine, "book", None) and engine.book:
-            bids = engine.book.get("bids", [])
-            if bids:
-                return float(bids[0][0])
-        return 0.0
-
-    def _extract_best_ask(self, snapshot: ExecutionSnapshot) -> float:
-        """Extract best ask from snapshot (fallback)."""
-        engine = getattr(self, "engine", None)
-        if engine and getattr(engine, "book", None) and engine.book:
-            asks = engine.book.get("asks", [])
-            if asks:
-                return float(asks[0][0])
-        return 0.0
 
     # ── Gap validation ──────────────────────────────────────────────────
 
@@ -494,6 +534,8 @@ class ASCoordinator:
 
             # advance_to drains expired timers (F1.2) then consumes events
             self.engine.advance_to(ts_ms, market_events_for_advance)
+            # Signal stack sees exactly what the engine consumed (F1.3)
+            self._feed_market_state(ts_ms, market_events_for_advance)
 
             # Update best bid/ask from the engine's internal book
             if getattr(self.engine, "book", None) and self.engine.book:

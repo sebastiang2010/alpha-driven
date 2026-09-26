@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **515 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **521 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (F1.2, 8/8) → **93/93 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (F1.2, 8/8) + `test_as_signals.py` (F1.3, 6/6) → **99/99 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -45,7 +45,7 @@
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**
-- Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) ~~calendario 1s→5s, ciclos sin eventos + drenar timers~~ **HECHO (F1.2)**; (3) conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup >3 muestras (`as_coordinator.py:270`, `alpha_model.py:329`); (4) flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py:324`).
+- Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) ~~calendario 1s→5s, ciclos sin eventos + drenar timers~~ **HECHO (F1.2)**; (3) ~~conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup~~ **HECHO (F1.3)** — `ASCoordinator` posee un `MarketState` real (sin WS, alimentado con los mismos eventos causales, ticks→USDC / lots→XRP con el config del engine) + un `AlphaModel` compartido (`record_mid` 1×/ciclo, `now_sec=ts_sim` explícito, `price_ticks=round(USDC/tick_size)`, guarda maker, código muerto eliminado); `test_as_signals.py` 6/6 (señales causales, conversiones no unitarias, escalado único de vol, determinismo doble corrida); (4) flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py`) — PENDIENTE (F1.4, fuera de alcance).
 - Fase 2: (5) medición integrada en `FinalResult`: equity neta, costes, valoración final, agregados de fills en cancelación, tiempo sin cotizar, exposición por lado (`execution_reconstruction.py:940`).
 - Orden propuesto + pruebas sintéticas de integración sin mockear la decisión A-S.
 
@@ -55,7 +55,7 @@
 - **Regla nueva**: NUNCA aprobar una rama por una corrida verde sin que coincida exactamente el número de tests seleccionados (`collected X items / Y deselected`) con el esperado.
 
 ## Pendientes P1+
-- (NUEVO) Investigar `test_fill_rate_deterministic_baseline_zero_fees` — riesgo "se degradó a estas simulaciones" del revisor.
+- (HALLAZGO F1.3, reportado al diseñador — NO modificado): `MarketState` comparte una sola deque de mids entre momentum (ventana 15s, poda destructiva en `_compute_momentum`) y volatilidad (ventana documentada 60s): tras cada `get_snapshot()` el historial queda acotado a ~15s, así que la ventana de 60s de sigma es inalcanzable en la práctica (en vivo y en replay). Cambiarlo altera conducta productiva e interfiere con los 3 tests de vol pre-existentes en fallo; se deja tal cual por condición de reuso, a decisión del diseñador.- (NUEVO) Investigar `test_fill_rate_deterministic_baseline_zero_fees` — riesgo "se degradó a estas simulaciones" del revisor.
 - (NUEVO) Aislar teardown en `TestF38ReplayRejectsAgedBadge` (disk-full simulado persiste entre tests).
 - Investigar bloqueo WS piloto (post-reconnect code=None); fix ping/pong user-level o watchdog (§13).
 - Rellenar placeholders T19.4 (decision-snapshot schema faltante).
