@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Sequence, Any
 
+from strategy import config as strategy_config
+
 
 # ── QueuePositionTracker ─────────────────────────────────────────────
 
@@ -328,6 +330,12 @@ class Cap25Virtual:
 
 # ── Orquestador mínimo de reconstrucción (para backtest) ─────────────
 
+#: Ventana de markout en ms: adverse_5s se evalúa contra el primer book
+#: con ts >= fill.ts_ms + MARKOUT_WINDOW_MS (Point 6: markouts vencidos
+#: se evalúan al llegar el book, aunque el fill ya haya ocurrido).
+MARKOUT_WINDOW_MS = 5000
+
+
 @dataclass
 class ReconstructionConfig:
     tick_size: float = 0.0001
@@ -494,6 +502,38 @@ class ExecutionReconstructor:
         self.book = {**b, 'ts_ms': ts_ms}
         mid_ticks = (b['bids'][0][0] + b['asks'][0][0]) / 2.0
         self.books.append({'ts_ms': ts_ms, 'mid_ticks': mid_ticks})
+        self._evaluate_pending_markouts(ts_ms)
+
+    def _markout_value(self, fill: 'ReconstructionFill', future_mid: float) -> Optional[float]:
+        """adverse_5s con signo: +1 BUY, -1 SELL. None si precio inválido."""
+        price = float(fill.price)
+        if not math.isfinite(price) or price <= 0:
+            return None
+        sign = 1.0 if fill.side == 'BUY' else -1.0
+        return sign * (float(future_mid) - price) / price
+
+    def _evaluate_pending_markouts(self, ts_ms: int) -> None:
+        """Evalúa markouts vencidos contra el primer book >= firing_time.
+
+        firing_time = fill.ts_ms + MARKOUT_WINDOW_MS. Solo evalúa fills cuyo
+        firing_time ya pasó (<= ts_ms); usa el PRIMER book en historial con
+        ts >= firing_time (ventana consolidada, no el último). Si no hay tal
+        book, el fill queda pendiente (adverse_5s=None) hasta el próximo book.
+        """
+        for f in self.fills:
+            if f.adverse_5s is not None:
+                continue
+            firing = f.ts_ms + MARKOUT_WINDOW_MS
+            if firing > ts_ms:
+                continue
+            for b in self.books:
+                if b['ts_ms'] >= firing:
+                    val = self._markout_value(f, b['mid_ticks'])
+                    if val is not None:
+                        f.adverse_5s = val
+                        self._log(ts_ms, 'markout_5s', f.order_id, trade_id=f.trade_id,
+                                  adverse_5s=val, firing_ms=firing, book_ms=b['ts_ms'])
+                    break
     
     def _process_trade_event(self, event: Dict[str, Any], ts_ms: int) -> List[Dict[str, Any]]:
         transitions = []
@@ -569,10 +609,35 @@ class ExecutionReconstructor:
         if any(x['side'] == side for x in existing):
             transitions.append(self._finish_order(oid, 'rejected_side_busy', ts_ms))
             return transitions
-        low = self.inventory_lots - sum(x['remaining_lots'] for x in existing if x['side'] == 'SELL')
-        high = self.inventory_lots + sum(x['remaining_lots'] for x in existing if x['side'] == 'BUY')
-        if max(abs(low), abs(high)) > self.config.max_position_lots:
+        # Projected position including the candidate order.
+        # Include the new order's qty according to its side.
+        candidate_qty = d['qty_lots']
+        existing_qty_se = sum(x['remaining_lots'] for x in existing if x['side'] == 'SELL')
+        existing_qty_bu = sum(x['remaining_lots'] for x in existing if x['side'] == 'BUY')
+        # Projected inventory after adding the candidate order.
+        proj_inv_low = self.inventory_lots - (existing_qty_se + candidate_qty)  # if SELL
+        proj_inv_high = self.inventory_lots + (existing_qty_bu + candidate_qty)  # if BUY
+        # Position limit in lots (includes candidate).
+        if max(abs(proj_inv_low), abs(proj_inv_high)) > self.config.max_position_lots:
             transitions.append(self._finish_order(oid, 'rejected_position_cap', ts_ms))
+            return transitions
+        # Notional limit (USDC): projected inventory notional vs MAX_POSITION_NOTIONAL_USDC.
+        # Unidades: notional = lots * qty_step [XRP] * mid_ticks * tick_size [USDC/XRP].
+        # (Bug §0.6 corregido: antes se comparaba price_ticks*qty directo contra
+        # el límite en USDC, rechazando todo.)
+        tick_size = float(self.config.tick_size)
+        qty_step = float(self.config.qty_step)
+        mid_ticks = 0.0
+        if self.book and self.book.get("bids") and self.book.get("asks"):
+            mid_ticks = (self.book["bids"][0][0] + self.book["asks"][0][0]) / 2.0
+        if mid_ticks <= 0:
+            mid_ticks = float(d.get('price_ticks', 0))
+        price_usdc = mid_ticks * tick_size
+        notional_new = price_usdc * candidate_qty * qty_step
+        current_notional = price_usdc * abs(self.inventory_lots) * qty_step
+        projected_notional = current_notional + notional_new
+        if abs(projected_notional) > float(strategy_config.MAX_POSITION_NOTIONAL_USDC):
+            transitions.append(self._finish_order(oid, 'rejected_position_notional', ts_ms))
             return transitions
         self._log(ts_ms, 'submit', oid)
         self._timer(o['arrival_ts_ms'], 'arrival', oid)
