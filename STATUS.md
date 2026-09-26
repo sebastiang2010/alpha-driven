@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **513 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **515 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (11/11) + `test_as_calendar.py` (F1.2, 8/8) → **91/91 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (F1.2, 8/8) → **93/93 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -41,6 +41,7 @@
 - `finish()` sigue cerrando en el último ts con eventos (límite de fin de datos). Sin simulaciones de mercado, sin push. Tests existentes con `decision_interval_ms=1000` explícito: intactos.
 - **4 ajustes del veredicto**: (1) `strategy/calendar.py` nuevo — `validate_interval_ms` / `cycle_grid` / `merged_steps` / `check_book_coverage`, una sola implementación para ambas rutas; `OfflineCoordinator` camina pasos fusionados (`_steps`) y valida su intervalo en el ctor; (2) `ASCoordinator._t0` = primer LIBRO (trades previos se procesan igual); (3) intervalo no entero-positivo (0, negativo, fraccionario, str, bool, None) → `ValueError` antes de la grilla, en ambas rutas; (4) cobertura de libro validada antes de la política en cada ciclo (vacío o no, haya comandos o no) — libro ausente/obsoleto invalida.
 - Tests: trade@500 previo al primer libro (t0=1000, trade consumido); intervalos inválidos ×6 en ambas rutas; ciclo vacío con libro obsoleto y política muda (invalida antes de llamarla, `calls==[]`); no-reset con inventario 5 (detectaría un reset; el 0 no); segunda ruta camina ciclo vacío 1500 y cierra en 2000.
+- **Fin de datos (ajuste)**: `OfflineCoordinator.load_events` fija cobertura SOLO con eventos públicos; comando posterior al último evento → `ValueError` explícito en carga (motor intacto, sin pasos/decisiones/drenado/cierre extendido); sin eventos de mercado → `ValueError`. Tests: comando@2500 con datos hasta 2000 rechazado; comando en el fin (2000) admitido y pasos acotados.
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**

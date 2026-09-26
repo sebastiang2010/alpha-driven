@@ -190,12 +190,26 @@ class OfflineCoordinator:
         else:
             self._t0 = self._all_timestamps[0]
 
+        # Fin de cobertura: SOLO eventos públicos (mercado). Un comando
+        # posterior al último evento público no extiende la corrida: se
+        # rechaza explícitamente aquí (nunca se descarta en silencio ni se
+        # camina fuera de cobertura). Sin eventos de mercado no hay cobertura.
+        market_ts = sorted(self._market_events_by_ts.keys())
+        if not market_ts:
+            raise ValueError(
+                'No market events: el fin de cobertura es indefinido')
+        coverage_end = market_ts[-1]
+        late = sorted(ts for ts in self._commands_by_ts.keys()
+                      if ts > coverage_end)
+        if late:
+            raise ValueError(
+                f'Comandos fuera de cobertura (fin={coverage_end}ms): {late}. '
+                'Ningún paso puede exceder el último evento público.')
+
         # F1.2: pasos fusionados con el MISMO calendario compartido que
         # ASCoordinator (ciclos t0+k*D dentro de cobertura ∪ ts con datos).
         # Los ciclos sin eventos avanzan igual (drenan timers, pueden decidir).
-        # t0 ya quedó fijado al primer libro arriba.
-        market_ts = sorted(self._market_events_by_ts.keys())
-        coverage_end = market_ts[-1] if market_ts else self._all_timestamps[-1]
+        # t0 ya quedó fijado al primer libro arriba; todo ts <= coverage_end.
         assert self._t0 is not None
         self._steps = merged_steps(self._all_timestamps, self._t0,
                                    self.cfg.cycle_interval_ms, coverage_end)

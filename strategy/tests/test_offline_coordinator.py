@@ -205,6 +205,32 @@ class TestCoordinatorEngineCompatibility(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"interval={bad!r}"):
                 OfflineCoordinator(_test_config(cycle_interval_ms=bad))
 
+    def test_command_beyond_coverage_rejected_before_advancing(self):
+        """Datos públicos hasta 2000 + comando a 2500: se rechaza en carga,
+        antes de avanzar (motor intacto: sin pasos, sin decisiones, sin
+        drenado de timers, sin cierre extendido)."""
+        coord = OfflineCoordinator(_test_config())
+        with self.assertRaises(ValueError) as ctx:
+            coord.load_events(
+                [_book(1000, 10000, 10001, 1, 0),
+                 _book(2000, 10000, 10001, 2, 1)],
+                [_submit(2500, 'late', 'BUY', 10000, 5)],
+            )
+        self.assertIn('2500', str(ctx.exception))
+        self.assertEqual(coord.engine.books, [])
+        self.assertEqual(coord.engine.fills, [])
+        self.assertEqual(coord._current_idx, 0)
+
+    def test_command_at_coverage_end_accepted(self):
+        """Comando exactamente en el fin de cobertura (2000) sí se admite."""
+        coord = OfflineCoordinator(_test_config())
+        coord.load_events(
+            [_book(1000, 10000, 10001, 1, 0),
+             _book(2000, 10000, 10001, 2, 1)],
+            [_submit(2000, 'o1', 'BUY', 10000, 5)],
+        )
+        self.assertLessEqual(coord._steps[-1], 2000)
+
 
 if __name__ == '__main__':
     unittest.main()
