@@ -44,6 +44,22 @@ class Command:
     data: Dict[str, Any]
 
 
+def flatten_event(event: MarketEvent) -> Dict[str, Any]:
+    """Frontera única coordinador→motor: MarketEvent a dict plano.
+
+    El motor (ExecutionReconstructor.advance_to/apply_commands) habla solo
+    el protocolo dict (`e.get('ts_ms')`, `e['kind']`, resto de campos en
+    el nivel superior). Toda conversión pasa por aquí y por
+    flatten_command; nunca se entregan dataclasses al motor.
+    """
+    return {'ts_ms': event.ts_ms, 'kind': event.kind, **event.data}
+
+
+def flatten_command(command: Command) -> Dict[str, Any]:
+    """Frontera única coordinador→motor para comandos (ver flatten_event)."""
+    return {'ts_ms': command.ts_ms, 'kind': command.kind, **command.data}
+
+
 @dataclass
 class CoordinatorConfig:
     """Configuración del coordinador offline."""
@@ -202,16 +218,19 @@ class OfflineCoordinator:
                     self.warmup.warmup_complete = True
                     self.warmup.warmup_end_ts = ts_ms
     
+    def _get_market_events_for_ts(self, ts_ms: int) -> List[MarketEvent]:
+        """Todos los eventos de mercado del timestamp, en orden de carga.
+
+        Conserva cada evento (incluidos varios libros con el mismo ts);
+        el motor los ordena por prioridad con sort estable.
+        """
+        return list(self._market_events_by_ts.get(ts_ms, []))
+
     def _get_book_for_ts(self, ts_ms: int) -> Optional[Dict[str, Any]]:
-        """Obtiene el último libro válido para un timestamp."""
+        """Último libro del timestamp (solo para warm-up, no para el motor)."""
         events = self._market_events_by_ts.get(ts_ms, [])
         books = [e.data for e in events if e.kind == 'book']
         return books[-1] if books else None
-    
-    def _get_trades_for_ts(self, ts_ms: int) -> List[Dict[str, Any]]:
-        """Obtiene todos los trades para un timestamp."""
-        events = self._market_events_by_ts.get(ts_ms, [])
-        return [e.data for e in events if e.kind == 'trade']
     
     def _get_commands_for_ts(self, ts_ms: int) -> List[Command]:
         """Obtiene comandos para un timestamp."""
@@ -231,22 +250,18 @@ class OfflineCoordinator:
             raise ValueError('No more timestamps to process')
         
         ts_ms = self._all_timestamps[self._current_idx]
-        
+
         # Validar timestamp no regresivo
         if ts_ms < self._last_processed_ts:
             raise ValueError(f'Regressive timestamp: {ts_ms} < {self._last_processed_ts}')
-        
-        # Preparar eventos de mercado para este timestamp
-        market_events = []
+
+        # Todos los eventos del timestamp, aplanados al protocolo dict del motor.
+        # Se conserva cada evento y su orden de carga (varios libros con el
+        # mismo ts incluidos); el motor aplica sort estable por prioridad.
+        market_events = [flatten_event(e) for e in self._get_market_events_for_ts(ts_ms)]
+
+        # Actualizar warm-up con el último libro (solo mid, no consume eventos)
         book_data = self._get_book_for_ts(ts_ms)
-        trades = self._get_trades_for_ts(ts_ms)
-        
-        if book_data:
-            market_events.append(MarketEvent(ts_ms, 'book', book_data))
-        for trade in trades:
-            market_events.append(MarketEvent(ts_ms, 'trade', trade))
-        
-        # Actualizar warm-up
         self._update_warmup(ts_ms, book_data)
         
         # advance_to con eventos de mercado
@@ -280,12 +295,9 @@ class OfflineCoordinator:
             if cmd.ts_ms != ts_ms:
                 raise ValueError(f'Command timestamp {cmd.ts_ms} != {ts_ms}')
         
-        # Convertir Command a dict para el motor
-        cmd_dicts = [
-            {'ts_ms': cmd.ts_ms, 'kind': cmd.kind, **cmd.data}
-            for cmd in commands
-        ]
-        
+        # Convertir Command a dict plano vía la frontera única
+        cmd_dicts = [flatten_command(cmd) for cmd in commands]
+
         return self.engine.apply_commands(ts_ms, cmd_dicts)
     
     def get_state(self) -> ExecutionSnapshot:
