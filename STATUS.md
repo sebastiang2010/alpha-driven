@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **480 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **488 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 (markouts 5s)**: `test_execution_reconstruction_markout_backfill.py` **4/4 OK** + `test_execution_reconstruction.py` + `test_as_coordinator.py` → **58/58 OK** en el área tocada
+  - **Point 6 + ajustes del veredicto**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 5/5) + `test_as_coordinator.py` → **66/66 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -17,6 +17,12 @@
 - Bug de unidades corregido en `_process_submit` (§0.6): el check nocional comparaba `price_ticks×qty` contra USDC 25.0 (rechazaba todo); ahora `lots×qty_step×mid_ticks×tick_size`.
 - Tests reparados: `test_equivalence_position_cap` (qty 60→10 para no pisar el check nocional que `Replay` no tiene), `TestPositionLimitCandidate` (eliminado `apply_commands` duplicado + trade qty que supera la cola FIFO + removida línea muerta que subindexaba el dataclass).
 - Sin regresiones: mismos 9 fallos pre-existentes con y sin mis cambios (verificado por stash).
+
+## Ajustes del veredicto (2026-09-26, hecho — 66/66 área, 488/9 suite)
+1. **Reservas por lado**: la candidata solo ensancha el extremo que puede empeorar (SELL→low, BUY→high); vender en largo / comprar en corto al límite se acepta (`TestReduceOnlyLimits`: 5 tests, largo/corto/aumento-bloqueado).
+2. **Nocional configurable y direccional**: usa `ReconstructionConfig.max_notional` (default 25.0) sobre `max(|low|,|high|)` direccionales; la reducción no se bloquea (test inv +20 vende 5 OK; `max_notional=5.0` rechaza 10 lots que con 25.0 pasa).
+3. **Tolerancia y motivos de markout** (criterio `Replay.markouts(tolerance_ms=500)`): `MARKOUT_TOLERANCE_MS=500`, `ReconstructionFill.markout_reason` (`pending|ok|late_book|end_of_data`); `finish()` cierra pendientes como `end_of_data`. Filtro de equivalencia ampliado a eventos `markout_*` (incremental-only, igual que `fill`).
+- Tests nuevos: `late_book` (book 900ms tarde → sin valor), `end_of_data` (finish sin cobertura), `ok` en firing exacto.
 
 ## Disciplina de evidencia (lección registrada)
 - El task previo reportó "63/63" en un worktree mutado (archivos fantasma, `.venv` externo). Rerun canónico encontró 137 deseleccionados y 9 fallos que mi comando original no veía.

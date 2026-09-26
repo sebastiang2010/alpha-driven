@@ -264,8 +264,9 @@ class TestIncrementalInterface(unittest.TestCase):
         # We compare the subset of events that both have
         orig_events = [(j['event'], j.get('order_id'), j.get('ts_ms')) for j in original.journal]
         inc_events = [(j['event'], j.get('order_id'), j.get('ts_ms')) for j in reconstructor.journal]
-        # Filter out 'fill' events from incremental for comparison
-        inc_events_filtered = [e for e in inc_events if e[0] != 'fill']
+        # Filter out incremental-only events for comparison ('fill' + 'markout_*':
+        # Replay.run() no registra markouts; Replay.markouts() es post-hoc)
+        inc_events_filtered = [e for e in inc_events if e[0] != 'fill' and not e[0].startswith('markout')]
         self.assertEqual(orig_events, inc_events_filtered)
         
         # Orders (compare all orders)
@@ -1129,6 +1130,92 @@ class TestPositionLimitCandidate(unittest.TestCase):
         # This test documents the behavioral change; it does not assert a crash
         # since the original code is being retained for comparison.
         pass  # Behavior documented above; test verifies fix is in place via test_candidate_order_included
+
+
+def _book(ts_ms, bid, ask, update_id, pu):
+    return {"ts_ms": ts_ms, "kind": "book", "bids": [[bid, 10]],
+            "asks": [[ask, 100]], "update_id": update_id, "pu": pu}
+
+
+def _submit(ts_ms, order_id, side, price, qty):
+    return {"ts_ms": ts_ms, "kind": "submit", "order_id": order_id,
+            "side": side, "price_ticks": price, "qty_lots": qty}
+
+
+def _trade(ts_ms, trade_id, price, qty, buyer_maker):
+    return {"ts_ms": ts_ms, "kind": "trade", "trade_id": trade_id,
+            "price_ticks": price, "qty_lots": qty, "is_buyer_maker": buyer_maker}
+
+
+class TestReduceOnlyLimits(unittest.TestCase):
+    """Veredicto: las reducciones (vender en largo, comprar en corto) nunca
+    se bloquean por límites; el nocional respeta ReconstructionConfig."""
+
+    def _rec(self, **kw):
+        kw.setdefault("max_gap_ms", 60000)
+        kw.setdefault("max_book_age_ms", 60000)
+        return ExecutionReconstructor(ReconstructionConfig(**kw))
+
+    def _fill_buy(self, rec, qty, order_id="b", trade_id="t"):
+        """Inventario +qty vía BUY fill. qa bids=10 -> trade qty>10."""
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, order_id, "BUY", 10000, qty)])
+        rec.advance_to(1040, [])
+        rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
+                              _trade(1100, trade_id, 10000, 10 + qty, True)])
+
+    def _fill_sell(self, rec, qty, order_id="s", trade_id="t"):
+        """Inventario -qty vía SELL fill. qa asks=100 -> trade qty>100."""
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, order_id, "SELL", 10001, qty)])
+        rec.advance_to(1040, [])
+        rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
+                              _trade(1100, trade_id, 10001, 100 + qty, False)])
+
+    def test_sell_reduces_long_at_limit(self):
+        """Inv +5, límite 5: vender 1 (-> +4) debe aceptarse, no rechazarse."""
+        rec = self._rec(max_position_lots=5)
+        self._fill_buy(rec, 5)
+        self.assertEqual(rec.inventory_lots, 5)
+        d = rec.apply_commands(1100, [_submit(1100, "s1", "SELL", 10001, 1)])
+        self.assertEqual(rec.orders["s1"]["status"], "pending")
+        self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
+
+    def test_buy_reduces_short_at_limit(self):
+        """Inv -5, límite 5: comprar 1 (-> -4) debe aceptarse, no rechazarse."""
+        rec = self._rec(max_position_lots=5)
+        self._fill_sell(rec, 5)
+        self.assertEqual(rec.inventory_lots, -5)
+        d = rec.apply_commands(1100, [_submit(1100, "b1", "BUY", 10000, 1)])
+        self.assertEqual(rec.orders["b1"]["status"], "pending")
+        self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
+
+    def test_increase_beyond_limit_still_rejected(self):
+        """Inv +5, límite 5: comprar 1 (-> +6) sigue rechazado por cap."""
+        rec = self._rec(max_position_lots=5)
+        self._fill_buy(rec, 5)
+        rec.apply_commands(1100, [_submit(1100, "b2", "BUY", 10000, 1)])
+        self.assertEqual(rec.orders["b2"]["status"], "rejected_position_cap")
+
+    def test_notional_respects_experiment_config(self):
+        """max_notional configurable: 10 lots (~10 USDC) pasa con 25 pero no con 5."""
+        rec = self._rec(max_notional=5.0)
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "o1", "BUY", 10000, 10)])
+        self.assertEqual(rec.orders["o1"]["status"], "rejected_position_notional")
+        rec_ok = self._rec()  # default max_notional=25.0
+        rec_ok.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec_ok.apply_commands(1000, [_submit(1000, "o1", "BUY", 10000, 10)])
+        self.assertEqual(rec_ok.orders["o1"]["status"], "pending")
+
+    def test_notional_does_not_block_reduction(self):
+        """Inv +20 ($20 < $25): vender 5 (extremos 15..20) debe aceptarse."""
+        rec = self._rec(max_position_lots=100)
+        self._fill_buy(rec, 20, order_id="b", trade_id="t")
+        self.assertEqual(rec.inventory_lots, 20)
+        d = rec.apply_commands(1100, [_submit(1100, "s1", "SELL", 10001, 5)])
+        self.assertEqual(rec.orders["s1"]["status"], "pending")
+        self.assertFalse(any(t["to_status"].startswith("rejected") for t in d.order_transitions))
 
 
 if __name__ == "__main__":

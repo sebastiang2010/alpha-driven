@@ -137,6 +137,34 @@ class TestMarkoutBackfill(unittest.TestCase):
         assert fill.adverse_5s is not None
         self.assertAlmostEqual(fill.adverse_5s, expected, places=10)
 
+    def test_late_book_marks_reason_without_value(self):
+        """Primer book >= firing llega 900ms tarde (> tolerancia 500):
+        motivo 'late_book', adverse_5s None (criterio Replay.markouts)."""
+        rec = self._make_rec()
+        fill = self._submit_and_fill(rec, 1100, uid_start=1)
+        # firing = 6100; primer book >= firing en 7000 (900ms tarde)
+        rec.advance_to(7000, [_book(7000, 9980, 9981, 3, 2)])
+        self.assertEqual(fill.markout_reason, "late_book")
+        self.assertIsNone(fill.adverse_5s)
+
+    def test_end_of_data_marks_reason_at_finish(self):
+        """Sin book >= firing al cerrar la captura: 'end_of_data'."""
+        rec = self._make_rec()
+        fill = self._submit_and_fill(rec, 1100, uid_start=1)
+        rec.advance_to(3000, [_book(3000, 9990, 9991, 3, 2)])
+        self.assertEqual(fill.markout_reason, "pending")
+        rec.finish(3000)
+        self.assertEqual(fill.markout_reason, "end_of_data")
+        self.assertIsNone(fill.adverse_5s)
+
+    def test_ok_reason_on_timely_book(self):
+        """Book exactamente en firing -> motivo 'ok' con valor."""
+        rec = self._make_rec()
+        fill = self._submit_and_fill(rec, 1100, uid_start=1)
+        rec.advance_to(6100, [_book(6100, 9990, 9991, 3, 2)])
+        self.assertEqual(fill.markout_reason, "ok")
+        self.assertIsNotNone(fill.adverse_5s)
+
 
 if __name__ == "__main__":
     unittest.main()

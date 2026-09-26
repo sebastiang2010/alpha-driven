@@ -23,8 +23,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Sequence, Any
 
-from strategy import config as strategy_config
-
 
 # ── QueuePositionTracker ─────────────────────────────────────────────
 
@@ -335,6 +333,11 @@ class Cap25Virtual:
 #: se evalúan al llegar el book, aunque el fill ya haya ocurrido).
 MARKOUT_WINDOW_MS = 5000
 
+#: Tolerancia máxima entre firing_time y el primer book disponible (igual
+#: criterio que Replay.markouts(tolerance_ms=500)): si el book llega más
+#: tarde, motivo 'late_book' y adverse_5s queda None.
+MARKOUT_TOLERANCE_MS = 500
+
 
 @dataclass
 class ReconstructionConfig:
@@ -373,6 +376,7 @@ class ReconstructionFill:
     inventory_after: float
     mid_at_fill: float
     adverse_5s: Optional[float] = None  # (future_mid - fill_price)/fill_price con signo
+    markout_reason: str = 'pending'  # pending | ok | late_book | end_of_data (criterio Replay.markouts)
     order_id: Optional[str] = None
     trade_id: Optional[str] = None
 
@@ -517,22 +521,32 @@ class ExecutionReconstructor:
 
         firing_time = fill.ts_ms + MARKOUT_WINDOW_MS. Solo evalúa fills cuyo
         firing_time ya pasó (<= ts_ms); usa el PRIMER book en historial con
-        ts >= firing_time (ventana consolidada, no el último). Si no hay tal
-        book, el fill queda pendiente (adverse_5s=None) hasta el próximo book.
+        ts >= firing_time (ventana consolidada, no el último). Mismo criterio
+        que Replay.markouts(tolerance_ms=500):
+        - book_ts - firing <= tolerancia -> 'ok', adverse_5s valuado;
+        - si el primer book útil llega más tarde -> 'late_book', adverse None.
+        Si no hay tal book, el fill queda 'pending' hasta el próximo book o
+        finish() (que lo cierra como 'end_of_data').
         """
         for f in self.fills:
-            if f.adverse_5s is not None:
+            if f.markout_reason != 'pending':
                 continue
             firing = f.ts_ms + MARKOUT_WINDOW_MS
             if firing > ts_ms:
                 continue
             for b in self.books:
                 if b['ts_ms'] >= firing:
-                    val = self._markout_value(f, b['mid_ticks'])
-                    if val is not None:
-                        f.adverse_5s = val
+                    if b['ts_ms'] - firing > MARKOUT_TOLERANCE_MS:
+                        f.markout_reason = 'late_book'
+                        self._log(ts_ms, 'markout_late_book', f.order_id, trade_id=f.trade_id,
+                                  firing_ms=firing, book_ms=b['ts_ms'])
+                    else:
+                        val = self._markout_value(f, b['mid_ticks'])
+                        if val is not None:
+                            f.adverse_5s = val
+                        f.markout_reason = 'ok'
                         self._log(ts_ms, 'markout_5s', f.order_id, trade_id=f.trade_id,
-                                  adverse_5s=val, firing_ms=firing, book_ms=b['ts_ms'])
+                                  adverse_5s=f.adverse_5s, firing_ms=firing, book_ms=b['ts_ms'])
                     break
     
     def _process_trade_event(self, event: Dict[str, Any], ts_ms: int) -> List[Dict[str, Any]]:
@@ -609,22 +623,29 @@ class ExecutionReconstructor:
         if any(x['side'] == side for x in existing):
             transitions.append(self._finish_order(oid, 'rejected_side_busy', ts_ms))
             return transitions
-        # Projected position including the candidate order.
-        # Include the new order's qty according to its side.
+        # Projected position including the candidate order, side-aware.
+        # Solo el extremo que la candidata puede empeorar incluye su qty:
+        # SELL solo puede llevar el inventario hacia abajo, BUY hacia arriba.
+        # Una reducción (vender en largo, comprar en corto) nunca se bloquea.
         candidate_qty = d['qty_lots']
         existing_qty_se = sum(x['remaining_lots'] for x in existing if x['side'] == 'SELL')
         existing_qty_bu = sum(x['remaining_lots'] for x in existing if x['side'] == 'BUY')
-        # Projected inventory after adding the candidate order.
-        proj_inv_low = self.inventory_lots - (existing_qty_se + candidate_qty)  # if SELL
-        proj_inv_high = self.inventory_lots + (existing_qty_bu + candidate_qty)  # if BUY
-        # Position limit in lots (includes candidate).
+        if side == 'SELL':
+            proj_inv_low = self.inventory_lots - (existing_qty_se + candidate_qty)
+            proj_inv_high = self.inventory_lots + existing_qty_bu
+        else:  # BUY
+            proj_inv_low = self.inventory_lots - existing_qty_se
+            proj_inv_high = self.inventory_lots + (existing_qty_bu + candidate_qty)
+        # Position limit in lots (includes candidate on its side only).
         if max(abs(proj_inv_low), abs(proj_inv_high)) > self.config.max_position_lots:
             transitions.append(self._finish_order(oid, 'rejected_position_cap', ts_ms))
             return transitions
-        # Notional limit (USDC): projected inventory notional vs MAX_POSITION_NOTIONAL_USDC.
+        # Notional limit (USDC) on the same directional extremes, using the
+        # experiment config (max_notional), not the global budget.
         # Unidades: notional = lots * qty_step [XRP] * mid_ticks * tick_size [USDC/XRP].
         # (Bug §0.6 corregido: antes se comparaba price_ticks*qty directo contra
-        # el límite en USDC, rechazando todo.)
+        # el límite en USDC, rechazando todo; luego sumaba |inv|+candidata,
+        # bloqueando reducciones.)
         tick_size = float(self.config.tick_size)
         qty_step = float(self.config.qty_step)
         mid_ticks = 0.0
@@ -633,10 +654,8 @@ class ExecutionReconstructor:
         if mid_ticks <= 0:
             mid_ticks = float(d.get('price_ticks', 0))
         price_usdc = mid_ticks * tick_size
-        notional_new = price_usdc * candidate_qty * qty_step
-        current_notional = price_usdc * abs(self.inventory_lots) * qty_step
-        projected_notional = current_notional + notional_new
-        if abs(projected_notional) > float(strategy_config.MAX_POSITION_NOTIONAL_USDC):
+        worst_lots = max(abs(proj_inv_low), abs(proj_inv_high))
+        if price_usdc * worst_lots * qty_step > float(self.config.max_notional):
             transitions.append(self._finish_order(oid, 'rejected_position_notional', ts_ms))
             return transitions
         self._log(ts_ms, 'submit', oid)
@@ -891,6 +910,14 @@ class ExecutionReconstructor:
                 'status': o['status'],
             })
         
+        # Cerrar markouts sin cobertura: sin book >= firing_time al fin de
+        # la captura -> 'end_of_data' (mismo criterio que Replay.markouts).
+        for f in self.fills:
+            if f.markout_reason == 'pending':
+                f.markout_reason = 'end_of_data'
+                self._log(observed_end_ms, 'markout_end_of_data', f.order_id,
+                          trade_id=f.trade_id, firing_ms=f.ts_ms + MARKOUT_WINDOW_MS)
+
         self._finished = True
         
         return FinalResult(
