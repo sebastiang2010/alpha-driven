@@ -65,6 +65,38 @@ class TestFlattenBoundary(unittest.TestCase):
             d, {'ts_ms': 1000, 'kind': 'submit', 'order_id': 'o1',
                 'side': 'BUY', 'price_ticks': 10000, 'qty_lots': 5})
 
+    def test_flatten_event_rejects_reserved_keys_in_data(self):
+        """data con 'kind' (p. ej. submit camuflado) se rechaza, no se resuelve."""
+        bad = MarketEvent(1000, 'book', {'kind': 'submit', 'bids': [[10000, 10]],
+                                         'asks': [[10001, 100]],
+                                         'update_id': 1, 'pu': 0})
+        with self.assertRaises(ValueError):
+            flatten_event(bad)
+        bad_ts = MarketEvent(1000, 'book', {'ts_ms': 2000, 'bids': [[10000, 10]],
+                                            'asks': [[10001, 100]],
+                                            'update_id': 1, 'pu': 0})
+        with self.assertRaises(ValueError):
+            flatten_event(bad_ts)
+
+    def test_flatten_command_rejects_reserved_keys_in_data(self):
+        """Un 'cancel' con kind=submit en data se rechaza explícitamente."""
+        bad = Command(1000, 'cancel', {'kind': 'submit', 'order_id': 'o1'})
+        with self.assertRaises(ValueError):
+            flatten_command(bad)
+
+    def test_coordinator_rejects_before_touching_engine(self):
+        """El rechazo ocurre en la frontera: el motor queda intacto."""
+        coord = OfflineCoordinator(_test_config())
+        coord.load_events([
+            MarketEvent(1000, 'book', {'kind': 'trade', 'bids': [[10000, 10]],
+                                       'asks': [[10001, 100]],
+                                       'update_id': 1, 'pu': 0}),
+        ])
+        with self.assertRaises(ValueError):
+            coord.advance_to_next_timestamp()
+        self.assertEqual(coord.engine.books, [])
+        self.assertEqual(coord.engine.fills, [])
+
 
 class TestCoordinatorEngineCompatibility(unittest.TestCase):
     """Eventos y comandos del coordinador contra el motor real."""

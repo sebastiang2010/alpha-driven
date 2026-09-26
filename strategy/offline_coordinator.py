@@ -44,6 +44,19 @@ class Command:
     data: Dict[str, Any]
 
 
+#: Claves reservadas del protocolo motor: el contenido `data` nunca puede
+#: traerlas; si las trae se rechaza explícitamente (nunca override silencioso).
+_RESERVED_KEYS = ('ts_ms', 'kind')
+
+
+def _reject_reserved(what: str, data: Dict[str, Any]) -> None:
+    clashes = [k for k in _RESERVED_KEYS if k in data]
+    if clashes:
+        raise ValueError(
+            f'{what} data contiene claves reservadas {clashes}: '
+            'ts_ms/kind los fija el coordinador, no el contenido')
+
+
 def flatten_event(event: MarketEvent) -> Dict[str, Any]:
     """Frontera única coordinador→motor: MarketEvent a dict plano.
 
@@ -52,11 +65,13 @@ def flatten_event(event: MarketEvent) -> Dict[str, Any]:
     el nivel superior). Toda conversión pasa por aquí y por
     flatten_command; nunca se entregan dataclasses al motor.
     """
+    _reject_reserved('MarketEvent', event.data)
     return {'ts_ms': event.ts_ms, 'kind': event.kind, **event.data}
 
 
 def flatten_command(command: Command) -> Dict[str, Any]:
     """Frontera única coordinador→motor para comandos (ver flatten_event)."""
+    _reject_reserved('Command', command.data)
     return {'ts_ms': command.ts_ms, 'kind': command.kind, **command.data}
 
 

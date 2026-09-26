@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **498 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **501 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes del veredicto + F1.1**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9) + `test_as_coordinator.py` + `test_offline_coordinator.py` (F1.1, 6/6) → **76/76 OK** en el área tocada
+  - **Point 6 + ajustes del veredicto + F1.1**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9) + `test_as_coordinator.py` + `test_offline_coordinator.py` (F1.1, 9/9) → **79/79 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -31,7 +31,7 @@
 ## F1.1 — coordinador e interfaz unificados (2026-09-26, hecho — 76/76 área, 498/9 suite)
 - `strategy/offline_coordinator.py`: frontera única `flatten_event`/`flatten_command` (MarketEvent/Command → dict plano, el único protocolo que `ExecutionReconstructor` acepta). Antes se entregaban dataclasses al motor (`e.get` → AttributeError).
 - `advance_to_next_timestamp` conserva TODOS los eventos del ts en orden de carga (varios libros mismo ts incluidos; el motor aplica sort estable por prioridad). `_get_book_for_ts` queda solo para warm-up; eliminado `_get_trades_for_ts` en desuso; `apply_policy_commands` usa `flatten_command`.
-- Tests sintéticos nuevos `strategy/tests/test_offline_coordinator.py` (6/6): protocolo flatten, varios libros mismo ts en orden, submit→fill→finish end-to-end, `run_full` con policy_fn, factory desde filas crudas.
+- Tests sintéticos nuevos `strategy/tests/test_offline_coordinator.py` (9/9): protocolo flatten, varios libros mismo ts en orden, submit→fill→finish end-to-end, `run_full` con policy_fn, factory desde filas crudas, rechazo de claves reservadas (`ts_ms`/`kind` en data → `ValueError` antes de tocar el motor).
 - Sin regresiones: mismos 9 fallos pre-existentes. Sin simulaciones de mercado, sin push (F1.2+ pendientes de revisión).
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
