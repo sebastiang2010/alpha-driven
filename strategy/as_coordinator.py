@@ -13,6 +13,7 @@ from strategy.execution_reconstruction import (
     FinalResult,
     ReconstructionConfig,
 )
+from strategy.alpha_model import AlphaModel
 
 
 # ── Coordinator configuration ─────────────────────────────────────────
@@ -20,7 +21,7 @@ from strategy.execution_reconstruction import (
 @dataclass
 class ASCoordinatorConfig:
     """Configuración del ASCoordinator."""
-    decision_interval_ms: int = 1000
+    decision_interval_ms: int = 5000
     warmup_intervals: int = 3
     max_gap_ratio: float = 2.0
 
@@ -33,10 +34,12 @@ class ASCoordinator:
     The ExecutionReconstructor is a black box.
 
     Responsibilities:
-    - Owns the deterministic calendar: t0 + k*D (D = decision_interval_ms)
-    - Interleaves A-S cycles with market groups without skipping trades or books
+    - Owns the deterministic calendar: t0 + k*D (D = decision_interval_ms, default 5s)
+    - Walks the merged calendar (scheduled cycles ∪ event timestamps): cycles run
+      even without market events (empty advance drains expired timers first),
+      and no trade/book is ever skipped
     - Warm-up: requires warmup_intervals mids with positive intervals (mid prices strictly increase)
-    - No decisions after EOF; gaps invalidate the run without resetting inventory
+    - No decisions after EOF; event gaps invalidate the run without resetting inventory
     - Event group closes completely before delivering; never filters future to policy
     - Delayed replacement: if a decision cancels a side, that side stays "occupied"
       until the next scheduled cycle (no immediate re-submit).
@@ -48,7 +51,7 @@ class ASCoordinator:
         engine: ExecutionReconstructor,
         depth_csv: Sequence[Dict[str, Any]],
         trades_csv: Sequence[Dict[str, Any]],
-        decision_interval_ms: int = 1000,
+        decision_interval_ms: int = 5000,
         warmup_intervals: int = 3,
     ):
         self.config = config
@@ -242,26 +245,77 @@ class ASCoordinator:
                 f"out of {len(self._warmup_mids)} sampled mids."
             )
 
-    # ── A-S decision placeholder ────────────────────────────────────────
-
+    # ── A-S decision using AlphaModel ─────────────────────────────────
     def _as_decision(self, snapshot: ExecutionSnapshot) -> List[Dict[str, Any]]:
-        """Placeholder A-S decision: generate submit/cancel commands based on snapshot.
+        """Generate submit/cancel commands using real Avellaneda-Stoikov quotes.
 
-        Decision logic (per spec):
-        - inventory == 0: submit 1 BUY and 1 SELL at best bid/ask ± 1 tick
-        - inventory > 0: only submit SELL (reduce long)
-        - inventory < 0: only submit BUY (reduce short)
+        Decision logic (per A-S spec):
+        - Compute reservation price r_t = mid + alpha - gamma * inv * sigma^2 * T
+        - Compute quote distances (bid_dist, ask_dist) with inventory skew
+        - Optimal bid = r_t - bid_dist, optimal ask = r_t + ask_dist
+        - Inventory side: if inventory > 0 reduce long (SELL only), < 0 reduce short (BUY only), = 0 both sides
 
-        Uses state().best_bid, state().best_ask, state().inventory_lots.
-        Respects _side_occupied: if a side was cancelled, it stays occupied
-        until the next scheduled cycle and is not re-submitted immediately.
+        Uses snapshot.inventory_lots, self.engine.book for mid/volatility,
+        and AlphaModel for the A-S calculations.
         """
         commands: List[Dict[str, Any]] = []
-        inventory = snapshot.inventory_lots
+        inventory_lots = snapshot.inventory_lots
 
-        # Determine best bid/ask: prefer coordinator's tracking, fall back to engine's book
-        best_bid = self._best_bid if self._best_bid > 0 else self._extract_best_bid(snapshot)
-        best_ask = self._best_ask if self._best_ask > 0 else self._extract_best_ask(snapshot)
+        # Extract mid from engine's book if available, else fall back to bests
+        engine = getattr(self, "engine", None)
+        best_bid: float = 0.0
+        best_ask: float = 0.0
+        if engine and getattr(engine, "book", None) and engine.book:
+            bids = engine.book.get("bids", [])
+            asks = engine.book.get("asks", [])
+            if bids and asks:
+                best_bid = float(bids[0][0])
+                best_ask = float(asks[0][0])
+            mid = (best_bid + best_ask) / 2.0
+        else:
+            mid = 0.0
+
+        # Inventory in XRP (not lots): lots * qty_step (default 1.0)
+        qty_step = getattr(self.config, "qty_step", 1.0) if self.config else 1.0
+        inventory_xrp = float(inventory_lots) * float(qty_step)
+
+        # Alpha model instance and calculations
+        am = AlphaModel()
+        alpha = 0.0
+        # Build snapshot dict for AlphaModel; use mid > 0 guard for safe compute
+        snap_dict: Dict[str, object] = {
+            "mid": mid if mid > 0 else None,
+            "momentum": 0.0,
+            "imbalance": 0.0,
+            "microprice": 0.0,
+            "buy_volume_60s": 0.0,
+            "sell_volume_60s": 0.0,
+            "tick_size": getattr(self.config, "tick_size", 0.0001) if self.config else 0.0001,
+            "volatility": float(getattr(self.engine, "volatility", 0.0)) if engine and hasattr(engine, "volatility") else 0.0,
+        }
+        if mid > 0:
+            try:
+                alpha = am.compute_alpha(snap_dict)
+            except Exception:
+                alpha = 0.0
+
+        # Reservation price and quote distances via A-S model
+        # V2: sigma already normalized to ref_s from market_state; alpha_model
+        # handles the √T scaling internally (never double √T per §0.6).
+        sigma = max(
+            float(getattr(self.engine, "volatility", 0.0)) if engine and hasattr(engine, "volatility") else 0.0,
+            1e-12,
+        )
+        r = am.reservation_price(snap_dict if mid > 0 else {}, alpha, inventory_xrp, sigma)
+        bid_dist, ask_dist = am.quote_distances(snap_dict if mid > 0 else {}, alpha, inventory_xrp, sigma)
+
+        # Optimal A-S prices: bid = r - bid_dist, ask = r + ask_dist
+        as_bid_price = r - bid_dist
+        as_ask_price = r + ask_dist
+
+        # Helper: check if side is occupied (from previous cancel)
+        def is_occupied(side: str) -> bool:
+            return bool(self._side_occupied.get(side, False))
 
         tick_size = (
             getattr(self.config, "tick_size", 0.0001)
@@ -269,15 +323,11 @@ class ASCoordinator:
             else 0.0001
         )
 
-        # Helper: check if side is occupied (from previous cancel)
-        def is_occupied(side: str) -> bool:
-            return bool(self._side_occupied.get(side, False))
-
-        # Build decisions
-        if inventory == 0:
-            # Submit 1 BUY and 1 SELL at best bid/ask ± 1 tick
-            if best_bid > 0 and not is_occupied("BUY"):
-                buy_price = int(round(best_bid - tick_size))
+        # Build decisions using A-S prices
+        if inventory_lots == 0:
+            # Submit both sides at A-S optimal prices
+            if best_bid > 0 and not is_occupied("BUY") and as_bid_price > 0:
+                buy_price = int(round(as_bid_price))
                 commands.append(
                     {
                         "ts_ms": self._current_ts,
@@ -288,8 +338,8 @@ class ASCoordinator:
                         "qty_lots": 1,
                     }
                 )
-            if best_ask > 0 and not is_occupied("SELL"):
-                sell_price = int(round(best_ask + tick_size))
+            if best_ask > 0 and not is_occupied("SELL") and as_ask_price > 0:
+                sell_price = int(round(as_ask_price))
                 commands.append(
                     {
                         "ts_ms": self._current_ts,
@@ -300,10 +350,10 @@ class ASCoordinator:
                         "qty_lots": 1,
                     }
                 )
-        elif inventory > 0:
-            # Only submit SELL (reduce long) — respect occupied status
-            if best_ask > 0 and not is_occupied("SELL"):
-                sell_price = int(round(best_ask + tick_size))
+        elif inventory_lots > 0:
+            # Only submit SELL (reduce long) at A-S optimal price
+            if best_ask > 0 and not is_occupied("SELL") and as_ask_price > 0:
+                sell_price = int(round(as_ask_price))
                 commands.append(
                     {
                         "ts_ms": self._current_ts,
@@ -314,10 +364,10 @@ class ASCoordinator:
                         "qty_lots": 1,
                     }
                 )
-        elif inventory < 0:
-            # Only submit BUY (reduce short) — respect occupied status
-            if best_bid > 0 and not is_occupied("BUY"):
-                buy_price = int(round(best_bid - tick_size))
+        elif inventory_lots < 0:
+            # Only submit BUY (reduce short) at A-S optimal price
+            if best_bid > 0 and not is_occupied("BUY") and as_bid_price > 0:
+                buy_price = int(round(as_bid_price))
                 commands.append(
                     {
                         "ts_ms": self._current_ts,
@@ -330,8 +380,6 @@ class ASCoordinator:
                 )
 
         return commands
-
-    def _extract_best_bid(self, snapshot: ExecutionSnapshot) -> float:
         """Extract best bid from snapshot (fallback)."""
         # The snapshot does not directly expose best_bid/best_ask;
         # try the engine's internal book.
@@ -354,18 +402,36 @@ class ASCoordinator:
     # ── Gap validation ──────────────────────────────────────────────────
 
     def _check_gap(self, ts_ms: int) -> None:
-        """Check gap condition.
+        """Check gap condition between consecutive EVENT timestamps.
 
-        If ts_siguiente_decisión - ts_ultimo_evento > 2 * decision_interval_ms,
-        invalidates the simulation (raises ValueError). Does NOT reset inventory.
+        If ts_evento - ts_evento_previo > 2 * decision_interval_ms,
+        invalidates the simulation (raises ValueError). Does NOT reset
+        inventory. Cycle steps without events don't count (the calendar
+        itself advances in fixed D steps by design).
         """
-        if self._last_processed_ts > 0:
-            gap = ts_ms - self._last_processed_ts
+        last_event = getattr(self, "_last_event_ts", -1)
+        if last_event > 0:
+            gap = ts_ms - last_event
             if gap > 2 * self.decision_interval_ms:
                 raise ValueError(
                     f"Gap invalidates simulation: {gap}ms > 2*{self.decision_interval_ms}ms "
-                    f"between {self._last_processed_ts} and {ts_ms}"
+                    f"between {last_event} and {ts_ms}"
                 )
+
+    def _cycle_grid(self, last_event_ts: int) -> List[int]:
+        """Scheduled cycle timestamps t0 + k*D within data coverage (<= last event)."""
+        grid: List[int] = []
+        if not self._market_events:
+            return grid
+        t0 = self._t0
+        k = 0
+        while True:
+            ts = t0 + k * self.decision_interval_ms
+            if ts > last_event_ts:
+                break
+            grid.append(ts)
+            k += 1
+        return grid
 
     # ── Main run loop ───────────────────────────────────────────────────
 
@@ -375,14 +441,17 @@ class ASCoordinator:
         Flow:
         1. Warm-up phase: advance advance_to() without apply_commands until
            warmup_intervals mids with positive intervals are collected.
-        2. Main loop: for each scheduled decision timestamp (every decision_interval_ms):
-            - advance_to(ts, market_events_at_ts) — consume all market events at ts
-            - If events at that timestamp: process ALL (trades, books) before deciding
-            - Get state() — authoritative snapshot with inventory from the engine
-            - A-S decision (placeholder) — generate submit/cancel commands
-            - apply_commands(ts, commands) — inject decisions
-        3. Gap validation after each step.
-        4. EOF: finish(observed_end_ms=último_ts_evento) — closes the engine.
+        2. Main loop over the MERGED calendar (scheduled cycles t0+k*D within
+           data coverage ∪ event timestamps), strictly ascending:
+             - advance_to(ts, market_events_at_ts) — empty list on cycles
+               without events; expired timers drain before deciding
+             - consume ALL market events at ts (trades, books) before deciding
+             - event gaps > 2*D invalidate the run (no inventory reset)
+             - Get state() — authoritative snapshot with inventory from the engine
+             - A-S decision on grid timestamps once warm-up is complete
+             - apply_commands(ts, commands) — inject decisions
+        3. EOF: finish(observed_end_ms=último_ts_evento) — closes the engine,
+           never beyond the recorded data.
         """
         if not self._market_events:
             raise ValueError("No market events loaded")
@@ -390,33 +459,39 @@ class ASCoordinator:
         # ─── Step 1: Warm-up phase ───
         self._warmup_phase()
 
-        # ─── Step 2: Main loop over remaining event timestamps ───
+        # ─── Step 2: Main loop over merged calendar ───
         self._cycle_counter = 0
         self._finished = False
         self._last_processed_ts = getattr(self, "_warmup_last_ts", -1)
+        self._last_event_ts = self._last_processed_ts
         self._side_occupied = {}
 
         last_event_ts = self._market_events[-1]["ts_ms"]
         start_ts = self._last_processed_ts if self._last_processed_ts > 0 else -1
 
-        # Distinct event timestamps strictly after warm-up consumption.
-        # Iterate EVERY event timestamp (not only decision-grid points) so no
-        # trade/book is ever skipped; decisions only fire on grid timestamps.
-        pending_ts = sorted({
+        # F1.2: scheduled cycles run even without market events; event
+        # timestamps are all consumed (never skip trades/books). Both sets
+        # strictly after warm-up consumption, ascending, no duplicates.
+        event_ts = sorted({
             e["ts_ms"] for e in self._market_events if e["ts_ms"] > start_ts
         })
+        cycle_ts = [ts for ts in self._cycle_grid(last_event_ts) if ts > start_ts]
+        steps = sorted(set(event_ts) | set(cycle_ts))
+        event_ts_set = set(event_ts)
 
-        for ts_ms in pending_ts:
+        for ts_ms in steps:
             self._current_ts = ts_ms
+            has_events = ts_ms in event_ts_set
 
             # Collect all market events at this timestamp, flattened
+            # (possibly empty on cycles without events)
             market_events_for_advance: List[Dict[str, Any]] = [
                 {"ts_ms": ts_ms, "kind": e["kind"], **e["data"]}
                 for e in self._market_events
                 if e["ts_ms"] == ts_ms and e["kind"] in ("book", "trade")
             ]
 
-            # advance_to with all events at this timestamp
+            # advance_to drains expired timers (F1.2) then consumes events
             self.engine.advance_to(ts_ms, market_events_for_advance)
 
             # Update best bid/ask from the engine's internal book
@@ -428,15 +503,17 @@ class ASCoordinator:
                 if asks:
                     self._best_ask = float(asks[0][0])
 
-            # Gap validation BEFORE updating _last_processed_ts
+            # Gap validation on EVENT timestamps only, BEFORE updating state
             # (raises without resetting inventory)
-            self._check_gap(ts_ms)
+            if has_events:
+                self._check_gap(ts_ms)
+                self._last_event_ts = ts_ms
             self._last_processed_ts = ts_ms
 
             # Get authoritative snapshot (engine owns inventory/cash)
             snapshot = self.engine.state()
 
-            # A-S decision only if this is a decision timestamp and warmup is complete
+            # A-S decision only on grid timestamps once warm-up is complete
             if self._is_decision_timestamp(ts_ms) and self._warmup_complete:
                 # Generate decision (respects _side_occupied for delayed replacement)
                 commands = self._as_decision(snapshot)

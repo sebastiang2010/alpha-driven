@@ -1292,5 +1292,56 @@ class TestReduceOnlyLimits(unittest.TestCase):
         )
 
 
+class TestCycleTimerDrain(unittest.TestCase):
+    """F1.2 (motor): advance_to con lista vacía drena timers vencidos."""
+
+    def test_empty_advance_fires_expired_arrival(self):
+        """Submit@1000 (arrival@1040) + advance_to(6000, []) -> orden live.
+
+        Sin el drenado F1.2, el arrival quedaba encolado hasta el próximo
+        avance con eventos; los ciclos sin eventos no hacían avanzar nada.
+        """
+        config = ReconstructionConfig(max_gap_ms=60000, max_book_age_ms=60000)
+        rec = ExecutionReconstructor(config)
+        rec.advance_to(1000, [{
+            'ts_ms': 1000, 'kind': 'book', 'bids': [[10000, 10]],
+            'asks': [[10001, 100]], 'update_id': 1, 'pu': 0}])
+        rec.apply_commands(1000, [{
+            'ts_ms': 1000, 'kind': 'submit', 'order_id': 'o1',
+            'side': 'BUY', 'price_ticks': 10000, 'qty_lots': 5}])
+        self.assertEqual(rec.orders['o1']['status'], 'pending')
+        # Ciclo sin eventos: solo drena timers (arrival@1040)
+        delta = rec.advance_to(6000, [])
+        self.assertEqual(rec.orders['o1']['status'], 'live')
+        arrivals = [t for t in delta.order_transitions if t['to_status'] == 'live']
+        void = [j for j in rec.journal if j['event'] == 'live' and j['ts_ms'] == 1040]
+        self.assertTrue(arrivals or void)
+
+    def test_empty_advance_preserves_chronology_with_later_events(self):
+        """El drenado anticipado no altera el orden cronológico: arrival@1040
+        se despacha antes que el trade@7000 aunque se avance vacío a 6000."""
+        config = ReconstructionConfig(max_gap_ms=60000, max_book_age_ms=60000)
+        rec = ExecutionReconstructor(config)
+        rec.advance_to(1000, [{
+            'ts_ms': 1000, 'kind': 'book', 'bids': [[10000, 10]],
+            'asks': [[10001, 100]], 'update_id': 1, 'pu': 0}])
+        rec.apply_commands(1000, [{
+            'ts_ms': 1000, 'kind': 'submit', 'order_id': 'o1',
+            'side': 'BUY', 'price_ticks': 10000, 'qty_lots': 5}])
+        rec.advance_to(6000, [])
+        rec.advance_to(7000, [
+            {'ts_ms': 7000, 'kind': 'book', 'bids': [[10000, 10]],
+             'asks': [[10001, 100]], 'update_id': 2, 'pu': 1},
+            {'ts_ms': 7000, 'kind': 'trade', 'trade_id': 't1',
+             'price_ticks': 10000, 'qty_lots': 15, 'is_buyer_maker': True},
+        ])
+        fills = [f for f in rec.fills if f.order_id == 'o1']
+        self.assertEqual(len(fills), 1)
+        # El arrival (1040) precedió al fill (7000) en el journal
+        ts_live = next(j['ts_ms'] for j in rec.journal
+                       if j['event'] == 'live' and j.get('order_id') == 'o1')
+        self.assertEqual(ts_live, 1040)
+
+
 if __name__ == "__main__":
     unittest.main()

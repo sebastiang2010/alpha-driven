@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **501 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **508 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes del veredicto + F1.1**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9) + `test_as_coordinator.py` + `test_offline_coordinator.py` (F1.1, 9/9) → **79/79 OK** en el área tocada
+  - **Point 6 + ajustes del veredicto + F1.1 + F1.2**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (9/9) + `test_as_calendar.py` (F1.2, 5/5) → **86/86 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -34,9 +34,15 @@
 - Tests sintéticos nuevos `strategy/tests/test_offline_coordinator.py` (9/9): protocolo flatten, varios libros mismo ts en orden, submit→fill→finish end-to-end, `run_full` con policy_fn, factory desde filas crudas, rechazo de claves reservadas (`ts_ms`/`kind` en data → `ValueError` antes de tocar el motor).
 - Sin regresiones: mismos 9 fallos pre-existentes. Sin simulaciones de mercado, sin push (F1.2+ pendientes de revisión).
 
+## F1.2 — calendario 5s, ciclos sin eventos, drenado de timers (2026-09-26, hecho — 86/86 área, 508/9 suite)
+- `strategy/as_coordinator.py`: default `decision_interval_ms` 1000→5000 (`__init__` y `ASCoordinatorConfig`); `run()` recorre el calendario fusionado (ciclos `t0+k*D` dentro de cobertura ∪ timestamps de eventos, ascendente, sin duplicados): los ciclos sin eventos avanzan con lista vacía y deciden si hay warm-up; ningún trade/libro se salta. `_check_gap` ahora solo entre EVENTOS consecutivos (`_last_event_ts`; los pasos de ciclo no cuentan); `_cycle_grid()` genera la grilla.
+- `strategy/execution_reconstruction.py` (`advance_to`): drena timers con `timer_ts < ts_ms` antes de los eventos (equivale al interleave cuando hay eventos; habilita avances vacíos). Cada timer se despacha en su propio ts; prioridades y `finish()` intactos.
+- Tests: `TestCycleTimerDrain` (2, motor: avance vacío dispara arrival@1040; cronología preservada con eventos posteriores) + `strategy/tests/test_as_calendar.py` (5: default 5s, pasos fusionados exactos `[1000,2000,3000,6000,7000,11000,12000]` con `observed_end=12000`, decisión en ciclo vacío sin pendientes, trade off-grid consumido, hueco entre eventos invalida sin reset).
+- `finish()` sigue cerrando en el último ts con eventos (límite de fin de datos). Sin simulaciones de mercado, sin push. Tests existentes con `decision_interval_ms=1000` explícito: intactos.
+
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**
-- Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) calendario 1s→5s, ciclos sin eventos + drenar timers vencidos antes de decidir (`as_coordinator.py:451`, `execution_reconstruction.py:825`); (3) conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup >3 muestras (`as_coordinator.py:270`, `alpha_model.py:329`); (4) flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py:324`).
+- Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) ~~calendario 1s→5s, ciclos sin eventos + drenar timers~~ **HECHO (F1.2)**; (3) conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup >3 muestras (`as_coordinator.py:270`, `alpha_model.py:329`); (4) flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py:324`).
 - Fase 2: (5) medición integrada en `FinalResult`: equity neta, costes, valoración final, agregados de fills en cancelación, tiempo sin cotizar, exposición por lado (`execution_reconstruction.py:940`).
 - Orden propuesto + pruebas sintéticas de integración sin mockear la decisión A-S.
 

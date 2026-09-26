@@ -788,10 +788,21 @@ class ExecutionReconstructor:
         
         all_transitions = []
         new_fills = []
-        
+
         import heapq
         from research.chronological_execution import PRIORITY
-        
+
+        # F1.2: drenar timers vencidos estrictamente anteriores a ts_ms ANTES
+        # de los eventos. Equivale al interleave cronológico cuando hay eventos
+        # en ts_ms (toda clave (t_t,<prio>) con t_t < ts_ms precede a cualquier
+        # clave de evento en ts_ms), y permite que avances vacíos (ciclos sin
+        # eventos) hagan avanzar arrivals/cancel_effective. Cada timer se
+        # despacha en su propio ts (frescura del libro evaluada ahí, no en ts_ms).
+        while self._timers and self._timers[0][0] < ts_ms:
+            timer_ts, _, _, timer_event = heapq.heappop(self._timers)
+            transitions = self._dispatch_timer(timer_event, timer_ts)
+            all_transitions.extend(transitions)
+
         # Sort market events by priority: trade(0) -> book(3)
         # Within same kind, preserve input order (stable sort)
         sorted_events = sorted(market_events, key=lambda e: PRIORITY[e['kind']])
