@@ -353,7 +353,11 @@ class ReconstructionConfig:
     # Supuestos de costo explícitos (F2.5): cero = escenario promo 0-fees
     # XRPUSDC vigente; configurar distinto de cero para evaluar su fin.
     maker_fee_rate: float = 0.0  # fracción del turnover por fill maker
-    funding_rate_per_8h: float = 0.0  # fracción del inventario (USDC) por 8 h
+    # Funding: NO hay rate continuo. Binance liquida en eventos puntuales
+    # (ts, tasa, mark price) aplicados al inventario con su signo (largo paga
+    # con tasa > 0, corto recibe). Se modela con eventos kind='funding' en
+    # advance_to; sin ellos funding_usdc = 0.0 (escenario sin liquidación,
+    # explícito, no asumido).
 
 
 @dataclass
@@ -494,6 +498,7 @@ class ExecutionReconstructor:
         self._finished: bool = False
         self._sequence: int = 0
         self._last_public_ts: int = -1  # último ts de evento externo (book/trade) procesado
+        self._funding_usdc: float = 0.0  # funding acumulado con signo (F2.5): positivo = costo del holder
         
     def _log(self, ts_ms: int, event: str, order_id: Optional[str] = None, **fields) -> None:
         self.journal.append({'ts_ms': ts_ms, 'event': event, 'order_id': order_id, **fields})
@@ -722,6 +727,26 @@ class ExecutionReconstructor:
         self._timer(o['arrival_ts_ms'], 'arrival', oid)
         return transitions
     
+    def _process_funding_event(self, event: Dict[str, Any], ts_ms: int) -> None:
+        """Liquidación puntual de funding (Binance): se aplica al inventario
+        con su signo. costo = inv_xrp * mark_usdc * rate (largo paga con
+        tasa positiva; corto recibe). Se registra en cash_units equivalente
+        (redondeado a tick) y se acumula en _funding_usdc para métricas.
+        """
+        rate = float(event['rate'])
+        mark_ticks = int(event['mark_price_ticks'])
+        if mark_ticks <= 0:
+            raise ValueError('Invalid funding mark price')
+        tick_size = float(self.config.tick_size)
+        qty_step = float(self.config.qty_step)
+        inv_xrp = float(self.inventory_lots) * qty_step
+        mark_usdc = mark_ticks * tick_size
+        # Convenio de Binance: largo * rate>0 paga -> cash disminuye
+        payment_usdc = inv_xrp * mark_usdc * rate
+        self._funding_usdc += payment_usdc
+        self._log(ts_ms, 'funding', None, rate=rate, mark_ticks=mark_ticks,
+                  inventory_lots=self.inventory_lots, payment_usdc=payment_usdc)
+
     def _process_arrival(self, event: Dict[str, Any], ts_ms: int) -> List[Dict[str, Any]]:
         transitions = []
         oid = event['order_id']
@@ -826,7 +851,7 @@ class ExecutionReconstructor:
         for e in market_events:
             if e.get('ts_ms') != ts_ms:
                 raise ValueError(f'Event timestamp {e.get("ts_ms")} does not match advance_to ts_ms={ts_ms}')
-            if e['kind'] not in ('book', 'trade'):
+            if e['kind'] not in ('book', 'trade', 'funding'):
                 raise ValueError(f'Invalid event kind for advance_to: {e["kind"]}')
         
         all_transitions = []
@@ -846,13 +871,15 @@ class ExecutionReconstructor:
             transitions = self._dispatch_timer(timer_event, timer_ts)
             all_transitions.extend(transitions)
 
-        # Sort market events by priority: trade(0) -> book(3)
+        # Sort market events by priority: trade(0) -> book(3); funding al final
+        # (aplica sobre inventario ya resuelto por fills del mismo ts).
         # Within same kind, preserve input order (stable sort)
-        sorted_events = sorted(market_events, key=lambda e: PRIORITY[e['kind']])
+        FUNDING_PRIO = 5
+        sorted_events = sorted(market_events, key=lambda e: PRIORITY.get(e['kind'], FUNDING_PRIO))
         
         # Process each market event with timer interleaving, matching Replay.run()
         for e in sorted_events:
-            event_priority = PRIORITY[e['kind']]
+            event_priority = PRIORITY.get(e['kind'], FUNDING_PRIO)
             event_key = (ts_ms, event_priority)
             
             # Process timers with (timer_ts, timer_priority) < event_key
@@ -868,6 +895,8 @@ class ExecutionReconstructor:
                 new_fills.extend([f for f in self.fills if f.ts_ms == ts_ms and f not in new_fills])
             elif e['kind'] == 'book':
                 self._process_book_event(e, ts_ms)
+            elif e['kind'] == 'funding':
+                self._process_funding_event(e, ts_ms)
             self._last_public_ts = max(self._last_public_ts, ts_ms)
         
         # After all market events at this timestamp, process remaining timers at this timestamp
@@ -980,24 +1009,10 @@ class ExecutionReconstructor:
             mid_ticks = None
         final_mid = None if mid_ticks is None else mid_ticks * tick
         inv_usdc = None if final_mid is None else float(self.inventory_lots) * step * final_mid
-        # Costes explícitos del config (F2.5 #2). Funding: ∫|inv_xrp|·mid dt / 8h.
+        # Costes explícitos (F2.5): fees del config; funding = suma de los
+        # eventos de liquidación procesados (ver _process_funding_event).
         fees = turnover * float(self.config.maker_fee_rate)
-        funding = 0.0
-        if self._inventory_path and self.books:
-            mid_by_ts = self.books
-            ms8h = 8 * 3600 * 1000
-            rate = float(self.config.funding_rate_per_8h)
-            path = list(self._inventory_path)
-            if path and path[0][0] > (self.books[0]['ts_ms'] if self.books else 0):
-                path = [(self.books[0]['ts_ms'], 0)] + path
-            for i, (ts, lots) in enumerate(path):
-                nxt = path[i + 1][0] if i + 1 < len(path) else observed_end_ms
-                dt = max(0, int(nxt - ts))
-                # mid más reciente <= ts
-                midv = next((b['mid_ticks'] for b in reversed(mid_by_ts) if b['ts_ms'] <= ts), None)
-                if midv is None:
-                    continue
-                funding += abs(lots) * step * midv * tick * (dt / ms8h) * rate
+        funding = self._funding_usdc
         gross = None if inv_usdc is None else cash_usdc + inv_usdc
         equity = None if gross is None else gross - fees - funding
         # Ventana de observación y cobertura

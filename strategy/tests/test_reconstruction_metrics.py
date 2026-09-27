@@ -235,22 +235,24 @@ class TestReconstructionMetrics(unittest.TestCase):
         self.assertEqual(m.coverage_ms, 2000)
 
     def test_costs_nonzero_fees_and_funding(self):
-        """#2: con maker_fee y funding != 0, net < gross y campos separados."""
-        # 2 fills @ 10000 de 5 lots -> turnover 10.0 USDC; fee 2 bps -> 0.002
-        # funding 0.01 por 8h sobre |inv|=10 (XRP) ~1.0 -> ~3.47e-8 por 1000ms
-        rec = self._rec(maker_fee_rate=0.0002, funding_rate_per_8h=0.01)
+        """#2: fees del config + funding por evento de liquidación explícito.
+        net = gross - fees - funding, con funding signado (largo paga)."""
+        rec = self._rec(maker_fee_rate=0.0002)
         rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
         rec.apply_commands(1000, [_submit(1000, "b1", "BUY", 10000, 5)])
         rec.advance_to(1040, [])
         rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
                               _trade(1100, "t1", 10000, 20, True)])
-        rec.advance_to(2000, [_book(2000, 10000, 10001, 3, 2)])
+        # funding: rate=+0.0001, mark=10000 ticks -> pago = 5*1.0*0.0001 = 0.0005
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": 0.0001, "mark_price_ticks": 10000}])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 4, 3)])
         res = rec.finish(2000)
         m = res.metrics
         assert m is not None
-        self.assertGreater(m.fees_usdc, 0.0)
         self.assertAlmostEqual(m.fees_usdc, m.turnover_usdc * 0.0002, places=12)
-        self.assertGreater(m.funding_usdc, 0.0)
+        self.assertAlmostEqual(m.funding_usdc, 0.0005, places=12)
         assert m.gross_equity_usdc is not None and m.net_equity_usdc is not None
         self.assertAlmostEqual(
             m.net_equity_usdc,
@@ -283,6 +285,92 @@ class TestReconstructionMetrics(unittest.TestCase):
         rec2.advance_to(2000, [_book(2000, 10000, 10001, 2, 1)])
         res = rec2.finish(2000)
         self.assertIsNotNone(res.metrics)
+
+    # ── Funding por evento de liquidación (veredicto F2.5 V3) ──────────
+
+    def _setup_buy_5(self, **kw) -> ExecutionReconstructor:
+        rec = self._rec(**kw)
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "b1", "BUY", 10000, 5)])
+        rec.advance_to(1040, [])
+        rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
+                              _trade(1100, "t1", 10000, 20, True)])
+        return rec
+
+    def test_funding_event_long_pays_with_positive_rate(self):
+        """Largo +5 XRP con mark $1.0 y rate +0.0001 -> paga 0.0005 por eso."""
+        rec = self._setup_buy_5()
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": 0.0001, "mark_price_ticks": 10000}])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 4, 3)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertAlmostEqual(m.funding_usdc, 5.0 * 1.0 * 0.0001, places=12)
+        assert m.gross_equity_usdc is not None and m.net_equity_usdc is not None
+        self.assertAlmostEqual(
+            m.net_equity_usdc,
+            m.gross_equity_usdc - m.fees_usdc - m.funding_usdc,
+            places=12)
+
+    def test_funding_event_short_receives_with_positive_rate(self):
+        """Corto -4 XRP con rate +0.0001 -> recibe (funding_usdc negativo)."""
+        rec = self._rec()
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "s1", "SELL", 10001, 4)])
+        rec.advance_to(1040, [])
+        rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
+                              _trade(1100, "t1", 10001, 14, False)])
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": 0.0001, "mark_price_ticks": 10001}])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 4, 3)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        expected = -4.0 * 1.0001 * 0.0001  # negativo: recibe
+        self.assertAlmostEqual(m.funding_usdc, expected, places=12)
+        assert m.gross_equity_usdc is not None and m.net_equity_usdc is not None
+        # net > gross al recibir funding
+        self.assertGreater(m.net_equity_usdc, m.gross_equity_usdc)
+
+    def test_funding_event_negative_rate_long_receives(self):
+        """Largo con rate -0.0001 -> recibe (funding_usdc < 0)."""
+        rec = self._setup_buy_5()
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": -0.0001, "mark_price_ticks": 10000}])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 4, 3)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertAlmostEqual(m.funding_usdc, -5.0 * 1.0 * 0.0001, places=12)
+
+    def test_funding_event_closed_before_settlement_no_payment(self):
+        """Se cierra la posición antes del funding -> payment 0."""
+        rec = self._setup_buy_5()  # inv = +5
+        # cerrar vendiendo: SELL resting llena con buyer agresor (m=False)
+        rec.advance_to(1300, [_book(1300, 10000, 10001, 3, 2)])
+        rec.apply_commands(1300, [_submit(1300, "s1", "SELL", 10001, 5)])
+        rec.advance_to(1340, [])
+        rec.advance_to(1400, [_book(1400, 10000, 10001, 4, 3),
+                              _trade(1400, "t2", 10001, 105, False)])  # fills sell
+        self.assertEqual(rec.inventory_lots, 0)
+        # inv==0 al funding
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 5, 4),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": 0.0001, "mark_price_ticks": 10000}])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 6, 5)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertEqual(m.funding_usdc, 0.0)
+        self.assertEqual(m.n_fills, 2)  # buy + sell
+
+    def test_funding_no_event_is_explicit_zero(self):
+        """Sin eventos 'funding': funding_usdc == 0 (escenario explícito)."""
+        rec = self._setup_buy_5()
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 3, 2)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertEqual(m.funding_usdc, 0.0)
 
 
 if __name__ == "__main__":
