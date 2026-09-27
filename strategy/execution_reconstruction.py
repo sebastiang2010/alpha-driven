@@ -377,6 +377,7 @@ class ReconstructionFill:
     mid_at_fill: float
     adverse_5s: Optional[float] = None  # (future_mid - fill_price)/fill_price con signo
     markout_reason: str = 'pending'  # pending | ok | late_book | end_of_data (criterio Replay.markouts)
+    filled_during_cancel: bool = False  # fill con cancel ya solicitada (F2.5)
     order_id: Optional[str] = None
     trade_id: Optional[str] = None
 
@@ -406,6 +407,32 @@ class ExecutionSnapshot:
 
 
 @dataclass(frozen=True)
+class ReconstructionMetrics:
+    """Medición integrada offline de una reconstrucción (F2.5).
+
+    Todo en USDC salvo conteos y ms. El motor modela fills maker sin
+    comisiones (promo 0 fees XRPUSDC): fees_usdc es 0.0 y los costes los
+    aplica el caller sobre turnover_usdc. Sin lookahead: la valoración
+    usa el último book procesado.
+    """
+    turnover_usdc: float  # suma |precio×qty| de fills
+    fees_usdc: float  # 0.0 — sin modelo de comisiones en el motor
+    cash_usdc: float  # flujo de caja acumulado (= FinalResult.cash)
+    final_inventory_xrp: float
+    final_mid_usdc: Optional[float]  # None si no hubo books
+    final_inventory_usdc: Optional[float]  # None si no hubo books
+    net_equity_usdc: Optional[float]  # cash + valoración (None si no hubo books)
+    n_fills: int
+    fills_during_cancel: int  # fills con cancel ya solicitada
+    buy_qty_lots: float  # volumen llenado BUY
+    sell_qty_lots: float  # volumen llenado SELL
+    max_long_lots: int  # exposición máxima larga (incluye 0 inicial)
+    max_short_lots: int  # exposición máxima corta, <= 0 (incluye 0 inicial)
+    unquoted_ms: int  # ms sin órdenes vivas en [primer book, observed_end]
+    coverage_ms: int  # observed_end - primer book (0 si no hubo books)
+
+
+@dataclass(frozen=True)
 class FinalResult:
     """Resultado final tras finish()."""
     fills: List[ReconstructionFill]
@@ -414,6 +441,7 @@ class FinalResult:
     cash: float
     censored_orders: List[Dict[str, Any]]
     observed_end_ms: int
+    metrics: Optional[ReconstructionMetrics] = None  # F2.5 (None si finish() no lo pobló)
 
 
 class ExecutionReconstructor:
@@ -446,6 +474,7 @@ class ExecutionReconstructor:
         self.book: Optional[Dict[str, Any]] = None
         self.inventory_lots: int = 0
         self.cash_units: int = 0  # unidades enteras: cash = cash_units * qty_step * tick_size
+        self._inventory_path: List[Tuple[int, int]] = []  # (ts_ms, inventory_lots) por fill (F2.5 exposición)
         self.seen_trades: set = set()
         self._timers: List[Tuple[int, int, int, Any]] = []  # (ts_ms, priority, serial, event)
         self._serial = 0
@@ -592,12 +621,15 @@ class ExecutionReconstructor:
             o['remaining_lots'] -= qty
             mid_before = self.books[-1]['mid_ticks'] if self.books else 0
             book_age = ts_ms - self.book['ts_ms'] if self.book else 0
+            during_cancel = o['cancel_effective_ms'] is not None
             self.fills.append(ReconstructionFill(
                 ts_ms=ts_ms, side=side, price=float(o['price_ticks']), qty=float(qty),
                 status=fill.status, inventory_after=float(self.inventory_lots),
                 mid_at_fill=float(mid_before), adverse_5s=None,
+                filled_during_cancel=during_cancel,
                 order_id=o['order_id'], trade_id=tid
             ))
+            self._inventory_path.append((ts_ms, self.inventory_lots))
             self._log(ts_ms, 'fill', o['order_id'], trade_id=tid, qty_lots=qty,
                       inventory_lots=self.inventory_lots, cash_units=self.cash_units)
             if o['remaining_lots'] == 0:
@@ -909,6 +941,80 @@ class ExecutionReconstructor:
         ts_ms = self._last_advance_ts if self._last_advance_ts >= 0 else 0
         return self._build_snapshot(ts_ms)
     
+    def compute_metrics(self, observed_end_ms: int) -> ReconstructionMetrics:
+        """Medición integrada offline (F2.5). Solo usa datos ya procesados.
+
+        - Valoración: último book conocido (final_mid_ticks * tick_size).
+        - unquoted_ms: intervalos sin órdenes vivas, reconstruidos del journal
+          (una orden vive entre evento 'live' y su primer terminal lógico:
+          filled / cancel_requested / end_censored / rejected_*).
+        - Exposición: la trayectoria solo cambia en fills (régimen base 0).
+        """
+        tick = float(self.config.tick_size)
+        step = float(self.config.qty_step)
+        cash_usdc = float(self.cash_units) * step * tick
+        turnover = sum(f.price * f.qty for f in self.fills) * step * tick
+        buy_lvl = sum(f.qty for f in self.fills if f.side == 'BUY')
+        sell_lvl = sum(f.qty for f in self.fills if f.side == 'SELL')
+        fills_dc = sum(1 for f in self.fills if f.filled_during_cancel)
+        max_long = 0
+        max_short = 0
+        for _, lvl in [(0, 0)] + list(self._inventory_path):
+            max_long = max(max_long, lvl)
+            max_short = min(max_short, lvl)
+        if self.books:
+            mid_ticks = (self.book['bids'][0][0] + self.book['asks'][0][0]) / 2.0 if self.book else None
+        else:
+            mid_ticks = None
+        final_mid = None if mid_ticks is None else mid_ticks * tick
+        inv_usdc = None if final_mid is None else float(self.inventory_lots) * step * final_mid
+        equity = None if inv_usdc is None else cash_usdc + inv_usdc
+        # Ventana de observación y cobertura
+        if self.books:
+            first_book_ts = self.books[0]['ts_ms']
+            coverage = max(0, int(observed_end_ms - first_book_ts))
+        else:
+            first_book_ts = None
+            coverage = 0
+        # Vida de órdenes desde journal: eventos ordenados por ts
+        live_set: set = set()
+        events_sorted = sorted(self.journal, key=lambda j: j['ts_ms'])
+        current_ts: Optional[int] = first_book_ts
+        unquoted = 0
+        for j in events_sorted:
+            ts = int(j['ts_ms'])
+            if current_ts is not None and ts > current_ts:
+                unquoted += 0 if live_set else (ts - current_ts)
+                current_ts = ts
+            elif current_ts is None:
+                current_ts = ts
+            ev = j['event']
+            oid = j.get('order_id')
+            if ev == 'live' and oid is not None:
+                live_set.add(oid)
+            elif oid is not None and (ev in ('filled', 'cancelled', 'end_censored', 'cancel_requested')
+                                      or ev.startswith('rejected_')):
+                live_set.discard(oid)
+        if current_ts is not None and observed_end_ms > current_ts:
+            unquoted += 0 if live_set else (observed_end_ms - current_ts)
+        return ReconstructionMetrics(
+            turnover_usdc=turnover,
+            fees_usdc=0.0,
+            cash_usdc=cash_usdc,
+            final_inventory_xrp=float(self.inventory_lots) * step,
+            final_mid_usdc=final_mid,
+            final_inventory_usdc=inv_usdc,
+            net_equity_usdc=equity,
+            n_fills=len(self.fills),
+            fills_during_cancel=fills_dc,
+            buy_qty_lots=buy_lvl,
+            sell_qty_lots=sell_lvl,
+            max_long_lots=int(max_long),
+            max_short_lots=int(max_short),
+            unquoted_ms=int(unquoted),
+            coverage_ms=int(coverage),
+        )
+
     def finish(self, observed_end_ms: int) -> FinalResult:
         """
         Cierra el motor. Exige que observed_end_ms sea el último timestamp público ya procesado.
@@ -947,7 +1053,9 @@ class ExecutionReconstructor:
                           trade_id=f.trade_id, firing_ms=f.ts_ms + MARKOUT_WINDOW_MS)
 
         self._finished = True
-        
+
+        metrics = self.compute_metrics(observed_end_ms)
+
         return FinalResult(
             fills=self.fills,
             journal=self.journal,
@@ -955,6 +1063,7 @@ class ExecutionReconstructor:
             cash=float(self.cash_units) * self.config.qty_step * self.config.tick_size,
             censored_orders=censored,
             observed_end_ms=observed_end_ms,
+            metrics=metrics,
         )
 
 

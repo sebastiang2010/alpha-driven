@@ -1,14 +1,14 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-27 — F1.4 + 2 ajustes del veredicto **implementados** (pendiente de revisión del diseñador). Q1–Q3 aprobados; F2.5 fuera de alcance.
+**Actualizado**: 2026-09-27 — F2.5 (medición integrada en `FinalResult`) **implementado** (pendiente de revisión del diseñador). F1.4 aprobado.
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **559 passed / 9 failed** (2026-09-27)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **567 passed / 9 failed** (2026-09-27)
   - Los 9 fallos son **pre-existentes** (mismos nombres que en veredictos previos; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) → **124/124 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes + F2.5**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) + `test_reconstruction_metrics.py` **8/8 nuevo** → **132/132 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -91,13 +91,18 @@
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**
 - Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) ~~calendario 1s→5s, ciclos sin eventos + drenar timers~~ **HECHO (F1.2)**; (3) ~~conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup~~ **HECHO (F1.3)** — `ASCoordinator` posee un `MarketState` real (sin WS, alimentado con los mismos eventos causales, ticks→USDC / lots→XRP con el config del engine) + un `AlphaModel` compartido (`record_mid` 1×/ciclo, `now_sec=ts_sim` explícito, `price_ticks=round(USDC/tick_size)`, guarda maker, código muerto eliminado); `test_as_signals.py` 6/6 (señales causales, conversiones no unitarias, escalado único de vol, determinismo doble corrida); (4) ~~flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py`)~~ **HECHO (F1.4, pendiente revisión del diseñador)**.
-- Fase 2: (5) medición integrada en `FinalResult`: equity neta, costes, valoración final, agregados de fills en cancelación, tiempo sin cotizar, exposición por lado (`execution_reconstruction.py:940`) — PENDIENTE (F2.5, fuera de alcance).
+- Fase 2: ~~(5) medición integrada en `FinalResult` (equity neta, costes, valoración final, fills en cancelación, tiempo sin cotizar, exposición por lado)~~ **HECHO (F2.5, 2026-09-27, pendiente revisión del diseñador)**. Siguiente paso tras el cierre estático: primera prueba dinámica offline (requiere autorización humana).
 - Orden propuesto + pruebas sintéticas de integración sin mockear la decisión A-S.
 
 ## Disciplina de evidencia (lección registrada)
 - El task previo reportó "63/63" en un worktree mutado (archivos fantasma, `.venv` externo). Rerun canónico encontró 137 deseleccionados y 9 fallos que mi comando original no veía.
 - Lección documentada en `.operator/specs/leccion_duplicate_basename_pytest.md` (incluye anti-patrón "lector perezoso": números de suite solo válidos con WC estable, contrastar conteo selected vs baseline).
 - **Regla nueva**: NUNCA aprobar una rama por una corrida verde sin que coincida exactamente el número de tests seleccionados (`collected X items / Y deselected`) con el esperado.
+
+## F2.5 — medición integrada en `FinalResult` (2026-09-27, hecho — 132/132 área, 567/9 suite, pendiente revisión del diseñador)
+- `strategy/execution_reconstruction.py`: dataclass frozen `ReconstructionMetrics` + `FinalResult.metrics`; `_process_trade_event` registra `filled_during_cancel` (cancel ya solicitada) y trayectoria `_inventory_path` (ts, lots) por fill.
+- `finish()` → `compute_metrics(observed_end_ms)`: turnover (Σ price·qty en USDC), fees 0.0 (motor maker sin comisiones — los costes los aplica el caller sobre turnover), cash, inventario final (XRP lots×qty_step), valoración al último mid (`mid×tick_size`), equity neta cash+valoración (None sin books), conta fills totales/durante-cancel, volúmenes por lado, exposición máxima long/short, `unquoted_ms` (intervalos sin órdenes vivas entre primer book y `observed_end_ms`, reconstruidos del journal: live↔{filled,cancelled,end_censored,cancel_requested,rejected_*}) y `coverage_ms`.
+- Sin lookahead: solo datos procesados ≤ fin. Tests `strategy/tests/test_reconstruction_metrics.py` 8/8 (equity exacto con mid móvil, exposición long/short, fill durante cancel, sin cotización sin órdenes y con hueco arrival+post-fill, sin books → None, tipo de la métrica).
 
 ## Pendientes P1+
 - (RESUELTO V3) El hallazgo F1.3 de la deque compartida quedó corregido con consultas no destructivas (valores idénticos a prod).
