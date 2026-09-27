@@ -226,7 +226,8 @@ class ASCoordinator:
         """Feed the owned MarketState with already-consumed causal events.
         Retorna True si el grupo incorporó un libro válido (una muestra
         real de mid); False si solo hubo trades o libros inválidos (W2:
-        esos grupos NO cuentan para el warm-up ni alimentan AlphaModel).
+        esos grupos NO cuentan como muestra ni refrescan el libro fresco
+        para el registro 1/ciclo de AlphaModel).
 
         Must be called AFTER a successful engine.advance_to(ts, events): the
         same flattened event dicts (book/trade with top-level keys). Unit
@@ -295,7 +296,8 @@ class ASCoordinator:
         V1: warmup_intervals mids ya no bastan — se exige además que el span
         (último menos primer mid, en segundos) cubra la ventana más larga
         de las ventanas offline explícitas (W4). Sin cobertura no hay submits.
-        Las muestras solo vienen de libros reales en la grilla (W2).
+        Cada muestra viene de un libro real en su propio timestamp (W2,
+        veredicto: la grilla NO filtra el conteo).
         """
         if len(self._warmup_mids) < self.warmup_intervals:
             return False
@@ -305,11 +307,17 @@ class ASCoordinator:
     def _warmup_phase(self) -> None:
         """Warm-up: advance advance_to() without apply_commands until having
         BOTH warmup_intervals mids AND window coverage (span >= longest
-        offline window, W4). Solo cuentan muestras REALES de libros en la
-        grilla de decisión (W2): los grupos de solo-trades o fuera de grilla
-        alimentan el estado pero no el conteo; el historial AlphaModel se
-        alimenta una vez por ciclo de grilla con libro (misma frecuencia que
-        en el main loop — nunca por evento).
+        offline window, W4).
+
+        Recorre el calendario fusionado (grilla ∪ timestamps de eventos),
+        incluidos los ciclos vacíos: cada grupo CON libro real aporta una
+        muestra en su propio timestamp, esté o no en grilla (W2 — la grilla
+        no filtra el conteo). El historial AlphaModel se alimenta una vez
+        por ciclo de grilla con libro fresco (el último mid incorporado
+        desde el registro anterior, consumido una sola vez): los ciclos
+        vacíos registran sin añadir muestras ficticias al historial de
+        mercado, y los grupos de solo-trades o libros inválidos no cuentan
+        ni alimentan.
 
         After warmup, _warmup_complete=True and the main loop may emit decisions.
         The phase is idempotent: a second call returns immediately (the engine
@@ -330,18 +338,21 @@ class ASCoordinator:
         self._best_ask = 0.0
         self._side_occupied = {}
 
-        i = 0
-        n = len(self._market_events)
+        # Calendario fusionado (misma implementación que el main loop):
+        # los ciclos vacíos también se visitan para el registro 1/ciclo.
+        event_ts = sorted({e["ts_ms"] for e in self._market_events})
+        last_event_ts = self._market_events[-1]["ts_ms"] if self._market_events else self._t0
+        steps = merged_steps(event_ts, self._t0, self.decision_interval_ms, last_event_ts)
+        pending_mid: float | None = None  # libro fresco aún no registrado
 
-        # Process events timestamp by timestamp until window coverage
-        while i < n and not self._warmup_ready():
-            ts_ms = self._market_events[i]["ts_ms"]
+        # Process steps in order until window coverage
+        for ts_ms in steps:
+            if self._warmup_ready():
+                break
 
-            # Collect all events at this timestamp
-            events_at_ts = []
-            while i < n and self._market_events[i]["ts_ms"] == ts_ms:
-                events_at_ts.append(self._market_events[i])
-                i += 1
+            # Collect all events at this timestamp (possibly none on
+            # empty cycles — advance_to with [] only drains timers)
+            events_at_ts = [e for e in self._market_events if e["ts_ms"] == ts_ms]
 
             # Extract market events (book + trade), flattened to top-level keys
             # (ts_ms, kind, ...) as expected by ExecutionReconstructor.advance_to
@@ -355,8 +366,7 @@ class ASCoordinator:
             self.engine.advance_to(ts_ms, market_events_for_advance)
             self._warmup_last_ts = ts_ms
             # Same causal events feed the signal stack; solo los grupos CON
-            # libro incorporan muestra (W2) y solo en la grilla alimentan
-            # el historial AlphaModel (frecuencia 1/ciclo, como el loop).
+            # libro incorporan muestra (W2) — en su propio timestamp.
             fed_book = self._feed_market_state(ts_ms, market_events_for_advance)
 
             # Update best bid/ask from the engine's internal book
@@ -369,16 +379,24 @@ class ASCoordinator:
                     self._best_ask = float(asks[0][0])
 
             # Mid consistente con la ruta de decisión: el del snapshot
-            # offline con tiempo explícito (V2). Solo muestra real de libro
-            # en ts de grilla (W2).
-            if fed_book and self._is_decision_timestamp(ts_ms):
+            # offline con tiempo explícito (V2). Toda muestra real cuenta
+            # para la cobertura; además deja el mid como fresco pendiente.
+            if fed_book:
                 ts_sec = float(ts_ms) / 1000.0
                 mid = self._market_state.get_snapshot(
                     ts_sec, offline_windows=self._signal_windows).get("mid") or 0.0
                 if mid > 0:
                     self._warmup_mids.append(float(mid))
                     self._warmup_ts.append(ts_sec)
-                    self._alpha_model.record_mid(ts_sec, float(mid))
+                    pending_mid = float(mid)
+
+            # Un registro AlphaModel por ciclo de grilla con libro fresco
+            # (misma frecuencia que en el main loop — nunca por evento y
+            # nunca sin libro: los ciclos vacíos sin libro pendiente no
+            # registran ni inventan muestras).
+            if self._is_decision_timestamp(ts_ms) and pending_mid is not None:
+                self._alpha_model.record_mid(float(ts_ms) / 1000.0, pending_mid)
+                pending_mid = None
 
         # Warm-up completo solo con conteo Y cobertura de ventanas
         self._warmup_complete = self._warmup_ready()

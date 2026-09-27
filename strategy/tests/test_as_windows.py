@@ -73,8 +73,9 @@ class TestWindowCoverageGate(unittest.TestCase):
         self.assertFalse(coord._warmup_complete)
         self.assertEqual(list(eng.orders.values()), [])
         # ...pero el warm-up best-effort ya alimentó el filtro §14 —
-        # W2: SOLO el libro en grilla (1000) cuenta; 2000/3000 están
-        # fuera de grilla (t0=1000, D=5000) y no re-alimentan.
+        # W2 (veredicto): los 3 libros cuentan como muestra (span 2s < 60s,
+        # por eso no hay cobertura), pero AlphaModel solo se registra en
+        # la grilla (t0=1000, D=5000): únicamente el ciclo 1000.
         hist = list(coord._alpha_model._mid_history)
         self.assertEqual(len(hist), 1)
         self.assertAlmostEqual(hist[-1][1], 10000.5 * 0.0001, places=12)
@@ -295,6 +296,57 @@ class TestSixtySecondVolWindow(unittest.TestCase):
         self.assertEqual(snap["volatility"], 0.0)
         # ...y la deque conserva las 36 muestras (sin poda destructiva)
         self.assertEqual(len(ms._mid_samples), 36)
+
+
+def _misaligned(t_start=1000, n=56, step=1100, bid=10000, ask=10001):
+    """Libros cada `step` ms (casi ninguno cae en la grilla t0+k*5000)."""
+    rows = []
+    uid = 1
+    prev = 0
+    for k in range(n):
+        ts = t_start + k * step
+        rows.append(_depth(ts, bid, ask, uid, prev))
+        prev = uid
+        uid += 1
+    return rows
+
+
+class TestMisalignedBooksWarmup(unittest.TestCase):
+    """Veredicto W2: con libros desalineados de la grilla el warm-up
+    igual se completa (cuenta todo libro real), AlphaModel se alimenta
+    1 vez por ciclo de grilla con libro fresco, y no hay submits
+    prematuros (el warm-up nunca aplica comandos)."""
+
+    def test_misaligned_books_complete_warmup_on_grid_records(self):
+        depth = _misaligned()  # 1000..61500 cada 1100ms: 56 libros, span 60.5s
+        eng = _engine()
+        coord = _coord(depth, [], eng)
+        coord._warmup_phase()
+        self.assertTrue(coord._warmup_complete)
+        # Sin submits prematuros: el warm-up jamás aplica comandos
+        self.assertEqual(
+            [j for j in eng.journal if j.get("event") == "submit"], [])
+        # Registros AlphaModel: todos en la grilla, uno por ciclo como máximo
+        hist = list(coord._alpha_model._mid_history)
+        self.assertGreaterEqual(len(hist), 3)
+        self.assertLess(len(hist), len(depth))
+        for ts_sec, _mid in hist:
+            self.assertEqual((round(ts_sec * 1000) - 1000) % 5000, 0)
+        # ...y estrictamente crecientes en el tiempo (un registro por ciclo)
+        for (t0, _), (t1, _) in zip(hist, hist[1:]):
+            self.assertGreater(t1, t0)
+
+    def test_full_run_no_submits_before_warmup_end(self):
+        depth = _misaligned(n=66)  # hasta 72500: cola para decidir tras el warm-up
+        eng = _engine()
+        coord = _coord(depth, [], eng)
+        coord.run()
+        self.assertTrue(coord._warmup_complete)
+        warmup_end = coord._warmup_last_ts
+        submits = [j for j in eng.journal if j.get("event") == "submit"]
+        self.assertGreater(len(submits), 0)
+        for s in submits:
+            self.assertGreater(s["ts_ms"], warmup_end)
 
 
 if __name__ == "__main__":
