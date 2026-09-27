@@ -1,14 +1,14 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-26 (veredicto F1.3 V1–V4 implementado)
+**Actualizado**: 2026-09-26 (veredicto F1.3 W1–W4 implementado)
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **528 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **535 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredicto V1–V4**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (8/8) + `test_as_signals.py` (7/7, +futuro-no-altera-pasado) + `test_as_windows.py` (6/6, nuevo) → **106/106 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredicto V1–V4 + W1–W4**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (8/8) + `test_as_signals.py` (7/7, +futuro-no-altera-pasado) + `test_as_windows.py` (13/13: cobertura, expiración, W2 frecuencia exacta, W3 regresivo+reproducción, W4 ventanas) → **113/113 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -43,7 +43,13 @@
 - Tests: trade@500 previo al primer libro (t0=1000, trade consumido); intervalos inválidos ×6 en ambas rutas; ciclo vacío con libro obsoleto y política muda (invalida antes de llamarla, `calls==[]`); no-reset con inventario 5 (detectaría un reset; el 0 no); segunda ruta camina ciclo vacío 1500 y cierra en 2000.
 - **Fin de datos (ajuste)**: `OfflineCoordinator.load_events` fija cobertura SOLO con eventos públicos; comando posterior al último evento → `ValueError` explícito en carga (motor intacto, sin pasos/decisiones/drenado/cierre extendido); sin eventos de mercado → `ValueError`. Tests: comando@2500 con datos hasta 2000 rechazado; comando en el fin (2000) admitido y pasos acotados.
 
-## Veredicto F1.3 V1–V4 (2026-09-26, hecho — 106/106 área, 528/9 suite)
+## Veredicto F1.3 W1–W4 (2026-09-26, hecho — 113/113 área, 535/9 suite)
+- **W1** (`strategy/market_state.py`): `get_snapshot()` separada en dos rutas — default sin args = legacy prod EXACTA (podas destructivas en orden histórico trade→vol 60s→momentum 15s, vía `_snapshot_legacy` + fórmulas puras sobre la deque podada); offline = `get_snapshot(now_sec, *, offline_windows)` con vistas no destructivas (`_snapshot_offline` + `_snapshot_levels` compartido). `market_maker.py:593` y `alpha_model.py:136` (sin args) intactos.
+- **W4**: `_signal_windows()` en `as_coordinator.py` (trade 60 / volatilidad `config.VOLATILITY_WINDOW_SEC` 60 / momentum `config.MOMENTUM_WINDOW_SECONDS` 30.0); `self._warmup_span = max(...)` reemplaza `_warmup_span_sec()` (eliminada); coordinador pasa ventanas en warm-up y decisión.
+- **W2**: `_feed_market_state` retorna si incorporó libro; warm-up solo cuenta/apunta `record_mid` en grupos CON libro válido Y en grilla (`_is_decision_timestamp`).
+- **W3**: `_snapshot_offline` rechaza `now_sec` anterior al estado consumido (`ValueError`); pasado vía reproducción cronológica.
+- Tests `test_as_windows.py` 13/13: cobertura (solo libro en grilla cuenta → len==1), W2 (trades sin libros no completan; frecuencia exacta 3 records en [1.0,6.0,11.0]), W3 (regresivo levanta; reproducción exacta+determinista), W4 (momentum 30≠0 vs 15==0; vol 60>0 vs 15==0 con variación entre 15-60s; coordinador usa config), expiración/no-destructivo/una-muestra/vol-60s adaptados a ventanas explícitas. `test_as_signals.py` sin cambios (ruta legacy no-arg, datos cortos → valores idénticos).
+- Sin regresiones: mismos 9 pre-existentes (`_compute_volatility` directo no tocado; los 3 de `market_state` idénticos al baseline).
 - **V3** (`strategy/market_state.py`): `_volatility_of` / `_momentum_of` puros sin mutación; `_compute_*` filtran vistas por ventana (valores idénticos a prod); `get_snapshot(now_sec=None)` con tiempo explícito opcional (None = conducta prod idéntica). Resuelve el HALLAZGO F1.3 de la deque compartida sin cambiar valores de prod.
 - **V1+V4** (`strategy/as_coordinator.py`): warm-up exige conteo Y span ≥ 60s (`_warmup_span_sec()` = max 60/15/30) + `record_mid` por grupo durante el warm-up; `_feed_market_state` valida todos los libros del grupo e incorpora solo el último válido (trades todos).
 - **V2**: `_as_decision` usa `get_snapshot(now_sec)` del ciclo (las ventanas vencen en ciclos vacíos).

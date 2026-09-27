@@ -7,12 +7,22 @@ import math
 import statistics
 import unittest
 
+from strategy import config as strategy_config
 from strategy.as_coordinator import ASCoordinator
 from strategy.execution_reconstruction import (
     ExecutionReconstructor,
     ReconstructionConfig,
 )
 from strategy.market_state import MarketState
+
+
+# Ventanas offline explícitas (W4): las de strategy.config — momentum 30s,
+# NO el local de 15s de MarketState (ese queda para la ruta prod legacy).
+WINDOWS = {"trade": 60.0, "volatility": 60.0, "momentum": 30.0}
+
+
+def _snap(ms, sec, windows=None):
+    return ms.get_snapshot(sec, offline_windows=windows or dict(WINDOWS))
 
 
 def _depth(ts_ms, bid, ask, update_id, pu, bid_qty=10, ask_qty=100):
@@ -62,9 +72,11 @@ class TestWindowCoverageGate(unittest.TestCase):
         coord.run()
         self.assertFalse(coord._warmup_complete)
         self.assertEqual(list(eng.orders.values()), [])
-        # ...pero el warm-up best-effort ya alimentó el filtro §14
+        # ...pero el warm-up best-effort ya alimentó el filtro §14 —
+        # W2: SOLO el libro en grilla (1000) cuenta; 2000/3000 están
+        # fuera de grilla (t0=1000, D=5000) y no re-alimentan.
         hist = list(coord._alpha_model._mid_history)
-        self.assertGreater(len(hist), 0)
+        self.assertEqual(len(hist), 1)
         self.assertAlmostEqual(hist[-1][1], 10000.5 * 0.0001, places=12)
 
     def test_submits_after_60s_with_fed_history(self):
@@ -96,19 +108,129 @@ class TestExplicitExpiry(unittest.TestCase):
         ms.update_depth([[1.0, 10.0]], [[1.0001, 100.0]], 1, 1000)
         ms.update_trade(1.0001, 4.0, False, 2000)
         ms.update_trade(1.0, 6.0, True, 3000)
-        fresh = ms.get_snapshot(3.0)
+        fresh = _snap(ms, 3.0)
         self.assertAlmostEqual(float(fresh["buy_volume_60s"] or 0.0), 4.0,
                                places=12)
         self.assertAlmostEqual(float(fresh["sell_volume_60s"] or 0.0), 6.0,
                                places=12)
         # A los 100s todo flujo/momentum/volatilidad expiró (mid persiste:
         # es nivel, no ventana)
-        old = ms.get_snapshot(100.0)
+        old = _snap(ms, 100.0)
         self.assertEqual(float(old["buy_volume_60s"] or 0.0), 0.0)
         self.assertEqual(float(old["sell_volume_60s"] or 0.0), 0.0)
         self.assertEqual(float(old["momentum"] or 0.0), 0.0)
         self.assertEqual(float(old["volatility"] or 0.0), 0.0)
         self.assertGreater(float(old["mid"] or 0.0), 0.0)
+
+
+class TestWarmupRealSamplesOnly(unittest.TestCase):
+    """W2: el warm-up solo cuenta libros reales en la grilla; los trades
+    no aportan muestras y AlphaModel se alimenta 1 vez por ciclo."""
+
+    def test_trades_without_new_books_do_not_complete_warmup(self):
+        depth = [_depth(1000, 10000, 10001, 1, 0)]
+        trades = [_trade(ts, f"t{i}", 10001, 2, False)
+                  for i, ts in enumerate(range(6000, 71000, 5000))]
+        eng = _engine()
+        coord = _coord(depth, trades, eng)
+        coord.run()
+        self.assertFalse(coord._warmup_complete)
+        self.assertEqual(list(eng.orders.values()), [])
+        # 12 trades en grilla, 1 solo libro real: una sola muestra
+        hist = list(coord._alpha_model._mid_history)
+        self.assertEqual(len(hist), 1)
+
+    def test_record_mid_exact_grid_frequency(self):
+        # Libros cada 1s 1000..11000 (11 grupos); solo los de grilla
+        # (1000, 6000, 11000 con t0=1000, D=5000) alimentan AlphaModel:
+        # exactamente 3 records (ventana §14 de 30s > span 10s: sin poda).
+        depth = [_depth(ts, 10000, 10001, uid + 1, uid)
+                 for uid, ts in enumerate(range(1000, 11001, 1000))]
+        eng = _engine()
+        coord = _coord(depth, [], eng)
+        coord.run()
+        self.assertFalse(coord._warmup_complete)
+        hist = list(coord._alpha_model._mid_history)
+        self.assertEqual(len(hist), 3)
+        self.assertEqual([t for t, _ in hist], [1.0, 6.0, 11.0])
+
+
+class TestRegressiveQueriesRejected(unittest.TestCase):
+    """W3: consultar antes del estado consumido levanta; el pasado se
+    prueba por reproducción cronológica."""
+
+    def _full_state(self):
+        ms = MarketState(symbol="xrpusdc", real=False)
+        for i in range(36):
+            ts = 1000 + i * 2000
+            m = 1.0 + (0.001 if i % 2 == 0 else 0.0)
+            ms.update_bookticker(m - 0.00005, 10.0, m + 0.00005, 100.0, ts)
+        return ms
+
+    def test_query_before_consumed_state_raises(self):
+        ms = self._full_state()  # consumido hasta 71s
+        with self.assertRaises(ValueError):
+            ms.get_snapshot(12.0, offline_windows=dict(WINDOWS))
+
+    def test_past_via_chronological_reproduction(self):
+        # Mismo prefijo (t=1..11s) en dos estados frescos: valores exactos
+        # y deterministas — así se prueba el pasado, no consultando atrás.
+        def build():
+            ms = MarketState(symbol="xrpusdc", real=False)
+            for i in range(6):
+                ts = 1000 + i * 2000
+                m = 1.0 + (0.001 if i % 2 == 0 else 0.0)
+                ms.update_bookticker(m - 0.00005, 10.0,
+                                     m + 0.00005, 100.0, ts)
+            return ms
+        a, b = build(), build()
+        sa, sb = _snap(a, 11.0), _snap(b, 11.0)
+        self.assertAlmostEqual(float(sa["mid"] or 0.0),
+                               1.0 + (0.001 if 5 % 2 == 0 else 0.0),
+                               places=12)
+        self.assertGreater(float(sa["volatility"] or 0.0), 0.0)
+        self.assertEqual(sa["volatility"], sb["volatility"])
+        self.assertEqual(sa["momentum"], sb["momentum"])
+
+
+class TestConfigurableWindows(unittest.TestCase):
+    """W4: la ruta offline usa ventanas explícitas (momentum 30s de
+    config, no el local de 15s)."""
+
+    def _varied_state(self):
+        # Variación t=1..55s (alternada), plano t=57..71s: la variación
+        # vive ENTRE 15 y 60s de antigüedad al consultar en 71s.
+        ms = MarketState(symbol="xrpusdc", real=False)
+        for i in range(36):
+            ts = 1000 + i * 2000
+            m = (1.0 + (0.001 if i % 2 == 0 else 0.0)) if i < 28 else 1.0
+            ms.update_bookticker(m - 0.00005, 10.0, m + 0.00005, 100.0, ts)
+        return ms
+
+    def test_momentum_window_from_config(self):
+        ms = self._varied_state()
+        m30 = _snap(ms, 71.0)
+        self.assertAlmostEqual(float(m30["momentum"] or 0.0), -0.001,
+                               places=12)
+        m15 = ms.get_snapshot(71.0, offline_windows={
+            "trade": 60.0, "volatility": 60.0, "momentum": 15.0})
+        self.assertEqual(float(m15["momentum"] or 0.0), 0.0)
+
+    def test_volatility_window_sees_old_variation(self):
+        ms = self._varied_state()
+        v60 = _snap(ms, 71.0)
+        self.assertGreater(float(v60["volatility"] or 0.0), 0.0)
+        v15 = ms.get_snapshot(71.0, offline_windows={
+            "trade": 60.0, "volatility": 15.0, "momentum": 30.0})
+        self.assertEqual(float(v15["volatility"] or 0.0), 0.0)
+
+    def test_coordinator_windows_come_from_config(self):
+        coord = _coord([], [], _engine())
+        self.assertEqual(coord._signal_windows["momentum"],
+                         float(strategy_config.MOMENTUM_WINDOW_SECONDS))
+        self.assertNotEqual(coord._signal_windows["momentum"], 15.0)
+        self.assertEqual(coord._warmup_span,
+                         max(coord._signal_windows.values()))
 
 
 class TestNonDestructiveQueries(unittest.TestCase):
@@ -121,9 +243,9 @@ class TestNonDestructiveQueries(unittest.TestCase):
             m = 1.0 + (0.001 if i % 2 else 0.0)
             ms.update_bookticker(m - 0.00005, 10.0, m + 0.00005, 100.0, ts)
         n0 = len(ms._mid_samples)
-        s1 = ms.get_snapshot(71.0)
+        s1 = _snap(ms, 71.0)
         n1 = len(ms._mid_samples)
-        s2 = ms.get_snapshot(71.0)
+        s2 = _snap(ms, 71.0)
         self.assertEqual(n0, n1)
         self.assertEqual(s1["volatility"], s2["volatility"])
         self.assertEqual(s1["momentum"], s2["momentum"])
@@ -156,7 +278,10 @@ class TestOneSamplePerGroup(unittest.TestCase):
 
 class TestSixtySecondVolWindow(unittest.TestCase):
     """La ventana de vol es 60s reales: 70s de datos con 60s finales
-    planos dan sigma 0 (el pasado variable queda fuera)."""
+    planos dan sigma 0 (el pasado variable queda fuera). El contrapeso
+    con variación ENTRE 15 y 60s vive en TestConfigurableWindows (W4);
+    la consulta al pasado (12s) está prohibida (W3) y se prueba por
+    reproducción cronológica en TestRegressiveQueriesRejected."""
 
     def test_vol_uses_only_60s_window(self):
         ms = MarketState(symbol="xrpusdc", real=False)
@@ -165,14 +290,11 @@ class TestSixtySecondVolWindow(unittest.TestCase):
         for i, m in enumerate(mids):
             ts = 1000 + i * 2000
             ms.update_bookticker(m - 0.00005, 10.0, m + 0.00005, 100.0, ts)
-        snap = ms.get_snapshot(71.0)
+        snap = _snap(ms, 71.0)
         # Ventana (11s, 71s]: todo plano -> solo retornos 0 -> sigma 0
         self.assertEqual(snap["volatility"], 0.0)
         # ...y la deque conserva las 36 muestras (sin poda destructiva)
         self.assertEqual(len(ms._mid_samples), 36)
-        # Contrapeso: a t=12s la ventana aún incluye variación -> sigma > 0
-        early = ms.get_snapshot(12.0)
-        self.assertGreater(early["volatility"], 0.0)
 
 
 if __name__ == "__main__":

@@ -21,8 +21,7 @@ from strategy.calendar import (
 )
 from strategy.alpha_model import AlphaModel
 from strategy.market_state import (
-    ALPHA_WINDOW_SEC,
-    VOLATILITY_WINDOW_SEC,
+    TRADE_WINDOW_SEC,
     MarketState,
 )
 
@@ -32,14 +31,15 @@ except ImportError:  # pragma: no cover - mismo fallback que market_state
     import config as _strategy_config
 
 
-def _warmup_span_sec():
-    """Cobertura mínima de warm-up: la ventana más larga entre señales
-    (MarketState) y filtro de momentum del AlphaModel (config)."""
-    return max(
-        float(VOLATILITY_WINDOW_SEC),
-        float(ALPHA_WINDOW_SEC),
-        float(getattr(_strategy_config, "MOMENTUM_WINDOW_SECONDS", 30.0)),
-    )
+def _signal_windows():
+    """Ventanas EXPLÍCITAS de la ruta offline (W4): señales y warm-up usan
+    la config unificada — momentum de strategy.config (30s), NO el local
+    de 15s de MarketState (ese queda solo para la ruta prod legacy)."""
+    return {
+        "trade": float(TRADE_WINDOW_SEC),
+        "volatility": float(getattr(_strategy_config, "VOLATILITY_WINDOW_SEC", 60)),
+        "momentum": float(getattr(_strategy_config, "MOMENTUM_WINDOW_SECONDS", 30.0)),
+    }
 
 
 # ── Coordinator configuration ─────────────────────────────────────────
@@ -74,10 +74,13 @@ class ASCoordinator:
     - Market signals (F1.3): owns a REAL MarketState (no WS started) fed with
       the same causal events the engine consumes (books/trades from t0, prices
       converted ticks→USDC, qty lots→XRP). The A-S policy reads
-      MarketState.get_snapshot(now_sec) with the EXPLICIT cycle time — windows
-      expire against the simulated clock (including empty cycles) — so
-      imbalance/microprice/momentum/volatility use the exact production
-      formulas (no parallel estimators) with non-destructive queries (V3).
+      MarketState.get_snapshot(now_sec, offline_windows=...) with the EXPLICIT
+      cycle time and EXPLICIT unified windows (W4: trade/volatilidad/momentum
+      de strategy.config — la ruta prod legacy sin args queda intacta, W1;
+      consultas regresivas rechazadas, W3) — windows expire against the
+      simulated clock (including empty cycles) — so imbalance/microprice/
+      momentum/volatility use the exact production formulas (no parallel
+      estimators) with non-destructive queries (V3).
       Same-timestamp books: all validated, only the last incorporated (V4).
     """
 
@@ -120,6 +123,11 @@ class ASCoordinator:
         self._warmup_mids: List[float] = []
         self._best_bid: float = 0.0
         self._best_ask: float = 0.0
+
+        # W4: ventanas explícitas offline + cobertura mínima de warm-up
+        # (la más larga: con defaults 60s de volatilidad/trade).
+        self._signal_windows = _signal_windows()
+        self._warmup_span = max(self._signal_windows.values())
 
         # F1.3: real signal stack, driven by the SIMULATED clock. MarketState
         # is fed exclusively from the causal event stream (never wall-clock,
@@ -214,8 +222,11 @@ class ASCoordinator:
 
     def _feed_market_state(
         self, ts_ms: int, events: Sequence[Dict[str, Any]]
-    ) -> None:
+    ) -> bool:
         """Feed the owned MarketState with already-consumed causal events.
+        Retorna True si el grupo incorporó un libro válido (una muestra
+        real de mid); False si solo hubo trades o libros inválidos (W2:
+        esos grupos NO cuentan para el warm-up ni alimentan AlphaModel).
 
         Must be called AFTER a successful engine.advance_to(ts, events): the
         same flattened event dicts (book/trade with top-level keys). Unit
@@ -273,6 +284,8 @@ class ASCoordinator:
             self._market_state.update_depth(
                 bids_usdc, asks_usdc, len(bids_usdc), ts_ms
             )
+            return True
+        return False
 
     # ── Warm-up phase ───────────────────────────────────────────────────
 
@@ -281,20 +294,22 @@ class ASCoordinator:
 
         V1: warmup_intervals mids ya no bastan — se exige además que el span
         (último menos primer mid, en segundos) cubra la ventana más larga
-        entre señales y filtro de momentum. Sin cobertura no hay submits.
+        de las ventanas offline explícitas (W4). Sin cobertura no hay submits.
+        Las muestras solo vienen de libros reales en la grilla (W2).
         """
         if len(self._warmup_mids) < self.warmup_intervals:
             return False
         span = self._warmup_ts[-1] - self._warmup_ts[0]
-        return span >= _warmup_span_sec()
+        return span >= self._warmup_span
 
     def _warmup_phase(self) -> None:
         """Warm-up: advance advance_to() without apply_commands until having
         BOTH warmup_intervals mids AND window coverage (span >= longest
-        signal/momentum window). One mid sample per timestamp group (V4);
-        each group mid also feeds the shared AlphaModel history via
-        record_mid (V1: el filtro §14 llega con historial a la primera
-        decisión — nunca empieza vacío tras el warm-up).
+        offline window, W4). Solo cuentan muestras REALES de libros en la
+        grilla de decisión (W2): los grupos de solo-trades o fuera de grilla
+        alimentan el estado pero no el conteo; el historial AlphaModel se
+        alimenta una vez por ciclo de grilla con libro (misma frecuencia que
+        en el main loop — nunca por evento).
 
         After warmup, _warmup_complete=True and the main loop may emit decisions.
         The phase is idempotent: a second call returns immediately (the engine
@@ -339,9 +354,10 @@ class ASCoordinator:
             # Advance to this timestamp (no apply_commands during warmup)
             self.engine.advance_to(ts_ms, market_events_for_advance)
             self._warmup_last_ts = ts_ms
-            # Same causal events feed the signal stack (one sample per
-            # timestamp group — V4 inside _feed_market_state)
-            self._feed_market_state(ts_ms, market_events_for_advance)
+            # Same causal events feed the signal stack; solo los grupos CON
+            # libro incorporan muestra (W2) y solo en la grilla alimentan
+            # el historial AlphaModel (frecuencia 1/ciclo, como el loop).
+            fed_book = self._feed_market_state(ts_ms, market_events_for_advance)
 
             # Update best bid/ask from the engine's internal book
             if getattr(self.engine, "book", None) and self.engine.book:
@@ -352,15 +368,17 @@ class ASCoordinator:
                 if asks:
                     self._best_ask = float(asks[0][0])
 
-            # Mid consistente con la ruta de decisión: el del snapshot con
-            # tiempo explícito (V2). Una muestra por grupo (V4).
-            ts_sec = float(ts_ms) / 1000.0
-            mid = self._market_state.get_snapshot(ts_sec).get("mid") or 0.0
-            if mid > 0:
-                self._warmup_mids.append(float(mid))
-                self._warmup_ts.append(ts_sec)
-                # Historial AlphaModel alimentado DURANTE el warm-up (V1)
-                self._alpha_model.record_mid(ts_sec, float(mid))
+            # Mid consistente con la ruta de decisión: el del snapshot
+            # offline con tiempo explícito (V2). Solo muestra real de libro
+            # en ts de grilla (W2).
+            if fed_book and self._is_decision_timestamp(ts_ms):
+                ts_sec = float(ts_ms) / 1000.0
+                mid = self._market_state.get_snapshot(
+                    ts_sec, offline_windows=self._signal_windows).get("mid") or 0.0
+                if mid > 0:
+                    self._warmup_mids.append(float(mid))
+                    self._warmup_ts.append(ts_sec)
+                    self._alpha_model.record_mid(ts_sec, float(mid))
 
         # Warm-up completo solo con conteo Y cobertura de ventanas
         self._warmup_complete = self._warmup_ready()
@@ -398,7 +416,9 @@ class ASCoordinator:
         # V2: tiempo explícito del ciclo — las ventanas vencen contra el
         # reloj simulado (en ciclos vacíos las observaciones viejas expiran;
         # pasar now_sec solo a quote_distances no corregiría las señales).
-        ms_snap = self._market_state.get_snapshot(now_sec)
+        # Ventanas offline explícitas (W4) + rechazo regresivo (W3).
+        ms_snap = self._market_state.get_snapshot(
+            now_sec, offline_windows=self._signal_windows)
         mid = ms_snap.get("mid") or 0.0
         if mid <= 0:
             return []

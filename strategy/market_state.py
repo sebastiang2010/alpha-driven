@@ -275,73 +275,135 @@ class MarketState:
         return self._momentum_of(window)
 
     # ── Snapshot para market_maker ─────────────────────────────────
-    def get_snapshot(self, now_sec=None):
+    def get_snapshot(self, now_sec=None, *, offline_windows=None):
         """
         Copia segura de todo el estado (lock adquirido, copiado, liberado).
         El contrato del dict es estable: inventory/pnl los rellena
         market_maker, acá solo se deja el espacio definido.
 
-        now_sec (V2, ruta offline): instante explícito en segundos contra el
-        que se vencen TODAS las ventanas (trade flow, volatilidad, momentum).
-        Si es None (producción), se usa el ts del último evento, idéntico a
-        la conducta anterior. Las consultas no mutan _mid_samples (V3).
+        Dos rutas separadas (W1):
+        - Producción (default, sin args): conducta ORIGINAL exacta — podas
+          destructivas incluidas (primero volatilidad a 60s, luego momentum
+          a 15s). La usa market_maker (get_snapshot() sin args).
+        - Offline (now_sec + offline_windows explícitos): consultas NO
+          destructivas con ventanas configurables; rechaza consultas
+          anteriores al estado consumido (W3). La usa el coordinador
+          offline con las ventanas de strategy.config.
         """
         with self._lock:
             if now_sec is None:
-                now_sec = self._to_sec(self.last_update_ts) or 0.0
-            else:
-                now_sec = float(now_sec)
+                if offline_windows is None:
+                    return self._snapshot_legacy()
+                raise ValueError(
+                    "offline get_snapshot requires an explicit now_sec"
+                )
+            if offline_windows is None:
+                raise ValueError(
+                    "offline get_snapshot requires explicit offline_windows "
+                    "{'trade':.., 'volatility':.., 'momentum':..}"
+                )
+            return self._snapshot_offline(float(now_sec), offline_windows)
 
-            # trade flow en los últimos TRADE_WINDOW_SEC
-            self._prune_deque(self._trade_flow, now_sec, TRADE_WINDOW_SEC)
-            buy_vol = sum(q for _, q, s in self._trade_flow if s == "buy")
-            sell_vol = sum(q for _, q, s in self._trade_flow if s == "sell")
-            arrival = len(self._trade_flow)
+    def _snapshot_legacy(self):
+        """Ruta producción ORIGINAL (asume lock tomado). Podas destructivas
+        en el orden histórico: trade flow → volatilidad (60s) → momentum
+        (15s). Idéntica a la versión pre-V3 caracter por caracter en
+        comportamiento."""
+        now_sec = self._to_sec(self.last_update_ts) or 0.0
 
-            mid = self._mid()
-            spread = self._spread()
-            spread_pct = self._spread_pct()
+        # trade flow en los últimos TRADE_WINDOW_SEC
+        self._prune_deque(self._trade_flow, now_sec, TRADE_WINDOW_SEC)
+        buy_vol = sum(q for _, q, s in self._trade_flow if s == "buy")
+        sell_vol = sum(q for _, q, s in self._trade_flow if s == "sell")
+        arrival = len(self._trade_flow)
 
-            # imbalance desde el depth (división segura)
-            imbalance = self._safe_div(
-                self.bid_volume_top - self.ask_volume_top,
-                self.bid_volume_top + self.ask_volume_top,
+        snapshot = self._snapshot_levels()
+        # Orden histórico: volatilidad poda a 60s, momentum recorta a 15s.
+        self._prune_deque(self._mid_samples, now_sec, VOLATILITY_WINDOW_SEC)
+        snapshot["volatility"] = self._volatility_of(self._mid_samples)
+        self._prune_deque(self._mid_samples, now_sec, ALPHA_WINDOW_SEC)
+        snapshot["momentum"] = self._momentum_of(self._mid_samples)
+        snapshot["buy_volume_60s"] = buy_vol
+        snapshot["sell_volume_60s"] = sell_vol
+        snapshot["trade_arrival_rate"] = arrival
+        return snapshot
+
+    def _snapshot_offline(self, now_sec, windows):
+        """Ruta offline (asume lock tomado). Vistas filtradas no
+        destructivas con ventanas EXPLÍCITAS; mid/spread/imbalance/
+        microprice son niveles actuales (sin libro histórico: el pasado se
+        prueba por reproducción cronológica, W3)."""
+        try:
+            trade_w = float(windows["trade"])
+            vol_w = float(windows["volatility"])
+            mom_w = float(windows["momentum"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "offline_windows must be {'trade':.., 'volatility':.., "
+                "'momentum':..} in seconds"
+            )
+        consumed = self.last_update_ts
+        if consumed is not None:
+            consumed_s = float(consumed) / 1000.0
+            if now_sec < consumed_s:
+                raise ValueError(
+                    f"regressive offline query: {now_sec}s < consumed "
+                    f"{consumed_s}s (reproduce the past "
+                    "chronologically instead)"
+                )
+        flow = [t for t in self._trade_flow if t[0] >= now_sec - trade_w]
+        snapshot = self._snapshot_levels()
+        snapshot["buy_volume_60s"] = sum(q for _, q, s in flow if s == "buy")
+        snapshot["sell_volume_60s"] = sum(q for _, q, s in flow if s == "sell")
+        snapshot["trade_arrival_rate"] = len(flow)
+        snapshot["volatility"] = self._volatility_of(
+            [s for s in self._mid_samples if s[0] >= now_sec - vol_w])
+        snapshot["momentum"] = self._momentum_of(
+            [s for s in self._mid_samples if s[0] >= now_sec - mom_w])
+        return snapshot
+
+    def _snapshot_levels(self):
+        """Niveles actuales + contrato base del dict (asume lock tomado)."""
+        mid = self._mid()
+        spread = self._spread()
+        spread_pct = self._spread_pct()
+
+        # imbalance desde el depth (división segura)
+        imbalance = self._safe_div(
+            self.bid_volume_top - self.ask_volume_top,
+            self.bid_volume_top + self.ask_volume_top,
+        )
+
+        # microprice §7: (Ask*BidSize + Bid*AskSize) / (BidSize + AskSize)
+        microprice = 0.0
+        if (self.best_bid is not None and self.best_ask is not None
+                and self.best_bid_qty is not None and self.best_ask_qty is not None):
+            microprice = self._safe_div(
+                self.best_ask * self.best_bid_qty + self.best_bid * self.best_ask_qty,
+                self.best_bid_qty + self.best_ask_qty,
             )
 
-            # microprice §7: (Ask*BidSize + Bid*AskSize) / (BidSize + AskSize)
-            microprice = 0.0
-            if (self.best_bid is not None and self.best_ask is not None
-                    and self.best_bid_qty is not None and self.best_ask_qty is not None):
-                microprice = self._safe_div(
-                    self.best_ask * self.best_bid_qty + self.best_bid * self.best_ask_qty,
-                    self.best_bid_qty + self.best_ask_qty,
-                )
-
-            volatility = self._compute_volatility(now_sec)
-            momentum = self._compute_momentum(now_sec)
-
-            snapshot = {
-                "ts": self.last_update_ts,
-                "mid": mid,
-                "best_bid": self.best_bid,
-                "best_ask": self.best_ask,
-                "spread": spread,
-                "spread_pct": spread_pct,
-                "imbalance": imbalance,
-                "microprice": microprice,
-                "bid_volume_top": self.bid_volume_top,
-                "ask_volume_top": self.ask_volume_top,
-                "buy_volume_60s": buy_vol,
-                "sell_volume_60s": sell_vol,
-                "trade_arrival_rate": arrival,
-                "volatility": volatility,
-                "momentum": momentum,
-                "inventory": 0.0,       # lo rellena market_maker
-                "unrealized_pnl": 0.0,  # lo rellena market_maker
-                "realized_pnl": 0.0,    # lo rellena market_maker
-                "fill_count": 0,        # lo rellena market_maker
-            }
-            return snapshot
+        return {
+            "ts": self.last_update_ts,
+            "mid": mid,
+            "best_bid": self.best_bid,
+            "best_ask": self.best_ask,
+            "spread": spread,
+            "spread_pct": spread_pct,
+            "imbalance": imbalance,
+            "microprice": microprice,
+            "bid_volume_top": self.bid_volume_top,
+            "ask_volume_top": self.ask_volume_top,
+            "buy_volume_60s": 0.0,
+            "sell_volume_60s": 0.0,
+            "trade_arrival_rate": 0,
+            "volatility": 0.0,
+            "momentum": 0.0,
+            "inventory": 0.0,       # lo rellena market_maker
+            "unrealized_pnl": 0.0,  # lo rellena market_maker
+            "realized_pnl": 0.0,    # lo rellena market_maker
+            "fill_count": 0,        # lo rellena market_maker
+        }
 
     # ── Ciclo de vida de los WebSockets ────────────────────────────
     def start_ws(self):
