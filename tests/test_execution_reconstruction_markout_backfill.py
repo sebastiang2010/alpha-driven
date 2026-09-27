@@ -165,6 +165,28 @@ class TestMarkoutBackfill(unittest.TestCase):
         self.assertEqual(fill.markout_reason, "ok")
         self.assertIsNotNone(fill.adverse_5s)
 
+    def test_tolerance_boundary_plus_500ms_is_ok(self):
+        """Q2: book exactamente a +500ms del firing (límite inclusivo) ->
+        motivo 'ok' con adverse valuado."""
+        rec = self._make_rec()
+        fill = self._submit_and_fill(rec, 1100, uid_start=1)
+        # firing = 6100; book en 6600 = +500ms exactos (tolerancia inclusiva)
+        rec.advance_to(6600, [_book(6600, 9990, 9991, 3, 2)])
+        self.assertEqual(fill.markout_reason, "ok")
+        self.assertIsNotNone(fill.adverse_5s)
+        assert fill.adverse_5s is not None
+        self.assertAlmostEqual(fill.adverse_5s, (9990.5 - 10000) / 10000,
+                               places=10)
+
+    def test_tolerance_boundary_plus_501ms_is_late_book(self):
+        """Q2: book a +501ms del firing -> 'late_book', adverse None."""
+        rec = self._make_rec()
+        fill = self._submit_and_fill(rec, 1100, uid_start=1)
+        # firing = 6100; book en 6601 = +501ms (fuera de tolerancia)
+        rec.advance_to(6601, [_book(6601, 9990, 9991, 3, 2)])
+        self.assertEqual(fill.markout_reason, "late_book")
+        self.assertIsNone(fill.adverse_5s)
+
 
 if __name__ == "__main__":
     unittest.main()

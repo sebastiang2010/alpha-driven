@@ -21,8 +21,10 @@ from strategy.calendar import (
 )
 from strategy.alpha_model import AlphaModel
 from strategy.market_state import (
-    TRADE_WINDOW_SEC,
+    MIN_MID_SAMPLES,
+    SignalWindows,
     MarketState,
+    TRADE_FLOW_WINDOW_SEC,
     lots_to_xrp,
     ticks_to_usdc,
     usdc_to_ticks,
@@ -35,14 +37,16 @@ except ImportError:  # pragma: no cover - mismo fallback que market_state
 
 
 def _signal_windows():
-    """Ventanas EXPLÍCITAS de la ruta offline (W4): señales y warm-up usan
-    la config unificada — momentum de strategy.config (30s), NO el local
-    de 15s de MarketState (ese queda solo para la ruta prod legacy)."""
-    return {
-        "trade": float(TRADE_WINDOW_SEC),
-        "volatility": float(getattr(_strategy_config, "VOLATILITY_WINDOW_SEC", 60)),
-        "momentum": float(getattr(_strategy_config, "MOMENTUM_WINDOW_SECONDS", 30.0)),
-    }
+    """Ventanas EXPLÍCITAS de la ruta offline (W4/Q1): señales y warm-up
+    usan la config unificada — momentum de strategy.config (30s), NO el
+    local de 15s de MarketState (ese queda solo para la ruta prod legacy).
+    Estructura Frozen por valor (Q1: sin dicts, sin aliasing)."""
+    return SignalWindows(
+        trade_flow_window_sec=float(TRADE_FLOW_WINDOW_SEC),
+        volatility_window_sec=float(getattr(_strategy_config, "VOLATILITY_WINDOW_SEC", 60)),
+        momentum_window_sec=float(getattr(_strategy_config, "MOMENTUM_WINDOW_SECONDS", 30.0)),
+        min_mid_samples=int(MIN_MID_SAMPLES),
+    )
 
 
 # ── Coordinator configuration ─────────────────────────────────────────
@@ -77,7 +81,7 @@ class ASCoordinator:
     - Market signals (F1.3): owns a REAL MarketState (no WS started) fed with
       the same causal events the engine consumes (books/trades from t0, prices
       converted ticks→USDC, qty lots→XRP). The A-S policy reads
-      MarketState.get_snapshot(now_sec, offline_windows=...) with the EXPLICIT
+      MarketState(signal_windows=...) + get_snapshot(now_sec) with the EXPLICIT
       cycle time and EXPLICIT unified windows (W4: trade/volatilidad/momentum
       de strategy.config — la ruta prod legacy sin args queda intacta, W1;
       consultas regresivas rechazadas, W3) — windows expire against the
@@ -130,7 +134,11 @@ class ASCoordinator:
         # W4: ventanas explícitas offline + cobertura mínima de warm-up
         # (la más larga: con defaults 60s de volatilidad/trade).
         self._signal_windows = _signal_windows()
-        self._warmup_span = max(self._signal_windows.values())
+        self._warmup_span = max(
+            self._signal_windows.trade_flow_window_sec,
+            self._signal_windows.volatility_window_sec,
+            self._signal_windows.momentum_window_sec,
+        )
 
         # F1.3: real signal stack, driven by the SIMULATED clock. MarketState
         # is fed exclusively from the causal event stream (never wall-clock,
@@ -141,7 +149,8 @@ class ASCoordinator:
             or getattr(getattr(engine, "config", None), "symbol", None)
             or "xrpusdc"
         )
-        self._market_state = MarketState(str(symbol))
+        self._market_state = MarketState(str(symbol),
+                                               signal_windows=self._signal_windows)
         self._alpha_model = AlphaModel()
 
         # Delayed replacement: track which sides are "occupied" after a cancel
@@ -418,7 +427,7 @@ class ASCoordinator:
             if fed_book:
                 ts_sec = float(ts_ms) / 1000.0
                 mid = self._market_state.get_snapshot(
-                    ts_sec, offline_windows=self._signal_windows).get("mid") or 0.0
+                    ts_sec, ).get("mid") or 0.0
                 if mid > 0:
                     self._warmup_mids.append(float(mid))
                     self._warmup_ts.append(ts_sec)
@@ -434,7 +443,7 @@ class ASCoordinator:
                 self._assert_consumed(grid_sec)
                 grid_mid = self._market_state.get_snapshot(
                     grid_sec,
-                    offline_windows=self._signal_windows).get("mid") or 0.0
+                    ).get("mid") or 0.0
                 if grid_mid > 0:
                     self._alpha_model.record_mid(grid_sec, float(grid_mid))
                 fresh_book_pending = False
@@ -479,7 +488,7 @@ class ASCoordinator:
         # capa: assert del coordinador + validación de MarketState).
         self._assert_consumed(now_sec)
         ms_snap = self._market_state.get_snapshot(
-            now_sec, offline_windows=self._signal_windows)
+            now_sec, )
         mid = ms_snap.get("mid") or 0.0
         if mid <= 0:
             return []

@@ -17,17 +17,25 @@ from strategy.execution_reconstruction import (
 from strategy.market_state import (
     MIN_MID_SAMPLES,
     MarketState,
+    SignalWindows,
     usdc_to_ticks,
 )
 
 
 # Ventanas offline explícitas (W4): las de strategy.config — momentum 30s,
 # NO el local de 15s de MarketState (ese queda para la ruta prod legacy).
-WINDOWS = {"trade": 60.0, "volatility": 60.0, "momentum": 30.0}
+WINDOWS = SignalWindows(trade_flow_window_sec=60.0,
+                        volatility_window_sec=60.0,
+                        momentum_window_sec=30.0)
 
 
-def _snap(ms, sec, windows=None):
-    return ms.get_snapshot(sec, offline_windows=windows or dict(WINDOWS))
+def _ms(windows=None):
+    return MarketState(symbol="xrpusdc", real=False,
+                       signal_windows=windows or WINDOWS)
+
+
+def _snap(ms, sec):
+    return ms.get_snapshot(sec)
 
 
 def _depth(ts_ms, bid, ask, update_id, pu, bid_qty=10, ask_qty=100):
@@ -109,7 +117,7 @@ class TestExplicitExpiry(unittest.TestCase):
     directo, sin coordinador)."""
 
     def test_stale_observations_expire(self):
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms()
         ms.update_bookticker(1.0, 10.0, 1.0001, 100.0, 1000)
         ms.update_depth([[1.0, 10.0]], [[1.0001, 100.0]], 1, 1000)
         ms.update_trade(1.0001, 4.0, False, 2000)
@@ -166,7 +174,7 @@ class TestRegressiveQueriesRejected(unittest.TestCase):
     prueba por reproducción cronológica."""
 
     def _full_state(self):
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms()
         for i in range(36):
             ts = 1000 + i * 2000
             m = 1.0 + (0.001 if i % 2 == 0 else 0.0)
@@ -176,13 +184,13 @@ class TestRegressiveQueriesRejected(unittest.TestCase):
     def test_query_before_consumed_state_raises(self):
         ms = self._full_state()  # consumido hasta 71s
         with self.assertRaises(ValueError):
-            ms.get_snapshot(12.0, offline_windows=dict(WINDOWS))
+            ms.get_snapshot(12.0)
 
     def test_past_via_chronological_reproduction(self):
         # Mismo prefijo (t=1..11s) en dos estados frescos: valores exactos
         # y deterministas — así se prueba el pasado, no consultando atrás.
         def build():
-            ms = MarketState(symbol="xrpusdc", real=False)
+            ms = _ms()
             for i in range(6):
                 ts = 1000 + i * 2000
                 m = 1.0 + (0.001 if i % 2 == 0 else 0.0)
@@ -203,10 +211,10 @@ class TestConfigurableWindows(unittest.TestCase):
     """W4: la ruta offline usa ventanas explícitas (momentum 30s de
     config, no el local de 15s)."""
 
-    def _varied_state(self):
+    def _varied_state(self, windows=None):
         # Variación t=1..55s (alternada), plano t=57..71s: la variación
         # vive ENTRE 15 y 60s de antigüedad al consultar en 71s.
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms(windows)
         for i in range(36):
             ts = 1000 + i * 2000
             m = (1.0 + (0.001 if i % 2 == 0 else 0.0)) if i < 28 else 1.0
@@ -218,32 +226,34 @@ class TestConfigurableWindows(unittest.TestCase):
         m30 = _snap(ms, 71.0)
         self.assertAlmostEqual(float(m30["momentum"] or 0.0), -0.001,
                                places=12)
-        m15 = ms.get_snapshot(71.0, offline_windows={
-            "trade": 60.0, "volatility": 60.0, "momentum": 15.0})
+        m15 = _snap(self._varied_state(SignalWindows(60.0, 60.0, 15.0)),
+                      71.0)
         self.assertEqual(float(m15["momentum"] or 0.0), 0.0)
 
     def test_volatility_window_sees_old_variation(self):
         ms = self._varied_state()
         v60 = _snap(ms, 71.0)
         self.assertGreater(float(v60["volatility"] or 0.0), 0.0)
-        v15 = ms.get_snapshot(71.0, offline_windows={
-            "trade": 60.0, "volatility": 15.0, "momentum": 30.0})
+        v15 = _snap(self._varied_state(SignalWindows(60.0, 15.0, 30.0)),
+                      71.0)
         self.assertEqual(float(v15["volatility"] or 0.0), 0.0)
 
     def test_coordinator_windows_come_from_config(self):
         coord = _coord([], [], _engine())
-        self.assertEqual(coord._signal_windows["momentum"],
+        self.assertEqual(coord._signal_windows.momentum_window_sec,
                          float(strategy_config.MOMENTUM_WINDOW_SECONDS))
-        self.assertNotEqual(coord._signal_windows["momentum"], 15.0)
+        self.assertNotEqual(coord._signal_windows.momentum_window_sec, 15.0)
         self.assertEqual(coord._warmup_span,
-                         max(coord._signal_windows.values()))
+                         max(coord._signal_windows.trade_flow_window_sec,
+                             coord._signal_windows.volatility_window_sec,
+                             coord._signal_windows.momentum_window_sec))
 
 
 class TestNonDestructiveQueries(unittest.TestCase):
     """V3: snapshots repetidos no se alteran entre sí ni podan la deque."""
 
     def test_repeated_snapshots_stable_and_deque_intact(self):
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms()
         for i in range(36):
             ts = 1000 + i * 2000  # 1s..71s cada 2s
             m = 1.0 + (0.001 if i % 2 else 0.0)
@@ -290,7 +300,7 @@ class TestSixtySecondVolWindow(unittest.TestCase):
     reproducción cronológica en TestRegressiveQueriesRejected."""
 
     def test_vol_uses_only_60s_window(self):
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms()
         # t=1..9s alternados, luego plano 1.0 hasta t=71s (cada 2s)
         mids = [1.0, 1.001, 1.0, 1.001, 1.0] + [1.0] * 31
         for i, m in enumerate(mids):
@@ -413,7 +423,7 @@ class TestMicropricePriceBasis(unittest.TestCase):
         buys = [c for c in cmds if c["side"] == "BUY"]
         self.assertEqual(len(buys), 1)
 
-        ms_snap = coord._market_state.get_snapshot(1.0, offline_windows=dict(WINDOWS))
+        ms_snap = coord._market_state.get_snapshot(1.0)
         mp = float(ms_snap["microprice"])
         mid = float(ms_snap["mid"])
         self.assertGreater(abs(mp - mid), 0)  # el caso distingue
@@ -442,7 +452,7 @@ class TestConsumedClockBoundary(unittest.TestCase):
     consumido vale; un ms antes levanta. El coordinador lo trackea."""
 
     def _fed_state(self, upto_ms=61000):
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms()
         for ts in range(1000, upto_ms + 1, 5000):
             ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, ts)
         return ms
@@ -465,13 +475,13 @@ class TestConsumedClockBoundary(unittest.TestCase):
         coord._feed_market_state(1000, [book])
         self.assertEqual(coord._last_feed_ts, 1000)
         with self.assertRaises(ValueError):
-            coord._market_state.get_snapshot(0.5, offline_windows=dict(WINDOWS))
+            coord._market_state.get_snapshot(0.5)
         trade = {"ts_ms": 2000, "kind": "trade", "trade_id": "t",
                  "price_ticks": 10000, "qty_lots": 2, "is_buyer_maker": True}
         coord._feed_market_state(2000, [trade])
         self.assertEqual(coord._last_feed_ts, 2000)
         with self.assertRaises(ValueError):
-            coord._market_state.get_snapshot(1.5, offline_windows=dict(WINDOWS))
+            coord._market_state.get_snapshot(1.5)
 
 
 class TestReadinessFollowsConfiguredSpan(unittest.TestCase):
@@ -482,15 +492,14 @@ class TestReadinessFollowsConfiguredSpan(unittest.TestCase):
         depth, _ = _dense(t_start=1000, t_end=11000, step=5000)
         eng = _engine()
         coord = _coord(depth, [], eng)
-        coord._signal_windows = {"trade": 10.0, "volatility": 10.0,
-                                 "momentum": 10.0}
+        coord._signal_windows = SignalWindows(10.0, 10.0, 10.0)
         coord._warmup_span = 10.0
         coord.run()
         self.assertTrue(coord._warmup_complete)  # span 10s basta
 
     def test_min_samples_constant(self):
         self.assertEqual(MIN_MID_SAMPLES, 3)
-        ms = MarketState(symbol="xrpusdc", real=False)
+        ms = _ms()
         ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, 1000)
         ms.update_bookticker(1.00095, 10.0, 1.00105, 100.0, 2000)
         self.assertEqual(_snap(ms, 2.0)["volatility"], 0.0)  # 2 < 3
@@ -498,15 +507,13 @@ class TestReadinessFollowsConfiguredSpan(unittest.TestCase):
         self.assertGreater(_snap(ms, 3.0)["volatility"], 0.0)  # 3 varían
 
     def test_trade_window_configurable(self):
-        ms = MarketState(symbol="xrpusdc", real=False)
-        ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, 1000)
-        ms.update_trade(1.0, 5.0, False, 1000)
-        wide = ms.get_snapshot(
-            61.0, offline_windows={"trade": 60.0, "volatility": 60.0,
-                                   "momentum": 30.0})
-        narrow = ms.get_snapshot(
-            61.0, offline_windows={"trade": 30.0, "volatility": 60.0,
-                                   "momentum": 30.0})
+        def fed(windows):
+            ms = _ms(windows)
+            ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, 1000)
+            ms.update_trade(1.0, 5.0, False, 1000)
+            return ms
+        wide = _snap(fed(WINDOWS), 61.0)
+        narrow = _snap(fed(SignalWindows(30.0, 60.0, 30.0)), 61.0)
         self.assertEqual(wide["buy_volume_60s"], 5.0)    # corte en 1.0
         self.assertEqual(narrow["buy_volume_60s"], 0.0)   # corte en 31.0
 
@@ -537,6 +544,107 @@ class TestCoordinatorEngineLimitInvariant(unittest.TestCase):
         self.assertGreater(len([e for e in events if e == "submit"]), 0)
         self.assertNotIn("rejected_position_cap", events)
         self.assertNotIn("rejected_position_notional", events)
+
+    def test_all_emitted_orders_avoid_limit_rejections_trending(self):
+        """Q3 (refuerzo): mercado plano + alcista con A-S real y motor
+        default. Se emiten MUCHAS órdenes de ambos lados (las quotes
+        persiguen al mercado; las viejas caen por depth, no por límites).
+        Invariante por orden: ninguna termina en rechazo por límites, y el
+        conteo global de rechazos por límites es 0."""
+        rows = []
+        for t in list(range(1000, 61001, 1000)) + list(range(62000, 66001, 1000)):
+            rows.append({"ts_ms": t, "bids": [[10000, 10]],
+                         "asks": [[10001, 100]]})
+        k = 0
+        for t in range(67000, 101001, 1000):
+            k += 1
+            rows.append({"ts_ms": t, "bids": [[10000 + 2 * k, 10]],
+                         "asks": [[10001 + 2 * k, 100]]})
+        uid, prev = 1, 0
+        for r in rows:
+            r["update_id"], r["pu"] = uid, prev
+            prev, uid = uid, uid + 1
+        eng = ExecutionReconstructor(ReconstructionConfig())  # defaults
+        coord = ASCoordinator(
+            config=ReconstructionConfig(), engine=eng,
+            depth_csv=[{"ts_ms": r["ts_ms"], "bids": r["bids"],
+                        "asks": r["asks"]} for r in rows],
+            trades_csv=[], decision_interval_ms=5000, warmup_intervals=3)
+        coord.run()
+        self.assertTrue(coord._warmup_complete)
+        orders = list(eng.orders.values())
+        # Muchas órdenes, ambos lados (las viejas caen por depth al
+        # perseguir al mercado — eso NO es rechazo por límites).
+        self.assertGreaterEqual(len(orders), 10)
+        self.assertGreater(len([o for o in orders if o["side"] == "BUY"]), 0)
+        self.assertGreater(len([o for o in orders if o["side"] == "SELL"]), 0)
+        for o in orders:
+            self.assertNotIn(o["status"], ("rejected_position_cap",
+                                           "rejected_position_notional"),
+                             o["order_id"])
+        events = [j.get("event") for j in eng.journal]
+        self.assertEqual(events.count("rejected_position_cap"), 0)
+        self.assertEqual(events.count("rejected_position_notional"), 0)
+
+
+class TestSignalWindowsFrozen(unittest.TestCase):
+    """Q1: ventanas por estructura Frozen — 30s/90s configurables,
+    min_mid_samples=1, inmutabilidad y sin aliasing."""
+
+    def _ramp(self, windows, n=41, step_ms=2000, upto_varied=11):
+        # Variación t=1..21s (i<11 alternado), plano hasta 81s.
+        ms = _ms(windows)
+        for i in range(n):
+            ts = 1000 + i * step_ms
+            m = 1.0 + (0.001 if i % 2 == 0 else 0.0) if i < upto_varied else 1.0
+            ms.update_bookticker(m - 0.00005, 10.0, m + 0.00005, 100.0, ts)
+        return ms
+
+    def test_momentum_30s_vs_90s(self):
+        # Consulta a 81s: ventana 30s (corte 51s) no ve variación (0.0);
+        # ventana 90s sí la ve (≠0.0).
+        s30 = _snap(self._ramp(SignalWindows(60.0, 60.0, 30.0)), 81.0)
+        self.assertEqual(float(s30["momentum"] or 0.0), 0.0)
+        s90 = _snap(self._ramp(SignalWindows(60.0, 60.0, 90.0)), 81.0)
+        self.assertNotEqual(float(s90["momentum"] or 0.0), 0.0)
+
+    def test_min_mid_samples_one_vs_five(self):
+        # 4 muestras variadas: min=1 valúa (>0), min=5 exige más (0.0).
+        def fed(min_n):
+            ms = _ms(SignalWindows(60.0, 60.0, 60.0, min_n))
+            for i, m in enumerate([1.0, 1.001, 1.0, 1.001]):
+                ts = 1000 + i * 2000
+                ms.update_bookticker(m - 0.00005, 10.0,
+                                     m + 0.00005, 100.0, ts)
+            return ms
+        self.assertGreater(float(_snap(fed(1), 7.0)["volatility"] or 0.0),
+                           0.0)
+        self.assertEqual(float(_snap(fed(5), 7.0)["volatility"] or 0.0),
+                         0.0)
+
+    def test_windows_invalid_rejected(self):
+        with self.assertRaises(ValueError):
+            SignalWindows(0.0, 60.0, 30.0)
+        with self.assertRaises(ValueError):
+            SignalWindows(60.0, -5.0, 30.0)
+        with self.assertRaises(ValueError):
+            SignalWindows(60.0, 60.0, 30.0, 0)
+        with self.assertRaises(ValueError):
+            MarketState(symbol="xrpusdc", real=False,
+                        signal_windows={"trade": 1.0})  # type: ignore[arg-type]
+
+    def test_frozen_no_aliasing(self):
+        import dataclasses
+        w = SignalWindows(60.0, 60.0, 30.0)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            w.momentum_window_sec = 15.0  # type: ignore[misc]
+        ms = _ms(w)
+        self.assertEqual(ms._signal_windows, w)
+        self.assertEqual(ms._signal_windows,
+                         SignalWindows(60.0, 60.0, 30.0))
+        # get_snapshot sin args sigue siendo la ruta legacy (prod intacta)
+        legacy = MarketState(symbol="xrpusdc", real=False).get_snapshot()
+        self.assertIn("volatility", legacy)
 
 
 if __name__ == "__main__":

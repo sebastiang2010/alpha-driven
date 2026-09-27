@@ -1,14 +1,14 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-26 (veredicto R1–R5: mid de grilla, base microprice, reloj consumido, span único, invariante límites)
+**Actualizado**: 2026-09-26 (veredicto Q1–Q3: SignalWindows Frozen, tolerancia ±500/501ms, invariante R5 reforzado)
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **545 passed / 9 failed** (2026-09-26)
-  - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **552 passed / 9 failed** (2026-09-26)
+  - Los 9 fallos son **pre-existentes** (mismos nombres que en veredictos previos; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredicto V1–V4 + W1–W4 + W2 + R1–R5**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (8/8) + `test_as_signals.py` (7/7, +futuro-no-altera-pasado) + `test_as_windows.py` (23/23: +R1–R5×7) → **116/116 OK** en el área tocada (nota: el 113/113 previo contaba dos veces test_as_windows)
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** (+Q1×4, +Q3 trending) → **117/117 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -68,6 +68,13 @@
 - **R4**: prontitud ya usaba `_warmup_span` (verificado, sin 60 fijo) + test con ventanas 10s que completa en 11s; `MIN_MID_SAMPLES=3` expuesto (2 muestras→sigma 0, 3→>0); ventana de trades configurable probada (60s incluye / 30s excluye trade en t=1s consultado a 61s).
 - **R5**: invariante coordinador-motor con límites default (test de corrida completa 1s+cola a grilla: ≥1 submit, cero `rejected_position_cap`/`rejected_position_notional`).
 - Sin regresiones: mismos 9 pre-existentes (los 3 de `market_state` re-verificados con stash tras estos cambios: fallan igual).
+
+## Veredicto Q1–Q3 (2026-09-26, hecho — 117/117 área, 552/9 suite)
+- **Q1** (`market_state.py`): `SignalWindows` Frozen (`trade_flow/volatility/momentum_window_sec`, `min_mid_samples`, validación en `__post_init__`) + alias públicos `TRADE_FLOW_WINDOW_SEC`/`VOL_WINDOW_SEC`/`MOMENTUM_WINDOW_SEC` (originales conservados); `_volatility_of(samples, min_mid_samples)` sin default literal (legacy pasa `MIN_MID_SAMPLES` explícito); `MarketState(..., signal_windows=None)` por ctor (None = legacy prod); `get_snapshot(now_sec=None)` sin kwarg dict (offline exige ventanas del ctor); `_snapshot_offline` valida `isinstance` Frozen. Coordinador (`as_coordinator.py`): `_signal_windows()` construye Frozen desde `strategy.config`, se pasa al ctor de MarketState, `_warmup_span=max(triple)`, 3 call sites sin kwarg. Conversores ya eran module-level (sin cambios).
+- Tests Q1 (`TestSignalWindowsFrozen` ×4): momentum 30s=0.0 vs 90s≠0.0 (variación 1..21s, consulta 81s); min 1 valúa vs min 5 exige (4 muestras); inválidos (0/negativo/min 0/dict al ctor); Frozen (`FrozenInstanceError`, igualdad, legacy sin args intacto).
+- **Q2** (frontera tolerancia 500ms inclusiva): book a +500ms exactos → `ok` valuado; +501ms → `late_book` None (`test_execution_reconstruction_markout_backfill.py` 9/9).
+- **Q3** (invariante reforzado): corrida plano+alcista con A-S real y motor default emite ≥10 órdenes de ambos lados (quotes persiguen mercado; viejas caen por depth) — por orden: status ∉ límites; conteo global de rechazos por límites == 0.
+- Sin regresiones: mismos 9 pre-existentes (nombres idénticos; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1).
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**

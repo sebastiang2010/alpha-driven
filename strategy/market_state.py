@@ -30,6 +30,7 @@ Convención de volatilidad (declarada, consistente, sin √T doble §0.6):
 
 import os
 import sys
+import dataclasses
 import math
 import threading
 import logging
@@ -60,9 +61,47 @@ VOLATILITY_WINDOW_SEC = 60.0     # ventana de muestras de mid para sigma
 ALPHA_WINDOW_SEC = 15.0          # ventana de momentum
 _MAXLEN = 10000                  # maxlen generoso para las deques
 
+# Q1: alias públicos con nombre de señal (los originales se conservan por
+# compatibilidad con importadores existentes).
+TRADE_FLOW_WINDOW_SEC = TRADE_WINDOW_SEC
+VOL_WINDOW_SEC = VOLATILITY_WINDOW_SEC
+MOMENTUM_WINDOW_SEC = ALPHA_WINDOW_SEC
+
 # R4: umbral mínimo de muestras para sigma — antes literal `3` oculto en
 # _volatility_of; ahora constante visible y testeable.
 MIN_MID_SAMPLES = 3
+
+
+# ── Configuración de ventanas offline (Q1) ────────────────────────────
+# Estructura Frozen: la ruta offline y el coordinador SOLO reciben ventanas
+# por esta vía (MarketState por ctor, coordinador→MarketState). Sin defaults
+# literales en firmas de utilidades; por valor e inmutable (sin aliasing).
+@dataclasses.dataclass(frozen=True)
+class SignalWindows:
+    """Ventanas de señal en segundos + umbral de muestras, todo explícito."""
+    trade_flow_window_sec: float
+    volatility_window_sec: float
+    momentum_window_sec: float
+    min_mid_samples: int = MIN_MID_SAMPLES
+
+    def __post_init__(self):
+        for name in ("trade_flow_window_sec", "volatility_window_sec",
+                     "momentum_window_sec"):
+            val = float(getattr(self, name))
+            if not math.isfinite(val) or val <= 0:
+                raise ValueError(f"{name} must be a positive finite number")
+        n = self.min_mid_samples
+        if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+            raise ValueError("min_mid_samples must be an integer >= 1")
+
+
+#: Ventanas legacy de producción (idénticas a los defaults históricos).
+LEGACY_WINDOWS = SignalWindows(
+    trade_flow_window_sec=TRADE_FLOW_WINDOW_SEC,
+    volatility_window_sec=VOL_WINDOW_SEC,
+    momentum_window_sec=MOMENTUM_WINDOW_SEC,
+    min_mid_samples=MIN_MID_SAMPLES,
+)
 
 
 # ── Conversores de unidades (R2) ─────────────────────────────────────
@@ -104,9 +143,15 @@ class MarketState:
         ms.close_ws()
     """
 
-    def __init__(self, symbol: str, real: bool = False):
+    def __init__(self, symbol: str, real: bool = False,
+                 signal_windows: "SignalWindows | None" = None):
         self.symbol = symbol.lower()
         self.real = real
+        # Q1: ventanas offline por ctor (Frozen → sin aliasing). None = ruta
+        # prod legacy con constantes de módulo (comportamiento histórico).
+        if signal_windows is not None and not isinstance(signal_windows, SignalWindows):
+            raise ValueError("signal_windows must be a SignalWindows or None")
+        self._signal_windows = signal_windows
 
         self._lock = threading.Lock()
 
@@ -235,16 +280,18 @@ class MarketState:
 
     # ── Derivados que requieren lectura completa bajo lock ─────────
     @staticmethod
-    def _volatility_of(samples):
+    def _volatility_of(samples, min_mid_samples):
         """sigma pura (sin mutación): stdev muestral de logrets × sqrt(ref/dt_bar).
 
         `samples`: secuencia [(ts_sec, mid), ...] YA filtrada a la ventana.
-        <MIN_MID_SAMPLES muestras, <2 retornos, sin intervalos o dt_bar<=0
+        `min_mid_samples`: umbral explícito (Q1: sin default literal en la
+        firma — el caller pasa la constante o su ventana configurada).
+        <min_mid_samples muestras, <2 retornos, sin intervalos o dt_bar<=0
         → 0.0. Misma fórmula que _compute_volatility (V3: sin podar la deque
         compartida — antes el poda de momentum a 15s recortaba el historial
         de sigma entre consultas sucesivas).
         """
-        if len(samples) < MIN_MID_SAMPLES:
+        if len(samples) < min_mid_samples:
             return 0.0
         returns = []
         prev_price = samples[0][1]
@@ -301,7 +348,7 @@ class MarketState:
         """
         window = [s for s in self._mid_samples
                   if s[0] >= now_sec - VOLATILITY_WINDOW_SEC]
-        return self._volatility_of(window)
+        return self._volatility_of(window, MIN_MID_SAMPLES)
 
     def _compute_momentum(self, now_sec):
         """
@@ -316,34 +363,30 @@ class MarketState:
         return self._momentum_of(window)
 
     # ── Snapshot para market_maker ─────────────────────────────────
-    def get_snapshot(self, now_sec=None, *, offline_windows=None):
+    def get_snapshot(self, now_sec=None):
         """
         Copia segura de todo el estado (lock adquirido, copiado, liberado).
         El contrato del dict es estable: inventory/pnl los rellena
         market_maker, acá solo se deja el espacio definido.
 
-        Dos rutas separadas (W1):
+        Dos rutas separadas (W1/Q1):
         - Producción (default, sin args): conducta ORIGINAL exacta — podas
           destructivas incluidas (primero volatilidad a 60s, luego momentum
           a 15s). La usa market_maker (get_snapshot() sin args).
-        - Offline (now_sec + offline_windows explícitos): consultas NO
-          destructivas con ventanas configurables; rechaza consultas
+        - Offline (now_sec explícito): requiere ventanas configuradas por
+          ctor (SignalWindows); consultas NO destructivas; rechaza consultas
           anteriores al estado consumido (W3). La usa el coordinador
           offline con las ventanas de strategy.config.
         """
         with self._lock:
             if now_sec is None:
-                if offline_windows is None:
-                    return self._snapshot_legacy()
+                return self._snapshot_legacy()
+            if self._signal_windows is None:
                 raise ValueError(
-                    "offline get_snapshot requires an explicit now_sec"
+                    "offline get_snapshot requires SignalWindows passed "
+                    "via the MarketState constructor"
                 )
-            if offline_windows is None:
-                raise ValueError(
-                    "offline get_snapshot requires explicit offline_windows "
-                    "{'trade':.., 'volatility':.., 'momentum':..}"
-                )
-            return self._snapshot_offline(float(now_sec), offline_windows)
+            return self._snapshot_offline(float(now_sec), self._signal_windows)
 
     def _snapshot_legacy(self):
         """Ruta producción ORIGINAL (asume lock tomado). Podas destructivas
@@ -361,7 +404,8 @@ class MarketState:
         snapshot = self._snapshot_levels()
         # Orden histórico: volatilidad poda a 60s, momentum recorta a 15s.
         self._prune_deque(self._mid_samples, now_sec, VOLATILITY_WINDOW_SEC)
-        snapshot["volatility"] = self._volatility_of(self._mid_samples)
+        snapshot["volatility"] = self._volatility_of(
+            self._mid_samples, MIN_MID_SAMPLES)
         self._prune_deque(self._mid_samples, now_sec, ALPHA_WINDOW_SEC)
         snapshot["momentum"] = self._momentum_of(self._mid_samples)
         snapshot["buy_volume_60s"] = buy_vol
@@ -371,18 +415,17 @@ class MarketState:
 
     def _snapshot_offline(self, now_sec, windows):
         """Ruta offline (asume lock tomado). Vistas filtradas no
-        destructivas con ventanas EXPLÍCITAS; mid/spread/imbalance/
-        microprice son niveles actuales (sin libro histórico: el pasado se
-        prueba por reproducción cronológica, W3)."""
-        try:
-            trade_w = float(windows["trade"])
-            vol_w = float(windows["volatility"])
-            mom_w = float(windows["momentum"])
-        except (KeyError, TypeError, ValueError):
+        destructivas con ventanas EXPLÍCITAS (SignalWindows Frozen);
+        mid/spread/imbalance/microprice son niveles actuales (sin libro
+        histórico: el pasado se prueba por reproducción cronológica, W3)."""
+        if not isinstance(windows, SignalWindows):
             raise ValueError(
-                "offline_windows must be {'trade':.., 'volatility':.., "
-                "'momentum':..} in seconds"
+                "offline snapshot requires a SignalWindows instance "
+                "(pass it via the MarketState constructor)"
             )
+        trade_w = windows.trade_flow_window_sec
+        vol_w = windows.volatility_window_sec
+        mom_w = windows.momentum_window_sec
         consumed = self._last_feed_ts_ms
         if consumed is not None:
             consumed_s = float(consumed) / 1000.0
@@ -398,7 +441,8 @@ class MarketState:
         snapshot["sell_volume_60s"] = sum(q for _, q, s in flow if s == "sell")
         snapshot["trade_arrival_rate"] = len(flow)
         snapshot["volatility"] = self._volatility_of(
-            [s for s in self._mid_samples if s[0] >= now_sec - vol_w])
+            [s for s in self._mid_samples if s[0] >= now_sec - vol_w],
+            windows.min_mid_samples)
         snapshot["momentum"] = self._momentum_of(
             [s for s in self._mid_samples if s[0] >= now_sec - mom_w])
         return snapshot
