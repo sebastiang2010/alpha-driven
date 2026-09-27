@@ -23,6 +23,9 @@ from strategy.alpha_model import AlphaModel
 from strategy.market_state import (
     TRADE_WINDOW_SEC,
     MarketState,
+    lots_to_xrp,
+    ticks_to_usdc,
+    usdc_to_ticks,
 )
 
 try:
@@ -240,11 +243,16 @@ class ASCoordinator:
         validan (parseo; el inválido se salta), pero solo el ÚLTIMO válido
         se incorpora: una muestra de mid y un depth por grupo temporal.
         Los trades son eventos distintos y se alimentan todos, en orden.
+
+        R3: actualiza el último instante consumido del coordinador con el
+        máximo ts_ms de los eventos incorporados (libros válidos + trades;
+        los inválidos no cuentan). Los grupos vacíos no avanzan el reloj.
         """
         eng_cfg = getattr(self.engine, "config", None)
         tick_size = float(getattr(eng_cfg, "tick_size", 0.0001) or 0.0001)
         qty_step = float(getattr(eng_cfg, "qty_step", 1.0) or 1.0)
         last_book = None
+        fed_trade = False
         for e in events:
             kind = e.get("kind")
             if kind == "book":
@@ -253,16 +261,16 @@ class ASCoordinator:
                 if not bids or not asks:
                     continue
                 try:
-                    bb = float(bids[0][0]) * tick_size
-                    ba = float(asks[0][0]) * tick_size
-                    bq = float(bids[0][1]) * qty_step
-                    aq = float(asks[0][1]) * qty_step
+                    bb = ticks_to_usdc(bids[0][0], tick_size)
+                    ba = ticks_to_usdc(asks[0][0], tick_size)
+                    bq = lots_to_xrp(bids[0][1], qty_step)
+                    aq = lots_to_xrp(asks[0][1], qty_step)
                     bids_usdc = [
-                        [float(p) * tick_size, float(q) * qty_step]
+                        [ticks_to_usdc(p, tick_size), lots_to_xrp(q, qty_step)]
                         for p, q in bids
                     ]
                     asks_usdc = [
-                        [float(p) * tick_size, float(q) * qty_step]
+                        [ticks_to_usdc(p, tick_size), lots_to_xrp(q, qty_step)]
                         for p, q in asks
                     ]
                 except (IndexError, TypeError, ValueError):
@@ -271,22 +279,45 @@ class ASCoordinator:
                 last_book = (bb, bq, ba, aq, bids_usdc, asks_usdc)
             elif kind == "trade":
                 try:
-                    price_usdc = float(e.get("price_ticks", 0)) * tick_size
-                    qty_xrp = float(e.get("qty_lots", 0)) * qty_step
+                    price_usdc = ticks_to_usdc(e.get("price_ticks", 0), tick_size)
+                    qty_xrp = lots_to_xrp(e.get("qty_lots", 0), qty_step)
                 except (TypeError, ValueError):
                     continue
                 self._market_state.update_trade(
                     price_usdc, qty_xrp,
                     bool(e.get("is_buyer_maker", False)), ts_ms,
                 )
+                fed_trade = True
         if last_book is not None:
             bb, bq, ba, aq, bids_usdc, asks_usdc = last_book
             self._market_state.update_bookticker(bb, bq, ba, aq, ts_ms)
             self._market_state.update_depth(
                 bids_usdc, asks_usdc, len(bids_usdc), ts_ms
             )
+            self._note_consumed(ts_ms)
             return True
+        # Sin libro válido: solo los trades incorporados cuentan como consumo.
+        if fed_trade:
+            self._note_consumed(ts_ms)
         return False
+
+    def _note_consumed(self, ts_ms: int) -> None:
+        """R3: tracking explícito del último instante consumido (máximo
+        ts_ms incorporado al MarketState). Las consultas offline deben
+        cumplir now >= consumido (lo valida MarketState; el coordinador
+        lo afirma antes de consultar)."""
+        prev = getattr(self, "_last_feed_ts", None)
+        if prev is None or int(ts_ms) > prev:
+            self._last_feed_ts = int(ts_ms)
+
+    def _assert_consumed(self, now_sec: float) -> None:
+        """R3: falla rápido si se consulta antes de lo consumido."""
+        last = getattr(self, "_last_feed_ts", None)
+        if last is not None and float(now_sec) < float(last) / 1000.0:
+            raise ValueError(
+                f"coordinator query before consumed state: {now_sec}s < "
+                f"fed {float(last) / 1000.0}s"
+            )
 
     # ── Warm-up phase ───────────────────────────────────────────────────
 
@@ -313,11 +344,13 @@ class ASCoordinator:
         incluidos los ciclos vacíos: cada grupo CON libro real aporta una
         muestra en su propio timestamp, esté o no en grilla (W2 — la grilla
         no filtra el conteo). El historial AlphaModel se alimenta una vez
-        por ciclo de grilla con libro fresco (el último mid incorporado
-        desde el registro anterior, consumido una sola vez): los ciclos
-        vacíos registran sin añadir muestras ficticias al historial de
-        mercado, y los grupos de solo-trades o libros inválidos no cuentan
-        ni alimentan.
+        por ciclo de grilla CON libro fresco desde el registro anterior:
+        R1 — al cerrar el ciclo se consulta el snapshot de ESE instante y
+        se registra SU mid (el mid fecha la decisión, no la muestra); los
+        libros entre grillas alimentan el historial MarketState pero nunca
+        disparan un registro por sí solos. Los ciclos vacíos sin libro
+        pendiente no registran ni inventan muestras, y los grupos de
+        solo-trades o libros inválidos no cuentan ni alimentan.
 
         After warmup, _warmup_complete=True and the main loop may emit decisions.
         The phase is idempotent: a second call returns immediately (the engine
@@ -343,7 +376,8 @@ class ASCoordinator:
         event_ts = sorted({e["ts_ms"] for e in self._market_events})
         last_event_ts = self._market_events[-1]["ts_ms"] if self._market_events else self._t0
         steps = merged_steps(event_ts, self._t0, self.decision_interval_ms, last_event_ts)
-        pending_mid: float | None = None  # libro fresco aún no registrado
+        fresh_book_pending = False  # R1: flag, no valor — el mid se
+        # consulta fresco al cerrar el ciclo de grilla.
 
         # Process steps in order until window coverage
         for ts_ms in steps:
@@ -380,7 +414,7 @@ class ASCoordinator:
 
             # Mid consistente con la ruta de decisión: el del snapshot
             # offline con tiempo explícito (V2). Toda muestra real cuenta
-            # para la cobertura; además deja el mid como fresco pendiente.
+            # para la cobertura; además marca libro fresco pendiente.
             if fed_book:
                 ts_sec = float(ts_ms) / 1000.0
                 mid = self._market_state.get_snapshot(
@@ -388,15 +422,22 @@ class ASCoordinator:
                 if mid > 0:
                     self._warmup_mids.append(float(mid))
                     self._warmup_ts.append(ts_sec)
-                    pending_mid = float(mid)
+                    fresh_book_pending = True
 
-            # Un registro AlphaModel por ciclo de grilla con libro fresco
-            # (misma frecuencia que en el main loop — nunca por evento y
-            # nunca sin libro: los ciclos vacíos sin libro pendiente no
-            # registran ni inventan muestras).
-            if self._is_decision_timestamp(ts_ms) and pending_mid is not None:
-                self._alpha_model.record_mid(float(ts_ms) / 1000.0, pending_mid)
-                pending_mid = None
+            # R1: un registro AlphaModel por ciclo de grilla con libro
+            # fresco desde el registro anterior — consultando el snapshot
+            # del instante del ciclo (el mid fecha la decisión, no la
+            # muestra). Nunca por evento y nunca sin libro: los ciclos
+            # vacíos sin libro pendiente no registran ni inventan muestras.
+            if self._is_decision_timestamp(ts_ms) and fresh_book_pending:
+                grid_sec = float(ts_ms) / 1000.0
+                self._assert_consumed(grid_sec)
+                grid_mid = self._market_state.get_snapshot(
+                    grid_sec,
+                    offline_windows=self._signal_windows).get("mid") or 0.0
+                if grid_mid > 0:
+                    self._alpha_model.record_mid(grid_sec, float(grid_mid))
+                fresh_book_pending = False
 
         # Warm-up completo solo con conteo Y cobertura de ventanas
         self._warmup_complete = self._warmup_ready()
@@ -434,16 +475,23 @@ class ASCoordinator:
         # V2: tiempo explícito del ciclo — las ventanas vencen contra el
         # reloj simulado (en ciclos vacíos las observaciones viejas expiran;
         # pasar now_sec solo a quote_distances no corregiría las señales).
-        # Ventanas offline explícitas (W4) + rechazo regresivo (W3).
+        # Ventanas offline explícitas (W4) + rechazo regresivo (W3, doble
+        # capa: assert del coordinador + validación de MarketState).
+        self._assert_consumed(now_sec)
         ms_snap = self._market_state.get_snapshot(
             now_sec, offline_windows=self._signal_windows)
         mid = ms_snap.get("mid") or 0.0
         if mid <= 0:
             return []
+        # R2: el precio base A-S es el del snapshot — microprice cuando hay
+        # libro (incorpora el imbalance), mid en su defecto. Sin conversión
+        # manual: usdc_to_ticks centraliza ticks↔USDC.
+        micro = ms_snap.get("microprice") or 0.0
+        px_basis = float(micro) if micro > 0 else float(mid)
         sigma_ref = max(float(ms_snap.get("volatility") or 0.0), 0.0)
 
         snap_dict: Dict[str, object] = {
-            "mid": float(mid),
+            "mid": px_basis,
             "spread": float(ms_snap.get("spread") or 0.0),
             "momentum": float(ms_snap.get("momentum") or 0.0),
             "imbalance": float(ms_snap.get("imbalance") or 0.0),
@@ -459,8 +507,8 @@ class ASCoordinator:
         bid_dist, ask_dist = am.quote_distances(
             snap_dict, alpha, inventory_xrp, sigma_ref, now_sec=now_sec
         )
-        as_bid_ticks = int(round((r - bid_dist) / tick_size))
-        as_ask_ticks = int(round((r + ask_dist) / tick_size))
+        as_bid_ticks = usdc_to_ticks(r - bid_dist, tick_size)
+        as_ask_ticks = usdc_to_ticks(r + ask_dist, tick_size)
 
         # Engine bests in ticks for the maker guard (post-only GTX:
         # a quote that already crosses can never rest — don't emit it).

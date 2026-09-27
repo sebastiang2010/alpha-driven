@@ -8,12 +8,17 @@ import statistics
 import unittest
 
 from strategy import config as strategy_config
+from strategy.alpha_model import AlphaModel
 from strategy.as_coordinator import ASCoordinator
 from strategy.execution_reconstruction import (
     ExecutionReconstructor,
     ReconstructionConfig,
 )
-from strategy.market_state import MarketState
+from strategy.market_state import (
+    MIN_MID_SAMPLES,
+    MarketState,
+    usdc_to_ticks,
+)
 
 
 # Ventanas offline explícitas (W4): las de strategy.config — momentum 30s,
@@ -347,6 +352,191 @@ class TestMisalignedBooksWarmup(unittest.TestCase):
         self.assertGreater(len(submits), 0)
         for s in submits:
             self.assertGreater(s["ts_ms"], warmup_end)
+
+
+def _merged(uid_rows):
+    """Reasigna uid/pu secuenciales a filas ya ordenadas por ts."""
+    out = []
+    uid, prev = 1, 0
+    for r in uid_rows:
+        row = dict(r)
+        row["update_id"], row["pu"] = uid, prev
+        prev, uid = uid, uid + 1
+        out.append(row)
+    return out
+
+
+class TestGridCycleMidDatesDecision(unittest.TestCase):
+    """R1: al cerrar un ciclo de grilla se registra el mid del snapshot de
+    ESE instante; los libros entre grillas alimentan MarketState pero no
+    AlphaModel. Corrida con libros densos fuera de grilla == corrida sin
+    intermedios (mismo mid constante): historiales idénticos y en grilla."""
+
+    def _run_hist(self, depth):
+        eng = _engine()
+        coord = _coord(depth, [], eng)
+        coord.run()
+        self.assertTrue(coord._warmup_complete)
+        return list(coord._alpha_model._mid_history)
+
+    def test_offgrid_books_do_not_change_grid_records(self):
+        grid = [r for r in _dense()[0]]  # 1000..61000 cada 5s, mid cte
+        off = [_depth(ts, 10000, 10001, 0, 0)
+               for ts in range(1000, 61001, 1000)
+               if (ts - 1000) % 5000 != 0]
+        hist_a = self._run_hist(_merged(sorted(grid, key=lambda r: r["ts_ms"])))
+        both = sorted(grid + off, key=lambda r: r["ts_ms"])
+        hist_b = self._run_hist(_merged(both))
+        self.assertEqual(hist_a, hist_b)
+        self.assertEqual(len(hist_a), 13)
+        for ts_sec, _ in hist_a:
+            self.assertEqual((round(ts_sec * 1000) - 1000) % 5000, 0)
+
+
+class TestMicropricePriceBasis(unittest.TestCase):
+    """R2: el precio base A-S es microprice si hay libro, si no mid; la
+    conversión vive en usdc_to_ticks (sin aritmética manual). Spread 3
+    ticks + asks pesados: variantes separadas por ~2 ticks."""
+
+    def test_emitted_quote_uses_microprice(self):
+        tick = 0.0001
+        book = {"ts_ms": 1000, "kind": "book", "bids": [[10000, 10]],
+                "asks": [[10003, 100]], "update_id": 1, "pu": 0}
+        eng = _engine()
+        eng.advance_to(1000, [book])
+        coord = _coord(
+            [{"ts_ms": 1000, "bids": [[10000, 10]], "asks": [[10003, 100]]}],
+            [], eng)
+        coord._feed_market_state(1000, [book])
+        snap = eng.state()
+        cmds = coord._as_decision(snap)
+        buys = [c for c in cmds if c["side"] == "BUY"]
+        self.assertEqual(len(buys), 1)
+
+        ms_snap = coord._market_state.get_snapshot(1.0, offline_windows=dict(WINDOWS))
+        mp = float(ms_snap["microprice"])
+        mid = float(ms_snap["mid"])
+        self.assertGreater(abs(mp - mid), 0)  # el caso distingue
+
+        def variant(px):
+            am = AlphaModel()
+            d = {"mid": px, "spread": float(ms_snap["spread"]),
+                 "momentum": 0.0,
+                 "imbalance": float(ms_snap["imbalance"]),
+                 "microprice": mp, "buy_volume_60s": 0.0,
+                 "sell_volume_60s": 0.0, "tick_size": tick}
+            a = am.compute_alpha(d)
+            am.record_mid(1.0, px)
+            r = am.reservation_price(d, a, 0.0, 0.0)
+            bd, _ = am.quote_distances(d, a, 0.0, 0.0, now_sec=1.0)
+            return a, usdc_to_ticks(r - bd, tick)
+
+        _a_mp, bid_mp = variant(mp)
+        _a_mid, bid_mid = variant(mid)
+        self.assertNotEqual(bid_mp, bid_mid)
+        self.assertEqual(buys[0]["price_ticks"], bid_mp)
+
+
+class TestConsumedClockBoundary(unittest.TestCase):
+    """R3: el reloj de consumo es explícito — consultar en el instante
+    consumido vale; un ms antes levanta. El coordinador lo trackea."""
+
+    def _fed_state(self, upto_ms=61000):
+        ms = MarketState(symbol="xrpusdc", real=False)
+        for ts in range(1000, upto_ms + 1, 5000):
+            ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, ts)
+        return ms
+
+    def test_query_at_consumed_instant_ok_just_before_raises(self):
+        ms = self._fed_state()
+        self.assertEqual(ms._last_feed_ts_ms, 61000)
+        _snap(ms, 61.0)  # frontera: vale
+        with self.assertRaises(ValueError):
+            _snap(ms, 60.999)
+
+    def test_coordinator_tracks_last_feed(self):
+        eng = _engine()
+        coord = _coord(
+            [{"ts_ms": 1000, "bids": [[10000, 10]], "asks": [[10001, 100]]}],
+            [], eng)
+        self.assertIsNone(getattr(coord, "_last_feed_ts", None))
+        book = {"ts_ms": 1000, "kind": "book", "bids": [[10000, 10]],
+                "asks": [[10001, 100]], "update_id": 1, "pu": 0}
+        coord._feed_market_state(1000, [book])
+        self.assertEqual(coord._last_feed_ts, 1000)
+        with self.assertRaises(ValueError):
+            coord._market_state.get_snapshot(0.5, offline_windows=dict(WINDOWS))
+        trade = {"ts_ms": 2000, "kind": "trade", "trade_id": "t",
+                 "price_ticks": 10000, "qty_lots": 2, "is_buyer_maker": True}
+        coord._feed_market_state(2000, [trade])
+        self.assertEqual(coord._last_feed_ts, 2000)
+        with self.assertRaises(ValueError):
+            coord._market_state.get_snapshot(1.5, offline_windows=dict(WINDOWS))
+
+
+class TestReadinessFollowsConfiguredSpan(unittest.TestCase):
+    """R4: la prontitud usa el mismo _warmup_span (nada de 60s fijos);
+    el umbral de muestras y la ventana de trades están expuestos."""
+
+    def test_short_windows_complete_early(self):
+        depth, _ = _dense(t_start=1000, t_end=11000, step=5000)
+        eng = _engine()
+        coord = _coord(depth, [], eng)
+        coord._signal_windows = {"trade": 10.0, "volatility": 10.0,
+                                 "momentum": 10.0}
+        coord._warmup_span = 10.0
+        coord.run()
+        self.assertTrue(coord._warmup_complete)  # span 10s basta
+
+    def test_min_samples_constant(self):
+        self.assertEqual(MIN_MID_SAMPLES, 3)
+        ms = MarketState(symbol="xrpusdc", real=False)
+        ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, 1000)
+        ms.update_bookticker(1.00095, 10.0, 1.00105, 100.0, 2000)
+        self.assertEqual(_snap(ms, 2.0)["volatility"], 0.0)  # 2 < 3
+        ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, 3000)
+        self.assertGreater(_snap(ms, 3.0)["volatility"], 0.0)  # 3 varían
+
+    def test_trade_window_configurable(self):
+        ms = MarketState(symbol="xrpusdc", real=False)
+        ms.update_bookticker(0.99995, 10.0, 1.00005, 100.0, 1000)
+        ms.update_trade(1.0, 5.0, False, 1000)
+        wide = ms.get_snapshot(
+            61.0, offline_windows={"trade": 60.0, "volatility": 60.0,
+                                   "momentum": 30.0})
+        narrow = ms.get_snapshot(
+            61.0, offline_windows={"trade": 30.0, "volatility": 60.0,
+                                   "momentum": 30.0})
+        self.assertEqual(wide["buy_volume_60s"], 5.0)    # corte en 1.0
+        self.assertEqual(narrow["buy_volume_60s"], 0.0)   # corte en 31.0
+
+
+class TestCoordinatorEngineLimitInvariant(unittest.TestCase):
+    """R5: con límites por defecto del motor, las órdenes del coordinador
+    nunca son rechazadas por límites (cap/nocional). Corrida completa con
+    motor default (gaps 2000/1000): libros cada 1s + cola."""
+
+    def test_no_limit_rejections_with_default_limits(self):
+        rows = []
+        uid, prev = 1, 0
+        # Libros cada 1s (gaps engine default 2000 OK); la cola llega a
+        # 66000 (grilla) para que el main loop decida una vez que el
+        # warm-up termina en 61000.
+        for ts in list(range(1000, 61001, 1000)) + list(range(62000, 66001, 1000)):
+            rows.append(_depth(ts, 10000, 10001, uid, prev))
+            prev, uid = uid, uid + 1
+        eng = ExecutionReconstructor(ReconstructionConfig())  # defaults
+        coord = ASCoordinator(
+            config=ReconstructionConfig(), engine=eng,
+            depth_csv=[{"ts_ms": r["ts_ms"], "bids": r["bids"],
+                        "asks": r["asks"]} for r in rows],
+            trades_csv=[], decision_interval_ms=5000, warmup_intervals=3)
+        coord.run()
+        self.assertTrue(coord._warmup_complete)
+        events = [j.get("event") for j in eng.journal]
+        self.assertGreater(len([e for e in events if e == "submit"]), 0)
+        self.assertNotIn("rejected_position_cap", events)
+        self.assertNotIn("rejected_position_notional", events)
 
 
 if __name__ == "__main__":

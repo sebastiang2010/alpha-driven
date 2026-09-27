@@ -60,6 +60,29 @@ VOLATILITY_WINDOW_SEC = 60.0     # ventana de muestras de mid para sigma
 ALPHA_WINDOW_SEC = 15.0          # ventana de momentum
 _MAXLEN = 10000                  # maxlen generoso para las deques
 
+# R4: umbral mínimo de muestras para sigma — antes literal `3` oculto en
+# _volatility_of; ahora constante visible y testeable.
+MIN_MID_SAMPLES = 3
+
+
+# ── Conversores de unidades (R2) ─────────────────────────────────────
+# El motor habla ticks/lots enteros; MarketState habla USDC/XRP. Estas
+# funciones son el único lugar donde ocurre la conversión: el coordinador
+# las llama en vez de aritmética manual inline.
+def ticks_to_usdc(price_ticks, tick_size):
+    """Precio en ticks → USDC."""
+    return float(price_ticks) * float(tick_size)
+
+
+def lots_to_xrp(qty_lots, qty_step):
+    """Cantidad en lots → XRP."""
+    return float(qty_lots) * float(qty_step)
+
+
+def usdc_to_ticks(price_usdc, tick_size):
+    """Precio USDC → ticks enteros (redondeo bancario de round())."""
+    return int(round(float(price_usdc) / float(tick_size)))
+
 # Referencia de tiempo para volatilidad (V2: ref_s única congelada)
 # SAMPLING_INTERVAL_SEC = 5.0 es el intervalo de referencia (ref_s)
 # desde config. No se define constante local duplicada.
@@ -106,6 +129,10 @@ class MarketState:
         self._mid_samples = deque(maxlen=_MAXLEN)
 
         self.last_update_ts = None
+        # R3: último instante CONSUMIDO (ms). Reloj explícito para validar
+        # consultas offline (now >= consumido); se actualiza con cada
+        # update_* aceptado, sea WS (prod) o feed causal (offline).
+        self._last_feed_ts_ms: int | None = None
 
         self._ws_bookticker = None
         self._ws_depth = None
@@ -152,6 +179,17 @@ class MarketState:
             dq.popleft()
 
     # ── Callbacks de actualización (hilos del WS) ──────────────────
+    def _track_feed(self, timestamp) -> None:
+        """Registra el último instante consumido (asume lock tomado)."""
+        try:
+            ts = int(timestamp)
+        except (TypeError, ValueError):
+            return
+        if ts < 0:
+            return
+        if self._last_feed_ts_ms is None or ts > self._last_feed_ts_ms:
+            self._last_feed_ts_ms = ts
+
     def update_bookticker(self, bid_price, bid_qty, ask_price, ask_qty, timestamp):
         """Callback del BookTickerWebSocket."""
         with self._lock:
@@ -160,6 +198,7 @@ class MarketState:
             self.best_ask = float(ask_price)
             self.best_ask_qty = float(ask_qty)
             self.last_update_ts = timestamp
+            self._track_feed(timestamp)
 
             mid = self._mid()
             ts_sec = self._to_sec(timestamp)
@@ -175,6 +214,7 @@ class MarketState:
             self.bid_volume_top = sum(q for _, q in self.bids)
             self.ask_volume_top = sum(q for _, q in self.asks)
             self.last_update_ts = timestamp
+            self._track_feed(timestamp)
 
     def update_trade(self, price, qty, is_buyer_maker, timestamp):
         """Callback del TradeWebSocket.
@@ -191,6 +231,7 @@ class MarketState:
         with self._lock:
             self._trade_flow.append((ts_sec, float(qty), side))
             self.last_update_ts = timestamp
+            self._track_feed(timestamp)
 
     # ── Derivados que requieren lectura completa bajo lock ─────────
     @staticmethod
@@ -198,12 +239,12 @@ class MarketState:
         """sigma pura (sin mutación): stdev muestral de logrets × sqrt(ref/dt_bar).
 
         `samples`: secuencia [(ts_sec, mid), ...] YA filtrada a la ventana.
-        <3 muestras, <2 retornos, sin intervalos o dt_bar<=0 → 0.0.
-        Misma fórmula que _compute_volatility (V3: sin podar la deque
+        <MIN_MID_SAMPLES muestras, <2 retornos, sin intervalos o dt_bar<=0
+        → 0.0. Misma fórmula que _compute_volatility (V3: sin podar la deque
         compartida — antes el poda de momentum a 15s recortaba el historial
         de sigma entre consultas sucesivas).
         """
-        if len(samples) < 3:
+        if len(samples) < MIN_MID_SAMPLES:
             return 0.0
         returns = []
         prev_price = samples[0][1]
@@ -342,7 +383,7 @@ class MarketState:
                 "offline_windows must be {'trade':.., 'volatility':.., "
                 "'momentum':..} in seconds"
             )
-        consumed = self.last_update_ts
+        consumed = self._last_feed_ts_ms
         if consumed is not None:
             consumed_s = float(consumed) / 1000.0
             if now_sec < consumed_s:

@@ -1,14 +1,14 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-26 (veredicto W2 desalineados: warmup cuenta todo libro real, record 1/ciclo)
+**Actualizado**: 2026-09-26 (veredicto R1–R5: mid de grilla, base microprice, reloj consumido, span único, invariante límites)
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **537 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **545 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredicto V1–V4 + W1–W4**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (8/8) + `test_as_signals.py` (7/7, +futuro-no-altera-pasado) + `test_as_windows.py` (15/15: +W2 desalineados×2) → **102/102 OK** en el área tocada (nota: el 113/113 previo contaba dos veces test_as_windows)
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredicto V1–V4 + W1–W4 + W2 + R1–R5**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (8/8) + `test_as_signals.py` (7/7, +futuro-no-altera-pasado) + `test_as_windows.py` (23/23: +R1–R5×7) → **116/116 OK** en el área tocada (nota: el 113/113 previo contaba dos veces test_as_windows)
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -51,8 +51,7 @@
 - Tests `test_as_windows.py` 15/15: cobertura, W2 (trades sin libros no completan; frecuencia exacta 3 records en [1.0,6.0,11.0]; +desalineados×2: warm-up completo con libros cada 1100ms, records solo en grilla, cero submits prematuros), W3 (regresivo levanta; reproducción exacta+determinista), W4 (momentum 30≠0 vs 15==0; vol 60>0 vs 15==0 con variación entre 15-60s; coordinador usa config), expiración/no-destructivo/una-muestra/vol-60s adaptados a ventanas explícitas. `test_as_signals.py` sin cambios (ruta legacy no-arg, datos cortos → valores idénticos).
 - Sin regresiones: mismos 9 pre-existentes (`_compute_volatility` directo no tocado; los 3 de `market_state` idénticos al baseline).
 
-## Veredicto W2 desalineados (2026-09-26, hecho — 102/102 área, 537/9 suite)
-- Bloqueo: el warm-up solo contaba libros en la grilla (`fed_book and _is_decision_timestamp`); con libros en 1000,2100,3100… solo contaba el primero y nunca terminaba.
+## Veredicto W2 desalineados (2026-09-26, hecho — 102/102 área, 537/9 suite)- Bloqueo: el warm-up solo contaba libros en la grilla (`fed_book and _is_decision_timestamp`); con libros en 1000,2100,3100… solo contaba el primero y nunca terminaba.
 - Fix (`strategy/as_coordinator.py::_warmup_phase`): recorre el calendario fusionado (grilla ∪ eventos, incluidos ciclos vacíos); TODO libro real cuenta muestra en su propio timestamp; `record_mid` 1 vez por ciclo de grilla con libro fresco pendiente (one-shot, sin muestras ficticias); trades-solos no cuentan ni refrescan.
 - Tests `TestMisalignedBooksWarmup` (×2): fase directa (completo, 0 submits en journal, records todos en grilla y < nº libros) + corrida completa (submits existen, todos con ts > fin del warm-up).
 - Nota de conteo: el 113/113 previo contaba dos veces `test_as_windows.py`; el área real es 102/102.
@@ -61,6 +60,14 @@
 - **V2**: `_as_decision` usa `get_snapshot(now_sec)` del ciclo (las ventanas vencen en ciclos vacíos).
 - Tests adaptados al warm-up 60s (veredicto lo permite): datos densos 1000..61000 + cola; la primera decisión cae en el ciclo vacío 66000; solo quedan `pending` los submits del paso final (arrival más allá del fin, `finish()` no inventa tiempo). `test_as_windows.py` nuevo (6/6): sin submits pre-cobertura con AlphaModel alimentado, submits tras 60s, vencimiento directo, snapshots repetidos estables + deque intacta, mismo-ts una muestra, vol 60s con 70s de datos. `test_as_signals.py` 7/7 (+futuro-no-altera-pasado, nota de vol actualizada a V3).
 - Sin regresiones: mismos 9 pre-existentes (los 3 de `market_state` verificados con stash contra el `market_state.py` pre-V3: fallan igual).
+
+## Veredicto R1–R5 (2026-09-26, hecho — 116/116 área, 545/9 suite)
+- **R1** (`as_coordinator._warmup_phase`): `record_mid` al cerrar ciclo de grilla consulta el snapshot de ESE instante (`fresh_book_pending` es flag, no valor acarreado); libros entre grillas alimentan MarketState pero no AlphaModel. Test: corrida con libros densos fuera de grilla == sin intermedios (historiales idénticos, 13 records en grilla).
+- **R2**: precio base A-S = microprice del snapshot si hay libro, si no mid (`snap_dict["mid"]`); conversiones centralizadas en `market_state` (`ticks_to_usdc`/`lots_to_xrp`/`usdc_to_ticks`, usadas por el coordinador). Nota: con mid:=microprice el término micro de alpha es 0 por construcción (imbalance/flow/momentum intactos). Test: spread 3 ticks + asks pesados → BUY 9991 (variante mp) ≠ 9993 (variante mid).
+- **R3**: reloj consumido explícito — `MarketState._last_feed_ts_ms` (max en los 3 update_*, `_snapshot_offline` valida contra él) + `ASCoordinator._last_feed_ts` (`_note_consumed` por evento incorporado) con `_assert_consumed` antes de consultar. Tests: frontera (61.0 vale, 60.999 levanta) + tracking del coordinador (trades también consumen).
+- **R4**: prontitud ya usaba `_warmup_span` (verificado, sin 60 fijo) + test con ventanas 10s que completa en 11s; `MIN_MID_SAMPLES=3` expuesto (2 muestras→sigma 0, 3→>0); ventana de trades configurable probada (60s incluye / 30s excluye trade en t=1s consultado a 61s).
+- **R5**: invariante coordinador-motor con límites default (test de corrida completa 1s+cola a grilla: ≥1 submit, cero `rejected_position_cap`/`rejected_position_notional`).
+- Sin regresiones: mismos 9 pre-existentes (los 3 de `market_state` re-verificados con stash tras estos cambios: fallan igual).
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**
