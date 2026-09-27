@@ -248,19 +248,23 @@ class TestPartialFillDuringCancelWait(unittest.TestCase):
         depth.append(_depth(71000, 10000, 10001, nxt + 1, nxt))
         depth.append(_depth(76000, 10000, 10001, nxt + 2, nxt + 1))
         depth.append(_depth(81000, 10010, 10011, nxt + 3, nxt + 2))
-        engine = _engine(cancel_latency_ms=6000)
+        depth.append(_depth(86000, 10010, 10011, nxt + 4, nxt + 3))
+        # Cancel lenta (11000ms): efectiva en 92000. El ciclo de grilla
+        # 91000 cae dentro de la espera (86500 < 91000 < 92000) y es el
+        # ciclo observacional post-fill.
+        engine = _engine(cancel_latency_ms=11000)
         coord = _coord(depth, [], engine, qty_lots=3)
         probe = _coord(list(depth), [], _engine(), qty_lots=3)
         probe.run()
         buy_price = _ledger_rows(probe, 66000, side="BUY",
                                  reason="submitted")[0]["price_ticks"]
-        depth.append(_depth(86000, 10010, 10011, nxt + 4, nxt + 3))
+        # El mercado se mueve DURANTE la espera (91000 < efectiva 92000):
+        # el reemplazo debe usar este libro, no el precio guardado.
+        depth.append(_depth(91000, 10020, 10021, nxt + 5, nxt + 4))
+        depth.append(_depth(96000, 10020, 10021, nxt + 6, nxt + 5))
         # Trade chico (1 < 3): parcial contra la orden BUY de 3.
         trades = [_trade(86500, "partbuy", buy_price, 1, True)]
-        # El mercado se mueve DURANTE la espera: el reemplazo debe usar
-        # este libro, no el precio guardado de la orden cancelada.
-        depth.append(_depth(91000, 10020, 10021, nxt + 5, nxt + 4))
-        engine2 = _engine(cancel_latency_ms=6000)
+        engine2 = _engine(cancel_latency_ms=11000)
         coord2 = _coord(depth, trades, engine2, qty_lots=3)
         coord2.run()
         # 1. Cancel pedida en 81000 (edad 15s) con qty 3
@@ -269,33 +273,45 @@ class TestPartialFillDuringCancelWait(unittest.TestCase):
         self.assertEqual(len(canc), 1)
         self.assertEqual(canc[0]["qty_lots"], 3)
         old_oid = canc[0]["order_id"]
-        # 2. En 86000 el lado sigue ocupado: cancel_pending, sin submits
-        # del lado (sin reemplazo prematuro) aunque hubo fill parcial.
+        # 2. En 86000 (pre-fill) el lado sigue ocupado: cancel_pending
+        # con el total 3, sin submits del lado.
         pend = _ledger_rows(coord2, 86000, side="BUY",
                             reason="cancel_pending")
         self.assertEqual(len(pend), 1)
+        self.assertEqual(pend[0]["qty_lots"], 3)
         self.assertEqual(
             _ledger_rows(coord2, 86000, side="BUY", reason="submitted"), [])
-        # 3. Contabilidad del remanente: fill de 1, quedan 2 pendientes,
-        # inventario +1.
+        # 3. Ciclo observacional 91000: después del parcial (86500) y
+        # antes de la cancelación efectiva (92000). Remanente 2, lado
+        # ocupado, sin reemplazo, cash/inventario exactos.
+        pend9 = _ledger_rows(coord2, 91000, side="BUY",
+                             reason="cancel_pending")
+        self.assertEqual(len(pend9), 1)
+        self.assertEqual(pend9[0]["qty_lots"], 2)
+        self.assertEqual(pend9[0]["order_id"], old_oid)
+        self.assertEqual(
+            _ledger_rows(coord2, 91000, side="BUY", reason="submitted"), [])
         fills = [f for f in engine2.fills if f.side == "BUY"]
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].qty, 1.0)
         self.assertEqual(engine2.inventory_lots, 1)
+        self.assertEqual(engine2.cash_units, -buy_price)
         live = engine2.orders[old_oid]
         self.assertEqual(live["remaining_lots"], 2)
+        # 4. Contabilidad del remanente: fill de 1, quedan 2 pendientes,
+        # inventario +1.
         # La orden muere cancelada (no filled): el remanente nunca se
         # llenó del todo y no hubo reemplazo prematuro.
         self.assertEqual(live["status"], "cancelled")
-        # 4. Tras la cancelación efectiva (87000, drenada en 91000) el
+        # 5. Tras la cancelación efectiva (92000, drenada en 96000) el
         # inventario es +1 (fill parcial): BUY ya no puede reemplazarse
         # (regla de lados: en largo solo SELL) y SELL se reemplaza
         # recalculado con el mercado nuevo — precio distinto del guardado
         # e id nuevo.
-        supp = _ledger_rows(coord2, 91000, side="BUY",
+        supp = _ledger_rows(coord2, 96000, side="BUY",
                             reason="suppressed_inventory_side")
         self.assertEqual(len(supp), 1)
-        repl = _ledger_rows(coord2, 91000, side="SELL",
+        repl = _ledger_rows(coord2, 96000, side="SELL",
                             reason="submitted")
         self.assertEqual(len(repl), 1)
         old_sell = _ledger_rows(coord2, 81000, side="SELL",

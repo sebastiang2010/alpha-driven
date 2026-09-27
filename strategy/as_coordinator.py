@@ -600,10 +600,12 @@ class ASCoordinator:
                     })
                     self._cancel_requested[oid] = ts_ms
                     self._side_occupied[side] = True
-                    self._record_target(ts_ms, side, desired[side], 1,
+                    oq = int(owned[0].get("remaining_lots", 1) or 1)
+                    self._record_target(ts_ms, side, desired[side], oq,
                                         "cancel_requested", oid)
                 elif owned:
-                    self._record_target(ts_ms, side, desired[side], 1,
+                    oq = int(owned[0].get("remaining_lots", 1) or 1)
+                    self._record_target(ts_ms, side, desired[side], oq,
                                         "cancel_pending",
                                         str(owned[0].get("order_id")))
                 else:
