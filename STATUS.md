@@ -1,5 +1,5 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-26 (veredicto Q1–Q3: SignalWindows Frozen, tolerancia ±500/501ms, invariante R5 reforzado)
+**Actualizado**: 2026-09-27 — veredicto Q1–Q3 **APROBADO** en revisión estática (huellas estables en 12 archivos; Q3 limitado a escenario sin trades). Próximo: F1.4 pendiente de confirmación humana; F2.5 fuera de alcance.
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
