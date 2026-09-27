@@ -20,7 +20,26 @@ from strategy.calendar import (
     validate_interval_ms,
 )
 from strategy.alpha_model import AlphaModel
-from strategy.market_state import MarketState
+from strategy.market_state import (
+    ALPHA_WINDOW_SEC,
+    VOLATILITY_WINDOW_SEC,
+    MarketState,
+)
+
+try:
+    from strategy import config as _strategy_config
+except ImportError:  # pragma: no cover - mismo fallback que market_state
+    import config as _strategy_config
+
+
+def _warmup_span_sec():
+    """Cobertura mínima de warm-up: la ventana más larga entre señales
+    (MarketState) y filtro de momentum del AlphaModel (config)."""
+    return max(
+        float(VOLATILITY_WINDOW_SEC),
+        float(ALPHA_WINDOW_SEC),
+        float(getattr(_strategy_config, "MOMENTUM_WINDOW_SECONDS", 30.0)),
+    )
 
 
 # ── Coordinator configuration ─────────────────────────────────────────
@@ -45,7 +64,9 @@ class ASCoordinator:
     - Walks the merged calendar (scheduled cycles ∪ event timestamps): cycles run
       even without market events (empty advance drains expired timers first),
       and no trade/book is ever skipped
-    - Warm-up: requires warmup_intervals mids with positive intervals (mid prices strictly increase)
+    - Warm-up (V1): requires warmup_intervals mids AND window coverage
+      (span >= longest signal/momentum window); group mids also feed the
+      shared AlphaModel history, so §14 never starts empty
     - No decisions after EOF; event gaps invalidate the run without resetting inventory
     - Event group closes completely before delivering; never filters future to policy
     - Delayed replacement: if a decision cancels a side, that side stays "occupied"
@@ -53,12 +74,11 @@ class ASCoordinator:
     - Market signals (F1.3): owns a REAL MarketState (no WS started) fed with
       the same causal events the engine consumes (books/trades from t0, prices
       converted ticks→USDC, qty lots→XRP). The A-S policy reads
-      MarketState.get_snapshot() — the canonical AlphaModel input — so
+      MarketState.get_snapshot(now_sec) with the EXPLICIT cycle time — windows
+      expire against the simulated clock (including empty cycles) — so
       imbalance/microprice/momentum/volatility use the exact production
-      formulas (no parallel estimators). Windows (TRADE/VOLATILITY/ALPHA) are
-      enforced by MarketState pruning against the simulated clock; with short
-      captures the estimators degrade best-effort via their own guards
-      (volatility 0.0 with <3 samples, momentum 0.0 with <2).
+      formulas (no parallel estimators) with non-destructive queries (V3).
+      Same-timestamp books: all validated, only the last incorporated (V4).
     """
 
     def __init__(
@@ -203,10 +223,16 @@ class ASCoordinator:
         lots→XRP via qty_step — never unit ticks). Both bookticker (best
         bid/ask → mid samples for volatility/momentum) and full depth
         (levels → imbalance) are fed per book event.
+
+        V4 (varios libros del mismo ts): TODOS los libros del grupo se
+        validan (parseo; el inválido se salta), pero solo el ÚLTIMO válido
+        se incorpora: una muestra de mid y un depth por grupo temporal.
+        Los trades son eventos distintos y se alimentan todos, en orden.
         """
         eng_cfg = getattr(self.engine, "config", None)
         tick_size = float(getattr(eng_cfg, "tick_size", 0.0001) or 0.0001)
         qty_step = float(getattr(eng_cfg, "qty_step", 1.0) or 1.0)
+        last_book = None
         for e in events:
             kind = e.get("kind")
             if kind == "book":
@@ -219,10 +245,6 @@ class ASCoordinator:
                     ba = float(asks[0][0]) * tick_size
                     bq = float(bids[0][1]) * qty_step
                     aq = float(asks[0][1]) * qty_step
-                except (IndexError, TypeError, ValueError):
-                    continue
-                self._market_state.update_bookticker(bb, bq, ba, aq, ts_ms)
-                try:
                     bids_usdc = [
                         [float(p) * tick_size, float(q) * qty_step]
                         for p, q in bids
@@ -231,11 +253,10 @@ class ASCoordinator:
                         [float(p) * tick_size, float(q) * qty_step]
                         for p, q in asks
                     ]
-                except (TypeError, ValueError):
+                except (IndexError, TypeError, ValueError):
                     continue
-                self._market_state.update_depth(
-                    bids_usdc, asks_usdc, len(bids_usdc), ts_ms
-                )
+                # Validado: solo el último del grupo se incorpora (V4).
+                last_book = (bb, bq, ba, aq, bids_usdc, asks_usdc)
             elif kind == "trade":
                 try:
                     price_usdc = float(e.get("price_ticks", 0)) * tick_size
@@ -246,27 +267,48 @@ class ASCoordinator:
                     price_usdc, qty_xrp,
                     bool(e.get("is_buyer_maker", False)), ts_ms,
                 )
+        if last_book is not None:
+            bb, bq, ba, aq, bids_usdc, asks_usdc = last_book
+            self._market_state.update_bookticker(bb, bq, ba, aq, ts_ms)
+            self._market_state.update_depth(
+                bids_usdc, asks_usdc, len(bids_usdc), ts_ms
+            )
 
     # ── Warm-up phase ───────────────────────────────────────────────────
 
+    def _warmup_ready(self) -> bool:
+        """Cobertura de ventanas: conteo mínimo Y span temporal.
+
+        V1: warmup_intervals mids ya no bastan — se exige además que el span
+        (último menos primer mid, en segundos) cubra la ventana más larga
+        entre señales y filtro de momentum. Sin cobertura no hay submits.
+        """
+        if len(self._warmup_mids) < self.warmup_intervals:
+            return False
+        span = self._warmup_ts[-1] - self._warmup_ts[0]
+        return span >= _warmup_span_sec()
+
     def _warmup_phase(self) -> None:
         """Warm-up: advance advance_to() without apply_commands until having
-        warmup_intervals mids sampled at timestamps with positive intervals
-        (strictly increasing ts).
+        BOTH warmup_intervals mids AND window coverage (span >= longest
+        signal/momentum window). One mid sample per timestamp group (V4);
+        each group mid also feeds the shared AlphaModel history via
+        record_mid (V1: el filtro §14 llega con historial a la primera
+        decisión — nunca empieza vacío tras el warm-up).
 
         After warmup, _warmup_complete=True and the main loop may emit decisions.
         The phase is idempotent: a second call returns immediately (the engine
         already consumed those events and rejects duplicate advance_to).
 
-        If the data is exhausted before collecting warmup_intervals mids, the
-        warm-up ends best-effort WITHOUT raising: _warmup_complete stays False
-        and the main loop still processes the remaining events (no decisions).
+        If the data is exhausted before coverage, the warm-up ends
+        best-effort WITHOUT raising: _warmup_complete stays False and the
+        main loop still processes the remaining events (no decisions).
         """
         if getattr(self, "_warmup_done", False):
             return  # already executed — engine state must not be re-advanced
 
         self._warmup_mids = []
-        self._warmup_ts: List[int] = []
+        self._warmup_ts: List[float] = []
         self._warmup_complete = False
         self._warmup_done = True
         self._best_bid = 0.0
@@ -276,8 +318,8 @@ class ASCoordinator:
         i = 0
         n = len(self._market_events)
 
-        # Process events timestamp by timestamp until we have enough mids
-        while i < n and len(self._warmup_mids) < self.warmup_intervals:
+        # Process events timestamp by timestamp until window coverage
+        while i < n and not self._warmup_ready():
             ts_ms = self._market_events[i]["ts_ms"]
 
             # Collect all events at this timestamp
@@ -297,8 +339,8 @@ class ASCoordinator:
             # Advance to this timestamp (no apply_commands during warmup)
             self.engine.advance_to(ts_ms, market_events_for_advance)
             self._warmup_last_ts = ts_ms
-            # Same causal events feed the signal stack (warm-up by count;
-            # window coverage comes from MarketState pruning best-effort)
+            # Same causal events feed the signal stack (one sample per
+            # timestamp group — V4 inside _feed_market_state)
             self._feed_market_state(ts_ms, market_events_for_advance)
 
             # Update best bid/ask from the engine's internal book
@@ -310,32 +352,18 @@ class ASCoordinator:
                 if asks:
                     self._best_ask = float(asks[0][0])
 
-            # Calculate mid and record it
-            if self._best_bid > 0 and self._best_ask > 0:
-                mid = (self._best_bid + self._best_ask) / 2.0
-                self._warmup_mids.append(mid)
-                self._warmup_ts.append(ts_ms)
+            # Mid consistente con la ruta de decisión: el del snapshot con
+            # tiempo explícito (V2). Una muestra por grupo (V4).
+            ts_sec = float(ts_ms) / 1000.0
+            mid = self._market_state.get_snapshot(ts_sec).get("mid") or 0.0
+            if mid > 0:
+                self._warmup_mids.append(float(mid))
+                self._warmup_ts.append(ts_sec)
+                # Historial AlphaModel alimentado DURANTE el warm-up (V1)
+                self._alpha_model.record_mid(ts_sec, float(mid))
 
-        # Verify warm-up condition: need warmup_intervals mids with positive
-        # intervals (strictly increasing timestamps between consecutive mids)
-        if len(self._warmup_mids) < self.warmup_intervals:
-            # Data exhausted before completing warm-up: best-effort, no raise.
-            return
-
-        # Check that we have at least (warmup_intervals - 1) positive intervals
-        positive_intervals = 0
-        for j in range(1, len(self._warmup_ts)):
-            if self._warmup_ts[j] > self._warmup_ts[j - 1]:
-                positive_intervals += 1
-
-        if positive_intervals >= self.warmup_intervals - 1:
-            self._warmup_complete = True
-        else:
-            raise ValueError(
-                f"Warm-up requires {self.warmup_intervals} mids with positive intervals, "
-                f"but found only {positive_intervals} positive intervals "
-                f"out of {len(self._warmup_mids)} sampled mids."
-            )
+        # Warm-up completo solo con conteo Y cobertura de ventanas
+        self._warmup_complete = self._warmup_ready()
 
     # ── A-S decision with real signals (F1.3) ──────────────────────────
     def _as_decision(self, snapshot: ExecutionSnapshot) -> List[Dict[str, Any]]:
@@ -367,7 +395,10 @@ class ASCoordinator:
         now_sec = float(snapshot.ts_ms) / 1000.0
 
         am = self._alpha_model
-        ms_snap = self._market_state.get_snapshot()
+        # V2: tiempo explícito del ciclo — las ventanas vencen contra el
+        # reloj simulado (en ciclos vacíos las observaciones viejas expiran;
+        # pasar now_sec solo a quote_distances no corregiría las señales).
+        ms_snap = self._market_state.get_snapshot(now_sec)
         mid = ms_snap.get("mid") or 0.0
         if mid <= 0:
             return []

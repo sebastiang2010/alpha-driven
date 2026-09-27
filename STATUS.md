@@ -1,14 +1,14 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-26 (Point 6 markouts completado; reconciliación post-falso-verde)
+**Actualizado**: 2026-09-26 (veredicto F1.3 V1–V4 implementado)
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **521 passed / 9 failed** (2026-09-26)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **528 passed / 9 failed** (2026-09-26)
   - Los 9 fallos son **pre-existentes** (verificado con stash: fallan sin mis cambios; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (F1.2, 8/8) + `test_as_signals.py` (F1.3, 6/6) → **99/99 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredicto V1–V4**: `test_execution_reconstruction_markout_backfill.py` **7/7 OK** + `test_execution_reconstruction.py` (incl. `TestReduceOnlyLimits` 9/9 y `TestCycleTimerDrain` 2/2) + `test_as_coordinator.py` + `test_offline_coordinator.py` (13/13) + `test_as_calendar.py` (8/8) + `test_as_signals.py` (7/7, +futuro-no-altera-pasado) + `test_as_windows.py` (6/6, nuevo) → **106/106 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -43,6 +43,13 @@
 - Tests: trade@500 previo al primer libro (t0=1000, trade consumido); intervalos inválidos ×6 en ambas rutas; ciclo vacío con libro obsoleto y política muda (invalida antes de llamarla, `calls==[]`); no-reset con inventario 5 (detectaría un reset; el 0 no); segunda ruta camina ciclo vacío 1500 y cierra en 2000.
 - **Fin de datos (ajuste)**: `OfflineCoordinator.load_events` fija cobertura SOLO con eventos públicos; comando posterior al último evento → `ValueError` explícito en carga (motor intacto, sin pasos/decisiones/drenado/cierre extendido); sin eventos de mercado → `ValueError`. Tests: comando@2500 con datos hasta 2000 rechazado; comando en el fin (2000) admitido y pasos acotados.
 
+## Veredicto F1.3 V1–V4 (2026-09-26, hecho — 106/106 área, 528/9 suite)
+- **V3** (`strategy/market_state.py`): `_volatility_of` / `_momentum_of` puros sin mutación; `_compute_*` filtran vistas por ventana (valores idénticos a prod); `get_snapshot(now_sec=None)` con tiempo explícito opcional (None = conducta prod idéntica). Resuelve el HALLAZGO F1.3 de la deque compartida sin cambiar valores de prod.
+- **V1+V4** (`strategy/as_coordinator.py`): warm-up exige conteo Y span ≥ 60s (`_warmup_span_sec()` = max 60/15/30) + `record_mid` por grupo durante el warm-up; `_feed_market_state` valida todos los libros del grupo e incorpora solo el último válido (trades todos).
+- **V2**: `_as_decision` usa `get_snapshot(now_sec)` del ciclo (las ventanas vencen en ciclos vacíos).
+- Tests adaptados al warm-up 60s (veredicto lo permite): datos densos 1000..61000 + cola; la primera decisión cae en el ciclo vacío 66000; solo quedan `pending` los submits del paso final (arrival más allá del fin, `finish()` no inventa tiempo). `test_as_windows.py` nuevo (6/6): sin submits pre-cobertura con AlphaModel alimentado, submits tras 60s, vencimiento directo, snapshots repetidos estables + deque intacta, mismo-ts una muestra, vol 60s con 70s de datos. `test_as_signals.py` 7/7 (+futuro-no-altera-pasado, nota de vol actualizada a V3).
+- Sin regresiones: mismos 9 pre-existentes (los 3 de `market_state` verificados con stash contra el `market_state.py` pre-V3: fallan igual).
+
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**
 - Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) ~~calendario 1s→5s, ciclos sin eventos + drenar timers~~ **HECHO (F1.2)**; (3) ~~conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup~~ **HECHO (F1.3)** — `ASCoordinator` posee un `MarketState` real (sin WS, alimentado con los mismos eventos causales, ticks→USDC / lots→XRP con el config del engine) + un `AlphaModel` compartido (`record_mid` 1×/ciclo, `now_sec=ts_sim` explícito, `price_ticks=round(USDC/tick_size)`, guarda maker, código muerto eliminado); `test_as_signals.py` 6/6 (señales causales, conversiones no unitarias, escalado único de vol, determinismo doble corrida); (4) flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py`) — PENDIENTE (F1.4, fuera de alcance).
@@ -55,7 +62,8 @@
 - **Regla nueva**: NUNCA aprobar una rama por una corrida verde sin que coincida exactamente el número de tests seleccionados (`collected X items / Y deselected`) con el esperado.
 
 ## Pendientes P1+
-- (HALLAZGO F1.3, reportado al diseñador — NO modificado): `MarketState` comparte una sola deque de mids entre momentum (ventana 15s, poda destructiva en `_compute_momentum`) y volatilidad (ventana documentada 60s): tras cada `get_snapshot()` el historial queda acotado a ~15s, así que la ventana de 60s de sigma es inalcanzable en la práctica (en vivo y en replay). Cambiarlo altera conducta productiva e interfiere con los 3 tests de vol pre-existentes en fallo; se deja tal cual por condición de reuso, a decisión del diseñador.- (NUEVO) Investigar `test_fill_rate_deterministic_baseline_zero_fees` — riesgo "se degradó a estas simulaciones" del revisor.
+- (RESUELTO V3) El hallazgo F1.3 de la deque compartida quedó corregido con consultas no destructivas (valores idénticos a prod).
+- (NUEVO) Investigar `test_fill_rate_deterministic_baseline_zero_fees` — riesgo "se degradó a estas simulaciones" del revisor.
 - (NUEVO) Aislar teardown en `TestF38ReplayRejectsAgedBadge` (disk-full simulado persiste entre tests).
 - Investigar bloqueo WS piloto (post-reconnect code=None); fix ping/pong user-level o watchdog (§13).
 - Rellenar placeholders T19.4 (decision-snapshot schema faltante).

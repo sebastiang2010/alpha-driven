@@ -60,6 +60,10 @@ VOLATILITY_WINDOW_SEC = 60.0     # ventana de muestras de mid para sigma
 ALPHA_WINDOW_SEC = 15.0          # ventana de momentum
 _MAXLEN = 10000                  # maxlen generoso para las deques
 
+# Referencia de tiempo para volatilidad (V2: ref_s única congelada)
+# SAMPLING_INTERVAL_SEC = 5.0 es el intervalo de referencia (ref_s)
+# desde config. No se define constante local duplicada.
+
 # Separa "sin datos" de "spread = 0": límite por debajo del cual el
 # mid se considera degenerado (XRPUSDC cotiza muy por encima de esto).
 _MIN_PRICE = 1e-9
@@ -189,29 +193,23 @@ class MarketState:
             self.last_update_ts = timestamp
 
     # ── Derivados que requieren lectura completa bajo lock ─────────
-    def _compute_volatility(self, now_sec):
-        """
-        sigma (§7): desvío estándar muestral de retornos log de mid.
+    @staticmethod
+    def _volatility_of(samples):
+        """sigma pura (sin mutación): stdev muestral de logrets × sqrt(ref/dt_bar).
 
-        Se usan muestras de mid tomadas en cada actualización del
-        bookTicker/depth dentro de VOLATILITY_WINDOW_SEC. Retorno log:
-        r_i = ln(p_i / p_{i-1}). El std muestral (n-1) de esos retornos es
-        el sigma por evento del WS.
-
-        Reescala a intervalo fijo (§0.6): el WS puede actualizar más rápido
-        que SAMPLING_INTERVAL_SEC; para que sigma sea consistente con la
-        referencia de alpha_model (5 s), se multiplica por
-        sqrt(SAMPLING_INTERVAL_SEC / avg_interval). Si no hay suficientes
-        muestras o el intervalo medio no es positivo, devuelve 0.0.
+        `samples`: secuencia [(ts_sec, mid), ...] YA filtrada a la ventana.
+        <3 muestras, <2 retornos, sin intervalos o dt_bar<=0 → 0.0.
+        Misma fórmula que _compute_volatility (V3: sin podar la deque
+        compartida — antes el poda de momentum a 15s recortaba el historial
+        de sigma entre consultas sucesivas).
         """
-        self._prune_deque(self._mid_samples, now_sec, VOLATILITY_WINDOW_SEC)
-        if len(self._mid_samples) < 3:
+        if len(samples) < 3:
             return 0.0
         returns = []
-        prev_price = self._mid_samples[0][1]
-        prev_ts = self._mid_samples[0][0]
+        prev_price = samples[0][1]
+        prev_ts = samples[0][0]
         intervals = []
-        for ts, price in list(self._mid_samples)[1:]:
+        for ts, price in list(samples)[1:]:
             if prev_price > _MIN_PRICE and price > _MIN_PRICE:
                 returns.append(math.log(price / prev_price))
                 if ts > prev_ts:
@@ -228,7 +226,41 @@ class MarketState:
         if avg_interval <= 0.0:
             return 0.0
         ref_interval = float(getattr(config, "SAMPLING_INTERVAL_SEC", 5.0))
+        # V2: sigma_ref = sigma_event * sqrt(ref_s / dt_bar) — un solo escalado
         return sigma_event * math.sqrt(ref_interval / avg_interval)
+
+    @staticmethod
+    def _momentum_of(samples):
+        """Momentum puro (sin mutación): (newest-oldest)/newest, <2 → 0.0."""
+        if len(samples) < 2:
+            return 0.0
+        oldest = samples[0][1]
+        newest = samples[-1][1]
+        if newest <= _MIN_PRICE:
+            return 0.0
+        return (newest - oldest) / newest
+
+    def _compute_volatility(self, now_sec):
+        """
+        sigma (§7): desvío estándar muestral de retornos log de mid.
+
+        Se usan muestras de mid tomadas en cada actualización del
+        bookTicker/depth dentro de VOLATILITY_WINDOW_SEC. Retorno log:
+        r_i = ln(p_i / p_{i-1}). El std muestral (n-1) de esos retornos es
+        el sigma por evento del WS.
+
+        Reescala a intervalo fijo ref_s (§0.6, V2): el WS puede actualizar más rápido
+        que SAMPLING_INTERVAL_SEC; para que sigma sea consistente con la
+        referencia única congelada (ref_s = SAMPLING_INTERVAL_SEC), se multiplica por
+        sqrt(ref_s / avg_interval). Si no hay suficientes
+        muestras o el intervalo medio no es positivo, devuelve 0.0.
+
+        V2: usa una sola referencia ref_s desde config (no constante local duplicada).
+        V3: vista filtrada (no destructiva) — valores idénticos al poda anterior.
+        """
+        window = [s for s in self._mid_samples
+                  if s[0] >= now_sec - VOLATILITY_WINDOW_SEC]
+        return self._volatility_of(window)
 
     def _compute_momentum(self, now_sec):
         """
@@ -236,25 +268,29 @@ class MarketState:
 
         (mid_ahora - mid_hace_ALPHA_WINDOW_SEC) / mid_ahora, usando la
         muestra más reciente y la más antigua dentro de la ventana.
+        V3: vista filtrada (no destructiva) — valores idénticos al poda anterior.
         """
-        self._prune_deque(self._mid_samples, now_sec, ALPHA_WINDOW_SEC)
-        if len(self._mid_samples) < 2:
-            return 0.0
-        oldest = self._mid_samples[0][1]
-        newest = self._mid_samples[-1][1]
-        if newest <= _MIN_PRICE:
-            return 0.0
-        return (newest - oldest) / newest
+        window = [s for s in self._mid_samples
+                  if s[0] >= now_sec - ALPHA_WINDOW_SEC]
+        return self._momentum_of(window)
 
     # ── Snapshot para market_maker ─────────────────────────────────
-    def get_snapshot(self):
+    def get_snapshot(self, now_sec=None):
         """
         Copia segura de todo el estado (lock adquirido, copiado, liberado).
         El contrato del dict es estable: inventory/pnl los rellena
         market_maker, acá solo se deja el espacio definido.
+
+        now_sec (V2, ruta offline): instante explícito en segundos contra el
+        que se vencen TODAS las ventanas (trade flow, volatilidad, momentum).
+        Si es None (producción), se usa el ts del último evento, idéntico a
+        la conducta anterior. Las consultas no mutan _mid_samples (V3).
         """
         with self._lock:
-            now_sec = self._to_sec(self.last_update_ts) or 0.0
+            if now_sec is None:
+                now_sec = self._to_sec(self.last_update_ts) or 0.0
+            else:
+                now_sec = float(now_sec)
 
             # trade flow en los últimos TRADE_WINDOW_SEC
             self._prune_deque(self._trade_flow, now_sec, TRADE_WINDOW_SEC)

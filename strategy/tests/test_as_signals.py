@@ -91,11 +91,13 @@ class TestUnitConversions(unittest.TestCase):
             places=9)
 
     def test_emitted_quotes_are_ticks_and_maker_valid(self):
-        depth = [_depth(1000, 100, 101, 1, 0),
-                 _depth(2000, 100, 101, 2, 1),
-                 _depth(3000, 100, 101, 3, 2),
-                 _depth(7000, 100, 101, 4, 3),
-                 _depth(12000, 100, 101, 5, 4)]
+        # Densa 1000..61000 cada 5s (warm-up 60s) + cola: la primera
+        # decisión cae en el ciclo vacío 66000 y emite quotes maker-válidas.
+        depth = [_depth(ts, 100, 101, uid + 1, uid)
+                 for uid, ts in enumerate(range(1000, 61001, 5000))]
+        n = len(depth)
+        depth += [_depth(71000, 100, 101, n + 1, n),
+                  _depth(76000, 100, 101, n + 2, n + 1)]
         eng = _engine(tick_size=0.01, qty_step=10.0)
         coord = _coord(depth, [], eng)
         coord.run()
@@ -114,13 +116,10 @@ class TestUnitConversions(unittest.TestCase):
 class TestSimulatedVolatilityScaling(unittest.TestCase):
     """Un solo escalado sqrt(ref_s/dt_bar), exacto a 2s de muestreo.
 
-    Nota: espaciado 2s (no 10s) porque MarketState comparte una sola deque
-    de mids entre momentum (ventana 15s, poda destructiva) y volatilidad
-    (ventana 60s): con muestras separadas >15s el poda de momentum recorta
-    el historial de vol. Con 5 muestras en 8s nada se poda y el factor
-    sqrt(5/2)!=1 sigue fijando el escalado único (doble raíz daría 5/2).
-    La interacción de ventanas se reporta al diseñador (conducta heredada
-    del módulo reutilizado, no del coordinador).
+    Nota (V3): momentum y volatilidad ya no comparten poda destructiva —
+    cada cómputo filtra su propia vista por ventana sin mutar la deque.
+    El espaciado 2s queda como caso exacto mínimo; la cobertura real de
+    la ventana de 60s se prueba en test_as_windows.py con 70s de datos.
     """
 
     def test_single_sqrt_scaling_at_2s_spacing(self):
@@ -156,6 +155,33 @@ class TestDeterminism(unittest.TestCase):
 
     def test_double_run_identical_commands(self):
         self.assertEqual(self._run_orders(), self._run_orders())
+
+    def test_future_data_does_not_alter_past_decisions(self):
+        """Causalidad: agregar libros futuros no cambia las órdenes con
+        submit_ts dentro del prefijo común (warm-up 60s + decisión 66000)."""
+        prefix = [_depth(ts, 10000, 10001, uid + 1, uid)
+                  for uid, ts in enumerate(range(1000, 61001, 5000))]
+        n = len(prefix)
+        tail = [_depth(71000, 10000, 10001, n + 1, n),
+                _depth(76000, 10000, 10001, n + 2, n + 1)]
+        future = [_depth(81000, 10000, 10001, n + 3, n + 2),
+                  _depth(86000, 10002, 10003, n + 4, n + 3)]
+
+        def run_all(rows):
+            eng = _engine()
+            _coord(rows, [], eng).run()
+            return sorted(
+                (o["order_id"], o["side"], o["price_ticks"], o["qty_lots"])
+                for o in eng.orders.values())
+
+        short = run_all(prefix + tail)
+        long_ = run_all(prefix + tail + future)
+        short = run_all(prefix + tail)
+        long_ = run_all(prefix + tail + future)
+        # Todo lo emitido en la corrida corta aparece identico en la larga:
+        # el futuro no reescribe decisiones pasadas (ids por ciclo).
+        for o in short:
+            self.assertIn(o, long_)
 
 
 if __name__ == "__main__":

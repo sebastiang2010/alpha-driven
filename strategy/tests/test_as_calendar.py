@@ -28,6 +28,21 @@ def _big_gap_engine():
         ReconstructionConfig(max_gap_ms=60000, max_book_age_ms=60000))
 
 
+def _books(t_start, t_end, step, bid=10000, ask=10001, uid_start=1):
+    """Libros encadenados (update_id/pu) cada `step` ms. Gaps <=10s para no
+    disparar la regla de hueco (2*D); el llamador cuida max_gap del motor."""
+    rows = []
+    uid = uid_start
+    ts = t_start
+    prev = uid_start - 1
+    while ts <= t_end:
+        rows.append(_depth(ts, bid, ask, uid, prev))
+        prev = uid
+        uid += 1
+        ts += step
+    return rows, uid
+
+
 def _make_coord(depth_rows, trades_rows, engine=None, **kw):
     kw.setdefault("decision_interval_ms", 5000)
     kw.setdefault("warmup_intervals", 3)
@@ -66,42 +81,45 @@ class TestFiveSecondCalendar(unittest.TestCase):
         self.assertEqual(coord.decision_interval_ms, 5000)
 
     def test_merged_steps_include_empty_cycles_in_order(self):
-        """Libros@1000,2000,3000,7000,12000 (D=5s, t0=1000): pasos
-        1000,2000,3000,6000(vacío),7000,11000(vacío),12000 — sin saltos,
-        sin regresión, fin en último evento."""
-        depth = [_depth(1000, 10000, 10001, 1, 0),
-                 _depth(2000, 10000, 10001, 2, 1),
-                 _depth(3000, 10000, 10001, 3, 2),
-                 _depth(7000, 10000, 10001, 4, 3),
-                 _depth(12000, 10000, 10001, 5, 4)]
+        """Densa 1000..61000 cada 5s (warm-up 60s) + libro 71000
+        (D=5s, t0=1000): pasos = densa + 66000(vacío),71000 — sin
+        saltos, sin regresión, fin en último evento."""
+        depth, nxt = _books(1000, 61000, 5000)
+        depth += [_depth(71000, 10000, 10001, nxt, nxt - 1)]
         engine = RecordingEngine(
             ReconstructionConfig(max_gap_ms=60000, max_book_age_ms=60000))
         coord = _make_coord(depth, [], engine=engine)
         result = coord.run()
         self.assertIsInstance(result, FinalResult)
-        self.assertEqual(engine.advanced_ts,
-                         [1000, 2000, 3000, 6000, 7000, 11000, 12000])
-        self.assertEqual(result.observed_end_ms, 12000)
+        expected = list(range(1000, 61001, 5000)) + [66000, 71000]
+        self.assertEqual(engine.advanced_ts, expected)
+        self.assertEqual(result.observed_end_ms, 71000)
 
     def test_empty_cycle_decides_and_drains_arrival(self):
-        """El ciclo vacío 6000 decide (warm-up completo) y su arrival@6040
-        ya está drenado en el paso 7000: ninguna orden queda 'pending'."""
-        depth = [_depth(1000, 10000, 10001, 1, 0),
-                 _depth(2000, 10000, 10001, 2, 1),
-                 _depth(3000, 10000, 10001, 3, 2),
-                 _depth(7000, 10000, 10001, 4, 3),
-                 _depth(12000, 10000, 10001, 5, 4)]
+        """El ciclo vacío 66000 decide (warm-up 60s completo en la densa):
+        emite submits en 66000 y sus arrivals@66040 quedan drenados en los
+        pasos siguientes (nada 'pending' al cierre en 76000)."""
+        depth, nxt = _books(1000, 61000, 5000)
+        depth += [_depth(71000, 10000, 10001, nxt, nxt - 1)]
+        nxt += 1
+        depth += [_depth(76000, 10000, 10001, nxt, nxt - 1)]
         coord = _make_coord(depth, [])
         result = coord.run()
         self.assertIsInstance(result, FinalResult)
-        # Hubo decisión en ciclo sin eventos (órdenes emitidas en ts=6000)
+        self.assertEqual(result.observed_end_ms, 76000)
+        self.assertTrue(coord._warmup_complete)
+        # Hubo decisión en ciclo sin eventos (órdenes emitidas en ts=66000)
         by_empty_cycle = [o for o in coord.engine.orders.values()
-                          if o.get("submit_ts_ms") == 6000]
+                          if o.get("submit_ts_ms") == 66000]
         self.assertGreater(len(by_empty_cycle), 0)
-        # ...y sus arrivals se drenaron (nada pendiente)
+        # ...y todo lo emitido antes del último paso está drenado: solo
+        # puede quedar 'pending' lo del cierre (arrival más allá del fin,
+        # que finish() no debe inventar)
         pending = [o for o in coord.engine.orders.values()
                    if o["status"] == "pending"]
-        self.assertEqual(pending, [])
+        self.assertTrue(pending)  # el paso final siempre deja arrival futuro
+        self.assertTrue(all(o.get("submit_ts_ms") == result.observed_end_ms
+                            for o in pending))
 
     def test_off_grid_trade_is_consumed(self):
         """Trade@6500 (fuera de grilla) se procesa: el libro posterior lo
@@ -122,10 +140,10 @@ class TestFiveSecondCalendar(unittest.TestCase):
         """Hueco entre EVENTOS > 2*D invalida aunque los ciclos intermedios
         existan. El inventario NO NULO del motor no se resetea: si algo lo
         pusiera a cero, este test lo detectaría (comprobar cero no detecta)."""
-        depth = [_depth(1000, 10000, 10001, 1, 0),
-                 _depth(2000, 10000, 10001, 2, 1),
-                 _depth(3000, 10000, 10001, 3, 2),
-                 _depth(30000, 10000, 10001, 4, 3)]
+        depth, nxt = _books(1000, 61000, 5000)
+        # Hueco 61000 -> 100000 = 39000 > 2*D=10000 (el motor big-gap lo
+        # tolera: la invalidez viene de la regla del coordinador, no del motor)
+        depth += [_depth(100000, 10000, 10001, nxt, nxt - 1)]
         coord = _make_coord(depth, [])
         # Inventario no nulo previo al hueco (siembra de estado: la vía que
         # invalida no debe tocar el inventario del motor)
@@ -174,14 +192,14 @@ class TestFiveSecondCalendar(unittest.TestCase):
                 calls.append(self._current_ts)
                 return []
 
-        depth = [_depth(1000, 10000, 10001, 1, 0),
-                 _depth(2000, 10000, 10001, 2, 1),
-                 _depth(3000, 10000, 10001, 3, 2),
-                 _depth(7000, 10000, 10001, 4, 3)]
-        # Motor con max_book_age default (1000): en el ciclo vacío 6000 el
-        # libro@3000 tiene 3000ms -> obsoleto. Gap de libros 4000 <= 2*D=10000:
+        depth, nxt = _books(1000, 61000, 5000)
+        # Hueco de libros 61000 -> 70000 = 9000 <= 2*D=10000: no hay Gap;
         # la invalidez viene por cobertura, no por hueco.
-        engine = ExecutionReconstructor(ReconstructionConfig())
+        depth += [_depth(70000, 10000, 10001, nxt, nxt - 1)]
+        # Motor con max_book_age 1000 (pero max_gap amplio para la densa):
+        # en el ciclo vacío 66000 el libro@61000 tiene 5000ms -> obsoleto.
+        engine = ExecutionReconstructor(
+            ReconstructionConfig(max_gap_ms=60000, max_book_age_ms=1000))
         coord = QuietCoordinator(
             config=ReconstructionConfig(),
             engine=engine,
