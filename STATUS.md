@@ -1,14 +1,14 @@
 # STATUS — Alpha-Driven (XRPUSDC MM)
-**Actualizado**: 2026-09-27 — F1.4 **AUTORIZADO e implementado** (pendiente de revisión del diseñador). Q1–Q3 aprobados; F2.5 fuera de alcance.
+**Actualizado**: 2026-09-27 — F1.4 + 2 ajustes del veredicto **implementados** (pendiente de revisión del diseñador). Q1–Q3 aprobados; F2.5 fuera de alcance.
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **557 passed / 9 failed** (2026-09-27)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **559 passed / 9 failed** (2026-09-27)
   - Los 9 fallos son **pre-existentes** (mismos nombres que en veredictos previos; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **5/5** (nuevo) → **122/122 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) → **124/124 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -76,11 +76,16 @@
 - **Q3** (invariante reforzado): corrida plano+alcista con A-S real y motor default emite ≥10 órdenes de ambos lados (quotes persiguen mercado; viejas caen por depth) — por orden: status ∉ límites; conteo global de rechazos por límites == 0.
 - Sin regresiones: mismos 9 pre-existentes (nombres idénticos; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1).
 
-## F1.4 — cancel/replace + ledger de objetivos (2026-09-27, hecho — 122/122 área, 557/9 suite, pendiente revisión del diseñador)
+## F1.4 — cancel/replace + ledger de objetivos (2026-09-27, hecho — 124/124 área, 559/9 suite, pendiente revisión del diseñador)
 - `strategy/as_coordinator.py`: `quote_ledger` (una fila por ciclo×lado: ts, lado, precio, qty, motivo, order_id — incluso sin envío); `_owned` (order_id→lado) + `_cancel_requested` (lado ocupado hasta cancelación efectiva observada en el snapshot); `_reconcile_owned` (terminales liberan el lado); `_decide_side` (submit fresco / `held_unchanged` / `cancel_requested` / `cancel_pending` / supresiones con motivo); reemplazo siempre recalculado, nunca reenviado; lados no permitidos por inventario cancelan lo propio activo. `run()` ya no marca occupancy (vive en `_as_decision`); firma `_as_decision(snapshot)` intacta (`QuietCoordinator` OK); `_side_occupied` conservado.
 - Motivos: `submitted`, `held_unchanged`, `cancel_requested`, `cancel_pending`, `suppressed_maker`, `suppressed_inventory_side`, `suppressed_no_book`, `suppressed_no_mid`.
 - Tests nuevos `strategy/tests/test_as_cancel_replace.py` 5/5 (motor real, libros de 2 niveles balanceados para que las quotes descansen): cancel→reemplazo diferido con precio nuevo e ids nuevos; sin duplicadas ni `rejected_side_busy`; `held_unchanged` sin movimiento; fill durante la espera (cancel lenta 6000ms, trade fuera de grilla en 76500, `cancel_pending` en 76000, reemplazo SELL en 81000); trazabilidad (cada ciclo ambos lados, motivos válidos, comandos del journal ↔ ledger). Hallazgo: SELL suprimido por maker guard con imbalance fuerte es correcto (emitirlo cruzaría); `rejected_unknown_depth` en libros de 1 nivel es correcto (quote fuera de profundidad visible).
 - Sin regresiones: mismos 9 pre-existentes (nombres idénticos).
+
+## F1.4 — 2 ajustes del veredicto (2026-09-27, hecho — pendiente revisión)
+1. **Permanencia mínima** (espejo prod §8/§10): `_decide_side` solo cancela por cambio de precio si `edad >= MIN_ORDER_LIFETIME_SEC=15` (frontera inclusiva, `strategy/config.py:122`); antes registra `held_min_lifetime` sin comandos. Antigüedad desde `_owned_ts` (ts del ciclo que emitió el submit; se depura en `_reconcile_owned`). Escenarios existentes desplazados a 81000/86000 (submits 66000; 71000/76000 `held_unchanged`).
+2. **Fills parciales durante la espera**: `ASCoordinatorConfig.qty_lots` (default 1, comportamiento intacto en el resto) + filas del ledger de órdenes propias con `remaining_lots` real. Test con qty 3, cancel lenta 6000ms, trade de 1 a 86500: `cancel_pending` en 86000 sin submits, fill 1/remanente 2/inventario +1, orden muere `cancelled` con remanente; a 91000 BUY suprimido por inventario (+1) y SELL reemplazado recalculado con el mercado movido en la espera (precio e id nuevos, ≠ guardados).
+- Tests `test_as_cancel_replace.py` 7/7: `TestMinLifetimeBoundary` (5s/10s `held_min_lifetime`, 15s exactos cancela, sin `cancel_requested` antes, reemplazo en 86000) + `TestPartialFillDuringCancelWait` + existentes adaptados (gap rule: libros intermedios 71000/76000 sin movimiento).
 
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**

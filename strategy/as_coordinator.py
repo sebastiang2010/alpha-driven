@@ -57,6 +57,7 @@ class ASCoordinatorConfig:
     decision_interval_ms: int = 5000
     warmup_intervals: int = 3
     max_gap_ratio: float = 2.0
+    qty_lots: int = 1  # tamaño por orden propia (tests de parciales usan >1)
 
 
 # ── Main coordinator ──────────────────────────────────────────────────
@@ -104,6 +105,7 @@ class ASCoordinator:
         trades_csv: Sequence[Dict[str, Any]],
         decision_interval_ms: int = 5000,
         warmup_intervals: int = 3,
+        qty_lots: int = 1,
     ):
         self.config = config
         self.engine = engine
@@ -112,6 +114,7 @@ class ASCoordinator:
         self._cfg = ASCoordinatorConfig(
             decision_interval_ms=decision_interval_ms,
             warmup_intervals=warmup_intervals,
+            qty_lots=int(qty_lots),
         )
 
         # Derive t0 from the FIRST BOOK (F1.2): a leading trade must not shift
@@ -165,10 +168,13 @@ class ASCoordinator:
         # coordinator-submitted orders still tracked; _cancel_requested:
         # order_id -> ts of our cancel (side stays occupied until the
         # cancel-effective is observed in the engine snapshot).
+        # _owned_ts: order_id -> ts_ms del ciclo que emitió el submit
+        # (antigüedad para la permanencia mínima, espejo de prod §8/§10).
         # quote_ledger: one row per decision cycle × side with the quote
         # TARGET (ts, side, price, qty, reason, order_id) — recorded even
         # when no command is sent.
         self._owned: Dict[str, str] = {}
+        self._owned_ts: Dict[str, int] = {}
         self._cancel_requested: Dict[str, int] = {}
         self.quote_ledger: List[Dict[str, Any]] = []
 
@@ -396,6 +402,7 @@ class ASCoordinator:
         self._best_ask = 0.0
         self._side_occupied = {}
         self._owned = {}
+        self._owned_ts = {}
         self._cancel_requested = {}
         self.quote_ledger = []
 
@@ -630,6 +637,7 @@ class ASCoordinator:
             st = (states.get(oid) or {}).get("status")
             if st not in ("pending", "live"):
                 del self._owned[oid]
+                self._owned_ts.pop(oid, None)
                 if oid in self._cancel_requested:
                     del self._cancel_requested[oid]
                     self._side_occupied[side] = False
@@ -658,25 +666,40 @@ class ASCoordinator:
           fills —incluso parciales— los procesa el motor mientras tanto).
         - Con orden propia activa sin cancel → si el precio deseado coincide
           se mantiene (`held_unchanged`); si cambió se cancela
-          (`cancel_requested`) y el reemplazo se recalcula en el ciclo
-          siguiente (nunca se reenvía el objetivo viejo).
+          (`cancel_requested`) SOLO si la orden alcanzó la permanencia
+          mínima (espejo de prod market_maker §8/§10: requote con
+          age >= MIN_ORDER_LIFETIME_SEC, frontera inclusiva); antes se
+          mantiene (`held_min_lifetime`) sin comandos. El reemplazo se
+          recalcula en el ciclo siguiente (nunca se reenvía el objetivo
+          viejo).
         - Lado libre → submit fresco (`submitted`) o supresión con motivo.
         """
         owned = self._owned_on_side(snapshot, side)
         pending_cancel = [str(o.get("order_id")) for o in owned
                           if o.get("order_id") in self._cancel_requested]
         if pending_cancel:
-            self._record_target(ts_ms, side, desired_ticks, 1,
+            first = next((o for o in snapshot.orders
+                          if o.get("order_id") == min(pending_cancel)), None)
+            pq = int((first or {}).get("remaining_lots", 1) or 1)
+            self._record_target(ts_ms, side, desired_ticks, pq,
                                 "cancel_pending", min(pending_cancel))
             return
         if owned:
             current = owned[0]
+            oq = int(current.get("remaining_lots", 1) or 1)
             if int(current.get("price_ticks", -1)) == int(desired_ticks):
-                self._record_target(ts_ms, side, desired_ticks, 1,
+                self._record_target(ts_ms, side, desired_ticks, oq,
                                     "held_unchanged",
                                     current.get("order_id"))
                 return
             oid = str(current.get("order_id"))
+            min_lifetime_sec = float(
+                getattr(_strategy_config, "MIN_ORDER_LIFETIME_SEC", 15))
+            age_sec = (int(ts_ms) - int(self._owned_ts.get(oid, ts_ms))) / 1000.0
+            if age_sec < min_lifetime_sec:
+                self._record_target(ts_ms, side, desired_ticks, oq,
+                                    "held_min_lifetime", oid)
+                return
             self._pending_commands.append({
                 "ts_ms": ts_ms,
                 "kind": "cancel",
@@ -685,7 +708,7 @@ class ASCoordinator:
             })
             self._cancel_requested[oid] = ts_ms
             self._side_occupied[side] = True
-            self._record_target(ts_ms, side, desired_ticks, 1,
+            self._record_target(ts_ms, side, desired_ticks, oq,
                                 "cancel_requested", oid)
             return
         # Lado libre: rhythmic occupancy cleared (la reconciliación ya
@@ -700,16 +723,18 @@ class ASCoordinator:
                                 "suppressed_maker", None)
             return
         oid = f"{'buy' if side == 'BUY' else 'sell'}_{self._cycle_counter}"
+        qty = int(self._cfg.qty_lots)
         self._pending_commands.append({
             "ts_ms": ts_ms,
             "kind": "submit",
             "order_id": oid,
             "side": side,
             "price_ticks": int(desired_ticks),
-            "qty_lots": 1,
+            "qty_lots": qty,
         })
         self._owned[oid] = side
-        self._record_target(ts_ms, side, int(desired_ticks), 1,
+        self._owned_ts[oid] = int(ts_ms)
+        self._record_target(ts_ms, side, int(desired_ticks), qty,
                             "submitted", oid)
 
     # ── Gap validation ──────────────────────────────────────────────────

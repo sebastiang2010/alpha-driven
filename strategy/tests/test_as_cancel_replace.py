@@ -46,7 +46,7 @@ def _engine(**kw):
     return ExecutionReconstructor(ReconstructionConfig(**kw))
 
 
-def _coord(depth, trades, engine):
+def _coord(depth, trades, engine, qty_lots=1):
     return ASCoordinator(
         config=ReconstructionConfig(),
         engine=engine,
@@ -54,6 +54,7 @@ def _coord(depth, trades, engine):
         trades_csv=trades,
         decision_interval_ms=5000,
         warmup_intervals=3,
+        qty_lots=qty_lots,
     )
 
 
@@ -69,13 +70,22 @@ def _ledger_rows(coord, ts_ms=None, side=None, reason=None):
 
 
 class TestCancelPendingAndDeferredReplace(unittest.TestCase):
-    """Libro que se mueve tras la primera cotización: cancel diferido."""
+    """Libro que se mueve tras la primera cotización: cancel diferido.
 
-    def _run_until(self, shift_ts=71000, tail_ts=76000):
+    Permanencia mínima (espejo prod §8/§10, MIN_ORDER_LIFETIME_SEC=15):
+    submits en 66000 solo pueden cancelarse desde 81000 (frontera
+    inclusiva). El movimiento llega en 81000; 71000/76000 mantienen.
+    """
+
+    def _run_until(self, shift_ts=81000, tail_ts=86000):
         depth, nxt = _books(1000, 61000, 5000)
         depth.append(_depth(66000, 10000, 10001, nxt, nxt - 1))
-        depth.append(_depth(shift_ts, 10010, 10011, nxt + 1, nxt))
-        depth.append(_depth(tail_ts, 10010, 10011, nxt + 2, nxt + 1))
+        # Libros intermedios sin movimiento (gap rule: eventos <= 10000ms;
+        # ciclos 71000/76000 mantienen por libro quieto).
+        depth.append(_depth(71000, 10000, 10001, nxt + 1, nxt))
+        depth.append(_depth(76000, 10000, 10001, nxt + 2, nxt + 1))
+        depth.append(_depth(shift_ts, 10010, 10011, nxt + 3, nxt + 2))
+        depth.append(_depth(tail_ts, 10010, 10011, nxt + 4, nxt + 3))
         engine = _engine()
         coord = _coord(depth, [], engine)
         result = coord.run()
@@ -86,12 +96,16 @@ class TestCancelPendingAndDeferredReplace(unittest.TestCase):
         # 66000: submits iniciales (lado libre, inventario 0)
         first = _ledger_rows(coord, 66000, reason="submitted")
         self.assertEqual(len(first), 2)
-        # 71000: libro movido -> ambos lados piden cancel, nada se envía
-        canc = _ledger_rows(coord, 71000, reason="cancel_requested")
+        # 71000/76000: libro quieto -> se mantiene (edad irrelevante)
+        for ts in (71000, 76000):
+            self.assertEqual(len(_ledger_rows(coord, ts, reason="held_unchanged")), 2)
+        # 81000: libro movido + edad exactamente 15s (frontera inclusiva)
+        # -> ambos lados piden cancel, nada se envía
+        canc = _ledger_rows(coord, 81000, reason="cancel_requested")
         self.assertEqual(len(canc), 2)
-        self.assertEqual(_ledger_rows(coord, 71000, reason="submitted"), [])
-        # 76000: cancelación efectiva drenada -> reemplazo fresco
-        repl = _ledger_rows(coord, 76000, reason="submitted")
+        self.assertEqual(_ledger_rows(coord, 81000, reason="submitted"), [])
+        # 86000: cancelación efectiva drenada -> reemplazo fresco
+        repl = _ledger_rows(coord, 86000, reason="submitted")
         self.assertEqual(len(repl), 2)
         # El reemplazo NO reenvía el objetivo viejo: precio distinto
         # (el mercado se movió) e ids nuevos.
@@ -127,16 +141,65 @@ class TestCancelPendingAndDeferredReplace(unittest.TestCase):
         self.assertEqual(_ledger_rows(coord, 71000, reason="submitted"), [])
 
 
+class TestMinLifetimeBoundary(unittest.TestCase):
+    """Fronteras temporales de la permanencia mínima (15s, inclusiva).
+
+    El libro se mueve en 71000 (edad 5s) y sigue movido: 71000/76000
+    deben mantener por lifetime (held_min_lifetime, sin comandos) y
+    81000 (edad exactamente 15s) debe cancelar.
+    """
+
+    def _run_early_move(self):
+        depth, nxt = _books(1000, 61000, 5000)
+        depth.append(_depth(66000, 10000, 10001, nxt, nxt - 1))
+        depth.append(_depth(71000, 10010, 10011, nxt + 1, nxt))
+        depth.append(_depth(76000, 10010, 10011, nxt + 2, nxt + 1))
+        depth.append(_depth(81000, 10010, 10011, nxt + 3, nxt + 2))
+        depth.append(_depth(86000, 10010, 10011, nxt + 4, nxt + 3))
+        engine = _engine()
+        coord = _coord(depth, [], engine)
+        coord.run()
+        return coord, engine
+
+    def test_hold_below_15s_cancel_at_15s(self):
+        coord, engine = self._run_early_move()
+        self.assertEqual(len(_ledger_rows(coord, 66000, reason="submitted")), 2)
+        # 71000 (5s) y 76000 (10s): precio cambió pero la orden es joven
+        for ts in (71000, 76000):
+            held = _ledger_rows(coord, ts, reason="held_min_lifetime")
+            self.assertEqual(len(held), 2)
+            self.assertEqual(_ledger_rows(coord, ts, reason="cancel_requested"), [])
+            self.assertEqual(_ledger_rows(coord, ts, reason="submitted"), [])
+        # 81000 (exactamente 15s): frontera inclusiva -> cancela
+        canc = _ledger_rows(coord, 81000, reason="cancel_requested")
+        self.assertEqual(len(canc), 2)
+        # Sin comandos de cancel antes de la frontera
+        early_cancels = [j for j in engine.journal
+                         if j.get("event") == "cancel_requested"
+                         and j.get("ts_ms", 0) < 81000]
+        self.assertEqual(early_cancels, [])
+        # 86000: reemplazo fresco tras la cancelación efectiva
+        repl = _ledger_rows(coord, 86000, reason="submitted")
+        self.assertEqual(len(repl), 2)
+
+
 class TestFillDuringCancelWait(unittest.TestCase):
     """Cancel con latencia larga: el fill llega en la espera y el lado se
-    libera por terminal (filled), no por cancelación efectiva."""
+    libera por terminal (filled), no por cancelación efectiva.
+
+    La cancelación solo puede pedirse con edad >= 15s: el movimiento llega
+    en 81000; la cancel lenta (6000ms) vence en 87000 y el trade cae en
+    86500 (fuera de grilla, durante la espera).
+    """
 
     def test_fill_before_effective_frees_side(self):
         depth, nxt = _books(1000, 61000, 5000)
         depth.append(_depth(66000, 10000, 10001, nxt, nxt - 1))
-        depth.append(_depth(71000, 10010, 10011, nxt + 1, nxt))
+        depth.append(_depth(71000, 10000, 10001, nxt + 1, nxt))
+        depth.append(_depth(76000, 10000, 10001, nxt + 2, nxt + 1))
+        depth.append(_depth(81000, 10010, 10011, nxt + 3, nxt + 2))
         # Motor con cancelación lenta (6000ms > ciclo 5000ms): la cancel
-        # pedida en 71000 vence en 77000, un ciclo completo después.
+        # pedida en 81000 vence en 87000, más de un ciclo después.
         engine = _engine(cancel_latency_ms=6000)
         coord = _coord(depth, [], engine)
         # Se necesita el precio BUY emitido en 66000 para el trade;
@@ -145,31 +208,105 @@ class TestFillDuringCancelWait(unittest.TestCase):
         probe.run()
         buy_price = _ledger_rows(probe, 66000, side="BUY",
                                  reason="submitted")[0]["price_ticks"]
-        # Trade en 76500 (fuera de grilla: no hay decisión ese ts) al precio
+        # Trade en 86500 (fuera de grilla: no hay decisión ese ts) al precio
         # de la orden BUY (cola vacía: visible 0 fuera de nivel → llena).
-        # Ocurre DURANTE la espera: cancel pedida en 71000, efectiva en
-        # 77000. En 76000 (grilla, sin trades) el lado debe verse pendiente.
-        depth.append(_depth(76000, 10010, 10011, nxt + 2, nxt + 1))
-        trades = [_trade(76500, "fillbuy", buy_price, 5, True)]
-        depth.append(_depth(81000, 10010, 10011, nxt + 3, nxt + 2))
+        # Ocurre DURANTE la espera: cancel pedida en 81000, efectiva en
+        # 87000. En 86000 (grilla, sin trades) el lado debe verse pendiente.
+        depth.append(_depth(86000, 10010, 10011, nxt + 4, nxt + 3))
+        trades = [_trade(86500, "fillbuy", buy_price, 5, True)]
+        depth.append(_depth(91000, 10010, 10011, nxt + 5, nxt + 4))
         engine2 = _engine(cancel_latency_ms=6000)
         coord2 = _coord(depth, trades, engine2)
         coord2.run()
-        # 76000: lado BUY en espera de cancelación (ocupado, sin envío)
-        pend = _ledger_rows(coord2, 76000, side="BUY", reason="cancel_pending")
+        # 86000: lado BUY en espera de cancelación (ocupado, sin envío)
+        pend = _ledger_rows(coord2, 86000, side="BUY", reason="cancel_pending")
         self.assertEqual(len(pend), 1)
         # El fill se procesó durante la espera
         fills = [f for f in engine2.fills if f.side == "BUY"]
         self.assertEqual(len(fills), 1)
-        # 81000: BUY terminal-filled libera el lado; inventario +1 → BUY
+        # 91000: BUY terminal-filled libera el lado; inventario +1 → BUY
         # suprimido por regla de inventario y SELL reemplazado fresco.
         self.assertEqual(engine2.inventory_lots, 1)
         self.assertEqual(
-            len(_ledger_rows(coord2, 81000, side="BUY",
+            len(_ledger_rows(coord2, 91000, side="BUY",
                              reason="suppressed_inventory_side")), 1)
-        repl_sell = _ledger_rows(coord2, 81000, side="SELL",
+        repl_sell = _ledger_rows(coord2, 91000, side="SELL",
                                  reason="submitted")
         self.assertEqual(len(repl_sell), 1)
+
+
+class TestPartialFillDuringCancelWait(unittest.TestCase):
+    """Coordinador con qty_lots=3: un trade chico durante la espera deja
+    remanente pendiente (fill parcial). El lado sigue ocupado (sin
+    reemplazo prematuro), la contabilidad refleja el remanente y el
+    reemplazo —tras la cancelación efectiva— se recalcula con el mercado
+    movido durante la espera (no reenvía el precio guardado)."""
+
+    def test_partial_fill_keeps_side_busy_then_recalculates(self):
+        depth, nxt = _books(1000, 61000, 5000)
+        depth.append(_depth(66000, 10000, 10001, nxt, nxt - 1))
+        depth.append(_depth(71000, 10000, 10001, nxt + 1, nxt))
+        depth.append(_depth(76000, 10000, 10001, nxt + 2, nxt + 1))
+        depth.append(_depth(81000, 10010, 10011, nxt + 3, nxt + 2))
+        engine = _engine(cancel_latency_ms=6000)
+        coord = _coord(depth, [], engine, qty_lots=3)
+        probe = _coord(list(depth), [], _engine(), qty_lots=3)
+        probe.run()
+        buy_price = _ledger_rows(probe, 66000, side="BUY",
+                                 reason="submitted")[0]["price_ticks"]
+        depth.append(_depth(86000, 10010, 10011, nxt + 4, nxt + 3))
+        # Trade chico (1 < 3): parcial contra la orden BUY de 3.
+        trades = [_trade(86500, "partbuy", buy_price, 1, True)]
+        # El mercado se mueve DURANTE la espera: el reemplazo debe usar
+        # este libro, no el precio guardado de la orden cancelada.
+        depth.append(_depth(91000, 10020, 10021, nxt + 5, nxt + 4))
+        engine2 = _engine(cancel_latency_ms=6000)
+        coord2 = _coord(depth, trades, engine2, qty_lots=3)
+        coord2.run()
+        # 1. Cancel pedida en 81000 (edad 15s) con qty 3
+        canc = _ledger_rows(coord2, 81000, side="BUY",
+                            reason="cancel_requested")
+        self.assertEqual(len(canc), 1)
+        self.assertEqual(canc[0]["qty_lots"], 3)
+        old_oid = canc[0]["order_id"]
+        # 2. En 86000 el lado sigue ocupado: cancel_pending, sin submits
+        # del lado (sin reemplazo prematuro) aunque hubo fill parcial.
+        pend = _ledger_rows(coord2, 86000, side="BUY",
+                            reason="cancel_pending")
+        self.assertEqual(len(pend), 1)
+        self.assertEqual(
+            _ledger_rows(coord2, 86000, side="BUY", reason="submitted"), [])
+        # 3. Contabilidad del remanente: fill de 1, quedan 2 pendientes,
+        # inventario +1.
+        fills = [f for f in engine2.fills if f.side == "BUY"]
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].qty, 1.0)
+        self.assertEqual(engine2.inventory_lots, 1)
+        live = engine2.orders[old_oid]
+        self.assertEqual(live["remaining_lots"], 2)
+        # La orden muere cancelada (no filled): el remanente nunca se
+        # llenó del todo y no hubo reemplazo prematuro.
+        self.assertEqual(live["status"], "cancelled")
+        # 4. Tras la cancelación efectiva (87000, drenada en 91000) el
+        # inventario es +1 (fill parcial): BUY ya no puede reemplazarse
+        # (regla de lados: en largo solo SELL) y SELL se reemplaza
+        # recalculado con el mercado nuevo — precio distinto del guardado
+        # e id nuevo.
+        supp = _ledger_rows(coord2, 91000, side="BUY",
+                            reason="suppressed_inventory_side")
+        self.assertEqual(len(supp), 1)
+        repl = _ledger_rows(coord2, 91000, side="SELL",
+                            reason="submitted")
+        self.assertEqual(len(repl), 1)
+        old_sell = _ledger_rows(coord2, 81000, side="SELL",
+                                reason="cancel_requested")[0]
+        self.assertNotEqual(repl[0]["order_id"], old_sell["order_id"])
+        self.assertNotEqual(repl[0]["price_ticks"],
+                            old_sell["price_ticks"])
+        cancelled_evts = [j for j in engine2.journal
+                          if j.get("event") == "cancelled"
+                          and j.get("order_id") == old_oid]
+        self.assertEqual(len(cancelled_evts), 1)
 
 
 class TestQuoteLedgerTraceability(unittest.TestCase):
@@ -189,10 +326,16 @@ class TestQuoteLedgerTraceability(unittest.TestCase):
             self.assertEqual({r["side"] for r in rows}, {"BUY", "SELL"})
             for r in rows:
                 self.assertIn(r["reason"], {
-                    "submitted", "held_unchanged", "cancel_requested",
-                    "cancel_pending", "suppressed_maker",
+                    "submitted", "held_unchanged", "held_min_lifetime",
+                    "cancel_requested", "cancel_pending", "suppressed_maker",
                     "suppressed_inventory_side", "suppressed_no_book",
                     "suppressed_no_mid"})
+        # 71000/76000: precio movido pero órdenes jóvenes (5s/10s < 15s)
+        for cycle in (71000, 76000):
+            held = _ledger_rows(coord, cycle, reason="held_min_lifetime")
+            self.assertEqual(len(held), 2)
+            self.assertEqual(
+                _ledger_rows(coord, cycle, reason="cancel_requested"), [])
         # Comandos del journal ↔ filas del ledger
         ledger_by_id = {}
         for r in coord.quote_ledger:
