@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **567 passed / 9 failed** (2026-09-27)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **573 passed / 9 failed** (2026-09-27)
   - Los 9 fallos son **pre-existentes** (mismos nombres que en veredictos previos; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes + F2.5**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) + `test_reconstruction_metrics.py` **8/8 nuevo** → **132/132 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes + F2.5**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) + `test_reconstruction_metrics.py` **14/14** (8 iniciales + 6 de ajustes del veredicto) → **138/138 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 
@@ -91,7 +91,7 @@
 ## Veredicto global — fases 1 y 2 ABIERTAS (2026-09-26, pendiente confirmación humana)
 - Diseñador: aprobado lo hecho hasta `test_flip_excluded_from_bypass_under_excess`; markouts aprobados. Bloqueos en integración. **No ejecutar sin confirmación del usuario; no comparaciones ni push.**
 - Fase 1: (1) ~~unificar `OfflineCoordinator`~~ **HECHO (F1.1)**; (2) ~~calendario 1s→5s, ciclos sin eventos + drenar timers~~ **HECHO (F1.2)**; (3) ~~conectar A-S real: estado causal, conversión ticks↔USDC, tiempo simulado explícito, warmup~~ **HECHO (F1.3)** — `ASCoordinator` posee un `MarketState` real (sin WS, alimentado con los mismos eventos causales, ticks→USDC / lots→XRP con el config del engine) + un `AlphaModel` compartido (`record_mid` 1×/ciclo, `now_sec=ts_sim` explícito, `price_ticks=round(USDC/tick_size)`, guarda maker, código muerto eliminado); `test_as_signals.py` 6/6 (señales causales, conversiones no unitarias, escalado único de vol, determinismo doble corrida); (4) ~~flujo cancel/replace + registro de objetivos por ciclo (`as_coordinator.py`)~~ **HECHO (F1.4, pendiente revisión del diseñador)**.
-- Fase 2: ~~(5) medición integrada en `FinalResult` (equity neta, costes, valoración final, fills en cancelación, tiempo sin cotizar, exposición por lado)~~ **HECHO (F2.5, 2026-09-27, pendiente revisión del diseñador)**. Siguiente paso tras el cierre estático: primera prueba dinámica offline (requiere autorización humana).
+- Fase 2: ~~(5) medición integrada en `FinalResult` (equity neta, costes, valoración final, fills en cancelación, tiempo sin cotizar, exposición por lado)~~ **HECHO (F2.5, 2026-09-27, pendiente revisión del diseñador) — con 3 ajustes del veredicto ya implementados**. Siguiente paso tras el cierre estático: primera prueba dinámica offline (requiere autorización humana).
 - Orden propuesto + pruebas sintéticas de integración sin mockear la decisión A-S.
 
 ## Disciplina de evidencia (lección registrada)
@@ -99,7 +99,8 @@
 - Lección documentada en `.operator/specs/leccion_duplicate_basename_pytest.md` (incluye anti-patrón "lector perezoso": números de suite solo válidos con WC estable, contrastar conteo selected vs baseline).
 - **Regla nueva**: NUNCA aprobar una rama por una corrida verde sin que coincida exactamente el número de tests seleccionados (`collected X items / Y deselected`) con el esperado.
 
-## F2.5 — medición integrada en `FinalResult` (2026-09-27, hecho — 132/132 área, 567/9 suite, pendiente revisión del diseñador)
+## F2.5 — medición integrada en `FinalResult` (2026-09-27, hecho — 138/138 área, 573/9 suite, pendiente revisión del diseñador)
+- V2 ajustes del veredicto: (1) `cancel_requested` ya no extrae de `live_set` — la orden sigue contando como cotizada hasta su cancelación efectiva / terminal real; (2) costes explícitos en `ReconstructionConfig` (`maker_fee_rate`, `funding_rate_per_8h`; cero = escenario promo, no conclusión implícita), métricas separadas `gross_equity_usdc` vs `net_equity_usdc = gross − fees − funding`, slippage declarado 0 por construcción (ya materializado en precios maker ejecutados); (3) `finish()` rechaza `observed_end_ms > _last_public_ts` antes de drenar timers/métricas (tracking del último book/trade vía `advance_to`). Tests nuevos: espera de cancelación cotizando (-500ms no cuentan), dos lados vivos, fill parcial en espera, costes ≠ 0 exactos, cero como escenario explícito, rechazo de extensión.
 - `strategy/execution_reconstruction.py`: dataclass frozen `ReconstructionMetrics` + `FinalResult.metrics`; `_process_trade_event` registra `filled_during_cancel` (cancel ya solicitada) y trayectoria `_inventory_path` (ts, lots) por fill.
 - `finish()` → `compute_metrics(observed_end_ms)`: turnover (Σ price·qty en USDC), fees 0.0 (motor maker sin comisiones — los costes los aplica el caller sobre turnover), cash, inventario final (XRP lots×qty_step), valoración al último mid (`mid×tick_size`), equity neta cash+valoración (None sin books), conta fills totales/durante-cancel, volúmenes por lado, exposición máxima long/short, `unquoted_ms` (intervalos sin órdenes vivas entre primer book y `observed_end_ms`, reconstruidos del journal: live↔{filled,cancelled,end_censored,cancel_requested,rejected_*}) y `coverage_ms`.
 - Sin lookahead: solo datos procesados ≤ fin. Tests `strategy/tests/test_reconstruction_metrics.py` 8/8 (equity exacto con mid móvil, exposición long/short, fill durante cancel, sin cotización sin órdenes y con hueco arrival+post-fill, sin books → None, tipo de la métrica).

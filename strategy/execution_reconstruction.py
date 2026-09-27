@@ -350,6 +350,10 @@ class ReconstructionConfig:
     max_book_age_ms: int = 1000
     max_gap_ms: int = 2000
     max_position_lots: int = 100
+    # Supuestos de costo explícitos (F2.5): cero = escenario promo 0-fees
+    # XRPUSDC vigente; configurar distinto de cero para evaluar su fin.
+    maker_fee_rate: float = 0.0  # fracción del turnover por fill maker
+    funding_rate_per_8h: float = 0.0  # fracción del inventario (USDC) por 8 h
 
 
 @dataclass
@@ -410,18 +414,24 @@ class ExecutionSnapshot:
 class ReconstructionMetrics:
     """Medición integrada offline de una reconstrucción (F2.5).
 
-    Todo en USDC salvo conteos y ms. El motor modela fills maker sin
-    comisiones (promo 0 fees XRPUSDC): fees_usdc es 0.0 y los costes los
-    aplica el caller sobre turnover_usdc. Sin lookahead: la valoración
-    usa el último book procesado.
+    Todo en USDC salvo conteos y ms. Costes: fees = turnover*maker_fee_rate
+    y funding = |inv|*mid integrado*funding_rate_per_8h (ambos del config,
+    cero = escenario promo; explícitos, no implícitos). Slippage: los fills
+    del motor ya se ejecutan a precios maker resting — el efecto está en los
+    precios y NO se vuelve a descontar (slippage_usdc=0 por construcción,
+    no cero como supuesto). Incluye equity bruta (sin costes) y neta.
+    Sin lookahead: la valoración usa el último book procesado.
     """
     turnover_usdc: float  # suma |precio×qty| de fills
-    fees_usdc: float  # 0.0 — sin modelo de comisiones en el motor
+    fees_usdc: float  # turnover * config.maker_fee_rate
+    funding_usdc: float  # ∫|inv|·mid dt / 8h * config.funding_rate_per_8h
+    slippage_usdc: float  # 0.0: ya en los precios maker ejecutados
     cash_usdc: float  # flujo de caja acumulado (= FinalResult.cash)
     final_inventory_xrp: float
     final_mid_usdc: Optional[float]  # None si no hubo books
     final_inventory_usdc: Optional[float]  # None si no hubo books
-    net_equity_usdc: Optional[float]  # cash + valoración (None si no hubo books)
+    gross_equity_usdc: Optional[float]  # cash + valoración bruta (None si no hubo books)
+    net_equity_usdc: Optional[float]  # bruta - fees - funding (None si no hubo books)
     n_fills: int
     fills_during_cancel: int  # fills con cancel ya solicitada
     buy_qty_lots: float  # volumen llenado BUY
@@ -483,6 +493,7 @@ class ExecutionReconstructor:
         self._commands_applied: bool = False
         self._finished: bool = False
         self._sequence: int = 0
+        self._last_public_ts: int = -1  # último ts de evento externo (book/trade) procesado
         
     def _log(self, ts_ms: int, event: str, order_id: Optional[str] = None, **fields) -> None:
         self.journal.append({'ts_ms': ts_ms, 'event': event, 'order_id': order_id, **fields})
@@ -857,6 +868,7 @@ class ExecutionReconstructor:
                 new_fills.extend([f for f in self.fills if f.ts_ms == ts_ms and f not in new_fills])
             elif e['kind'] == 'book':
                 self._process_book_event(e, ts_ms)
+            self._last_public_ts = max(self._last_public_ts, ts_ms)
         
         # After all market events at this timestamp, process remaining timers at this timestamp
         # with priority < submit/cancel (4) - i.e., arrival(2), cancel_effective(1)
@@ -968,7 +980,26 @@ class ExecutionReconstructor:
             mid_ticks = None
         final_mid = None if mid_ticks is None else mid_ticks * tick
         inv_usdc = None if final_mid is None else float(self.inventory_lots) * step * final_mid
-        equity = None if inv_usdc is None else cash_usdc + inv_usdc
+        # Costes explícitos del config (F2.5 #2). Funding: ∫|inv_xrp|·mid dt / 8h.
+        fees = turnover * float(self.config.maker_fee_rate)
+        funding = 0.0
+        if self._inventory_path and self.books:
+            mid_by_ts = self.books
+            ms8h = 8 * 3600 * 1000
+            rate = float(self.config.funding_rate_per_8h)
+            path = list(self._inventory_path)
+            if path and path[0][0] > (self.books[0]['ts_ms'] if self.books else 0):
+                path = [(self.books[0]['ts_ms'], 0)] + path
+            for i, (ts, lots) in enumerate(path):
+                nxt = path[i + 1][0] if i + 1 < len(path) else observed_end_ms
+                dt = max(0, int(nxt - ts))
+                # mid más reciente <= ts
+                midv = next((b['mid_ticks'] for b in reversed(mid_by_ts) if b['ts_ms'] <= ts), None)
+                if midv is None:
+                    continue
+                funding += abs(lots) * step * midv * tick * (dt / ms8h) * rate
+        gross = None if inv_usdc is None else cash_usdc + inv_usdc
+        equity = None if gross is None else gross - fees - funding
         # Ventana de observación y cobertura
         if self.books:
             first_book_ts = self.books[0]['ts_ms']
@@ -992,18 +1023,23 @@ class ExecutionReconstructor:
             oid = j.get('order_id')
             if ev == 'live' and oid is not None:
                 live_set.add(oid)
-            elif oid is not None and (ev in ('filled', 'cancelled', 'end_censored', 'cancel_requested')
+            elif oid is not None and (ev in ('filled', 'cancelled', 'end_censored')
                                       or ev.startswith('rejected_')):
+                # Terminales reales únicamente: 'cancel_requested' NO quita la
+                # orden del conjunto (sigue viva y llena hasta la efectiva).
                 live_set.discard(oid)
         if current_ts is not None and observed_end_ms > current_ts:
             unquoted += 0 if live_set else (observed_end_ms - current_ts)
         return ReconstructionMetrics(
             turnover_usdc=turnover,
-            fees_usdc=0.0,
+            fees_usdc=fees,
+            funding_usdc=funding,
+            slippage_usdc=0.0,
             cash_usdc=cash_usdc,
             final_inventory_xrp=float(self.inventory_lots) * step,
             final_mid_usdc=final_mid,
             final_inventory_usdc=inv_usdc,
+            gross_equity_usdc=gross,
             net_equity_usdc=equity,
             n_fills=len(self.fills),
             fills_during_cancel=fills_dc,
@@ -1024,6 +1060,13 @@ class ExecutionReconstructor:
             raise ValueError('finish() already called')
         if observed_end_ms < self._last_advance_ts:
             raise ValueError(f'finish observed_end_ms={observed_end_ms} < last advance={self._last_advance_ts}')
+        # F2.5 #3: sin extensión más allá del último evento público procesado.
+        # Rechazar antes de drenar timers o calcular métricas.
+        # (Sin eventos públicos aún — `_last_public_ts == -1` — el fin es trivial.)
+        if self._last_public_ts >= 0 and observed_end_ms > self._last_public_ts:
+            raise ValueError(
+                f'finish observed_end_ms={observed_end_ms} extends beyond last public event '
+                f'ts_ms={self._last_public_ts}; no hay cobertura de datos')
         
         # Procesar timers hasta observed_end_ms (incluyendo mismo timestamp)
         import heapq
