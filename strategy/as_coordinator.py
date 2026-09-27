@@ -76,8 +76,13 @@ class ASCoordinator:
       shared AlphaModel history, so §14 never starts empty
     - No decisions after EOF; event gaps invalidate the run without resetting inventory
     - Event group closes completely before delivering; never filters future to policy
-    - Delayed replacement: if a decision cancels a side, that side stays "occupied"
-      until the next scheduled cycle (no immediate re-submit).
+     - Delayed replacement (F1.4): if a decision cancels a side, that
+       side stays "occupied" until the cancel-effective is observed in
+       the engine snapshot (fills — even partial — are processed by the
+       engine while the cancel is in flight). The replacement is
+       recomputed fresh at the next free cycle, never resent. Every
+       cycle x side records its quote TARGET in quote_ledger (timestamp,
+       side, price, qty, reason, order_id), even when nothing is sent.
     - Market signals (F1.3): owns a REAL MarketState (no WS started) fed with
       the same causal events the engine consumes (books/trades from t0, prices
       converted ticks→USDC, qty lots→XRP). The A-S policy reads
@@ -155,6 +160,17 @@ class ASCoordinator:
 
         # Delayed replacement: track which sides are "occupied" after a cancel
         self._side_occupied: Dict[str, bool] = {}
+
+        # F1.4 cancel/replace + quote ledger. _owned: order_id -> side for
+        # coordinator-submitted orders still tracked; _cancel_requested:
+        # order_id -> ts of our cancel (side stays occupied until the
+        # cancel-effective is observed in the engine snapshot).
+        # quote_ledger: one row per decision cycle × side with the quote
+        # TARGET (ts, side, price, qty, reason, order_id) — recorded even
+        # when no command is sent.
+        self._owned: Dict[str, str] = {}
+        self._cancel_requested: Dict[str, int] = {}
+        self.quote_ledger: List[Dict[str, Any]] = []
 
     # ── CSV loading ────────────────────────────────────────────────────
 
@@ -379,6 +395,9 @@ class ASCoordinator:
         self._best_bid = 0.0
         self._best_ask = 0.0
         self._side_occupied = {}
+        self._owned = {}
+        self._cancel_requested = {}
+        self.quote_ledger = []
 
         # Calendario fusionado (misma implementación que el main loop):
         # los ciclos vacíos también se visitan para el registro 1/ciclo.
@@ -490,7 +509,10 @@ class ASCoordinator:
         ms_snap = self._market_state.get_snapshot(
             now_sec, )
         mid = ms_snap.get("mid") or 0.0
+        ts_ms = int(snapshot.ts_ms)
         if mid <= 0:
+            for side in ("BUY", "SELL"):
+                self._record_target(ts_ms, side, 0, 1, "suppressed_no_mid", None)
             return []
         # R2: el precio base A-S es el del snapshot — microprice cuando hay
         # libro (incorpora el imbalance), mid en su defecto. Sin conversión
@@ -535,45 +557,160 @@ class ASCoordinator:
                     best_bid_ticks = 0
                     best_ask_ticks = 0
 
-        def is_occupied(side: str) -> bool:
-            return bool(self._side_occupied.get(side, False))
-
-        def emit(side: str, price_ticks: int) -> None:
-            commands.append(
-                {
-                    "ts_ms": int(snapshot.ts_ms),
-                    "kind": "submit",
-                    "order_id": f"{'buy' if side == 'BUY' else 'sell'}_{self._cycle_counter}",
-                    "side": side,
-                    "price_ticks": price_ticks,
-                    "qty_lots": 1,
-                }
-            )
-
-        # Inventory side rule with maker guard per side.
+        # F1.4 driver: reconcile owned orders against the authoritative
+        # snapshot, then decide each side (fresh quotes every cycle —
+        # replacements are recomputed, never resent).
+        self._reconcile_owned(snapshot)
+        self._pending_commands: List[Dict[str, Any]] = []
         if inventory_lots == 0:
-            if (best_bid_ticks > 0 and best_ask_ticks > 0
-                    and not is_occupied("BUY")
-                    and as_bid_ticks > 0 and as_bid_ticks < best_ask_ticks):
-                emit("BUY", as_bid_ticks)
-            if (best_bid_ticks > 0 and best_ask_ticks > 0
-                    and not is_occupied("SELL")
-                    and as_ask_ticks > 0 and as_ask_ticks > best_bid_ticks):
-                emit("SELL", as_ask_ticks)
+            allowed = ("BUY", "SELL")
         elif inventory_lots > 0:
-            # Reduce long: SELL only.
-            if (best_bid_ticks > 0 and best_ask_ticks > 0
-                    and not is_occupied("SELL")
-                    and as_ask_ticks > 0 and as_ask_ticks > best_bid_ticks):
-                emit("SELL", as_ask_ticks)
+            allowed = ("SELL",)  # reduce long
         else:
-            # Reduce short: BUY only.
-            if (best_bid_ticks > 0 and best_ask_ticks > 0
-                    and not is_occupied("BUY")
-                    and as_bid_ticks > 0 and as_bid_ticks < best_ask_ticks):
-                emit("BUY", as_bid_ticks)
-
+            allowed = ("BUY",)  # reduce short
+        desired = {"BUY": int(as_bid_ticks), "SELL": int(as_ask_ticks)}
+        maker_ok = {
+            "BUY": as_bid_ticks > 0 and as_bid_ticks < best_ask_ticks,
+            "SELL": as_ask_ticks > 0 and as_ask_ticks > best_bid_ticks,
+        }
+        for side in ("BUY", "SELL"):
+            if side in allowed:
+                self._decide_side(ts_ms, side, desired[side], snapshot,
+                                  best_bid_ticks, best_ask_ticks,
+                                  maker_ok[side])
+            else:
+                # Lado no permitido por inventario: si hay orden propia
+                # activa, se cancela (no mantener posición creciente);
+                # si no, objetivo suprimido con motivo.
+                owned = self._owned_on_side(snapshot, side)
+                if owned and not any(
+                        o.get("order_id") in self._cancel_requested
+                        for o in owned):
+                    oid = str(owned[0].get("order_id"))
+                    self._pending_commands.append({
+                        "ts_ms": ts_ms, "kind": "cancel",
+                        "order_id": oid, "side": side,
+                    })
+                    self._cancel_requested[oid] = ts_ms
+                    self._side_occupied[side] = True
+                    self._record_target(ts_ms, side, desired[side], 1,
+                                        "cancel_requested", oid)
+                elif owned:
+                    self._record_target(ts_ms, side, desired[side], 1,
+                                        "cancel_pending",
+                                        str(owned[0].get("order_id")))
+                else:
+                    self._record_target(ts_ms, side, desired[side], 1,
+                                        "suppressed_inventory_side", None)
+        commands = self._pending_commands
+        del self._pending_commands
         return commands
+
+    def _record_target(self, ts_ms: int, side: str, price_ticks: int,
+                       qty_lots: int, reason: str,
+                       order_id: Optional[str]) -> None:
+        """F1.4: registra el objetivo de cotización del ciclo en el ledger
+        (trazabilidad aun sin envío de órdenes)."""
+        self.quote_ledger.append({
+            "ts_ms": int(ts_ms),
+            "side": side,
+            "price_ticks": int(price_ticks),
+            "qty_lots": int(qty_lots),
+            "reason": reason,
+            "order_id": order_id,
+        })
+
+    def _reconcile_owned(self, snapshot: ExecutionSnapshot) -> None:
+        """F1.4: depura el seguimiento de órdenes propias contra el snapshot
+        autoritativo del motor. Las terminales (filled/cancelled/rejected_*)
+        salen de _owned; si tenían cancel pedida, el lado queda libre."""
+        states = {o.get("order_id"): o for o in snapshot.orders}
+        for oid in list(self._owned):
+            side = self._owned[oid]
+            st = (states.get(oid) or {}).get("status")
+            if st not in ("pending", "live"):
+                del self._owned[oid]
+                if oid in self._cancel_requested:
+                    del self._cancel_requested[oid]
+                    self._side_occupied[side] = False
+
+    def _owned_on_side(self, snapshot: ExecutionSnapshot,
+                       side: str) -> List[Dict[str, Any]]:
+        """Órdenes propias activas (pending/live) en un lado."""
+        out = []
+        for o in snapshot.orders:
+            if (o.get("order_id") in self._owned
+                    and o.get("side") == side
+                    and o.get("status") in ("pending", "live")):
+                out.append(o)
+        return out
+
+    def _decide_side(self, ts_ms: int, side: str, desired_ticks: int,
+                     snapshot: ExecutionSnapshot,
+                     best_bid_ticks: int, best_ask_ticks: int,
+                     maker_ok: bool) -> None:
+        """F1.4: decide un lado — submit / hold / cancel / espera.
+
+        Devuelve comandos vía lista interna (usa self._pending_commands).
+        Reglas:
+        - Con cancel pedida y aún activa → `cancel_pending`, sin comandos
+          (el lado permanece ocupado hasta la cancelación efectiva; los
+          fills —incluso parciales— los procesa el motor mientras tanto).
+        - Con orden propia activa sin cancel → si el precio deseado coincide
+          se mantiene (`held_unchanged`); si cambió se cancela
+          (`cancel_requested`) y el reemplazo se recalcula en el ciclo
+          siguiente (nunca se reenvía el objetivo viejo).
+        - Lado libre → submit fresco (`submitted`) o supresión con motivo.
+        """
+        owned = self._owned_on_side(snapshot, side)
+        pending_cancel = [str(o.get("order_id")) for o in owned
+                          if o.get("order_id") in self._cancel_requested]
+        if pending_cancel:
+            self._record_target(ts_ms, side, desired_ticks, 1,
+                                "cancel_pending", min(pending_cancel))
+            return
+        if owned:
+            current = owned[0]
+            if int(current.get("price_ticks", -1)) == int(desired_ticks):
+                self._record_target(ts_ms, side, desired_ticks, 1,
+                                    "held_unchanged",
+                                    current.get("order_id"))
+                return
+            oid = str(current.get("order_id"))
+            self._pending_commands.append({
+                "ts_ms": ts_ms,
+                "kind": "cancel",
+                "order_id": oid,
+                "side": side,
+            })
+            self._cancel_requested[oid] = ts_ms
+            self._side_occupied[side] = True
+            self._record_target(ts_ms, side, desired_ticks, 1,
+                                "cancel_requested", oid)
+            return
+        # Lado libre: rhythmic occupancy cleared (la reconciliación ya
+        # liberó el lado si la cancelación se hizo efectiva).
+        self._side_occupied[side] = False
+        if best_bid_ticks <= 0 or best_ask_ticks <= 0:
+            self._record_target(ts_ms, side, desired_ticks, 1,
+                                "suppressed_no_book", None)
+            return
+        if not maker_ok or desired_ticks <= 0:
+            self._record_target(ts_ms, side, desired_ticks, 1,
+                                "suppressed_maker", None)
+            return
+        oid = f"{'buy' if side == 'BUY' else 'sell'}_{self._cycle_counter}"
+        self._pending_commands.append({
+            "ts_ms": ts_ms,
+            "kind": "submit",
+            "order_id": oid,
+            "side": side,
+            "price_ticks": int(desired_ticks),
+            "qty_lots": 1,
+        })
+        self._owned[oid] = side
+        self._record_target(ts_ms, side, int(desired_ticks), 1,
+                            "submitted", oid)
 
     # ── Gap validation ──────────────────────────────────────────────────
 
@@ -631,6 +768,9 @@ class ASCoordinator:
         self._last_processed_ts = getattr(self, "_warmup_last_ts", -1)
         self._last_event_ts = self._last_processed_ts
         self._side_occupied = {}
+        self._owned = {}
+        self._cancel_requested = {}
+        self.quote_ledger = []
 
         last_event_ts = self._market_events[-1]["ts_ms"]
         start_ts = self._last_processed_ts if self._last_processed_ts > 0 else -1
@@ -688,19 +828,14 @@ class ASCoordinator:
             if self._is_decision_timestamp(ts_ms) and self._warmup_complete:
                 max_age = self.engine.config.max_book_age_ms
                 check_book_coverage(self.engine.book, ts_ms, max_age)
-                # Generate decision (respects _side_occupied for delayed replacement)
+                # Generate decision (F1.4: submits, cancels y ledger de
+                # objetivos; el reemplazo es diferido — la occupancy vive
+                # dentro de _as_decision vía cancelaciones efectivas).
                 commands = self._as_decision(snapshot)
 
                 # Apply commands if any
                 if commands:
                     self.engine.apply_commands(ts_ms, commands)
-
-                    # Mark cancelled sides as occupied for delayed replacement
-                    for cmd in commands:
-                        if cmd["kind"] == "cancel":
-                            side = cmd.get("side", "")
-                            if side:
-                                self._side_occupied[side] = True
 
                 self._cycle_counter += 1
 
