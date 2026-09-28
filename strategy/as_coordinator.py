@@ -106,6 +106,7 @@ class ASCoordinator:
         decision_interval_ms: int = 5000,
         warmup_intervals: int = 3,
         qty_lots: int = 1,
+        funding_csv: Optional[Sequence[Dict[str, Any]]] = None,
     ):
         self.config = config
         self.engine = engine
@@ -120,7 +121,7 @@ class ASCoordinator:
         # Derive t0 from the FIRST BOOK (F1.2): a leading trade must not shift
         # the decision grid. Earlier trades are still loaded and processed.
         # Each event dict has keys: ts_ms (int), kind (str: "book"|"trade"), data (dict).
-        self._market_events = self._load_market_events(depth_csv, trades_csv)
+        self._market_events = self._load_market_events(depth_csv, trades_csv, funding_csv)
         books = [e["ts_ms"] for e in self._market_events if e["kind"] == "book"]
         if books:
             self._t0: int = books[0]
@@ -181,7 +182,8 @@ class ASCoordinator:
     # ── CSV loading ────────────────────────────────────────────────────
 
     def _load_market_events(
-        self, depth_csv: Sequence[Dict[str, Any]], trades_csv: Sequence[Dict[str, Any]]
+        self, depth_csv: Sequence[Dict[str, Any]], trades_csv: Sequence[Dict[str, Any]],
+        funding_csv: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Load and normalize market events from CSV row data.
 
@@ -247,6 +249,19 @@ class ASCoordinator:
                 "kind": "trade",
                 "data": trade_data,
             })
+
+        # Funding settlements (F2.5 V4): solo si el caller los provee
+        # (distingue desconocido / escenario cero explícito / completo).
+        if funding_csv:
+            for row in funding_csv:
+                raw_events.append({
+                    "ts_ms": int(row.get("ts_ms", 0)),
+                    "kind": "funding",
+                    "data": {
+                        "rate": float(row.get("rate", 0.0)),
+                        "mark_price_ticks": int(row.get("mark_price_ticks", 0)),
+                    },
+                })
 
         # Sort by timestamp (stable sort preserves input order for same ts)
         raw_events.sort(key=lambda e: e["ts_ms"])

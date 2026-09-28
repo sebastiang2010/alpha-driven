@@ -3,12 +3,12 @@
 
 ## Estado actual
 - **HEAD real**: `18420e4` en `master` (local, ahead de `origin/master@405f38f`; el `6010803` citado antes no existe — ver lección anti-hash-fantasma)
-- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **578 passed / 9 failed** (2026-09-27)
+- **Suite canónica** (pytest `tests/` + `strategy/tests/`, `-p no:cacheprovider`): **585 passed / 9 failed** (2026-09-27)
   - Los 9 fallos son **pre-existentes** (mismos nombres que en veredictos previos; vienen del trabajo sucio ajeno en `alpha_model`/`market_state`/`config`/`walk_forward`; los 3 de market_state fallan por assert de sigma, no por el cambio de firma Q1):
     - `test_run_monte_carlo_real_data_fails_protocol`, `test_adverse_filter_threshold_defined`,
       3× `TestPisoDeSpread`/`TestFiltroMomentum` (`alpha_model`), `test_inventory_penalty_limits`,
       3× volatilidad (`market_state`)
-  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes + F2.5**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) + `test_reconstruction_metrics.py` **19/19** (8 iniciales + 6 de ajustes del veredicto) → **143/143 OK** en el área tocada
+  - **Point 6 + ajustes + F1.1 + F1.2 + F1.3 + veredictos V1–V4 + W1–W4 + W2 + R1–R5 + Q1–Q3 + F1.4 + 2 ajustes + F2.5**: `test_execution_reconstruction.py` **62/62** + `test_execution_reconstruction_markout_backfill.py` **9/9** (+frontera ±500/501ms) + `test_as_coordinator.py` 3/3 + `test_as_calendar.py` 8/8 + `test_as_signals.py` 7/7 + `test_as_windows.py` **28/28** + `test_as_cancel_replace.py` **7/7** (2 ajustes: frontera lifetime + parcial) + `test_reconstruction_metrics.py` **26/26** (8 iniciales + 6 de ajustes del veredicto) → **150/150 OK** en el área tocada
 - Nivel 0 / dry-run sigue operativo; presupuestos de riesgo: **pendientes de confirmación humana**
 - WS L2 piloto: capture en curso, hueco 3328 s → proceso WS quedó BLOQUEADO SIN SALIDA (silencio total)
 

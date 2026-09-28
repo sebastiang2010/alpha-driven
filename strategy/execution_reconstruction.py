@@ -355,9 +355,13 @@ class ReconstructionConfig:
     maker_fee_rate: float = 0.0  # fracción del turnover por fill maker
     # Funding: NO hay rate continuo. Binance liquida en eventos puntuales
     # (ts, tasa, mark price) aplicados al inventario con su signo (largo paga
-    # con tasa > 0, corto recibe). Se modela con eventos kind='funding' en
-    # advance_to; sin ellos funding_usdc = 0.0 (escenario sin liquidación,
-    # explícito, no asumido).
+    # con tasa > 0, corto recibe). Modelo por eventos kind='funding'.
+    # funding_mode distingue (veredicto F2.5 V4):
+    #   'unknown'  — sin datos de liquidación: funding_usdc=0 PERO la equity
+    #                neta NO es certificable (net_equity_usdc=None).
+    #   'zero'     — escenario cero DECLARADO explícitamente por el caller.
+    #   'complete' — liquidaciones incorporadas; equity neta certificable.
+    funding_mode: str = 'unknown'
 
 
 @dataclass
@@ -428,7 +432,7 @@ class ReconstructionMetrics:
     """
     turnover_usdc: float  # suma |precio×qty| de fills
     fees_usdc: float  # turnover * config.maker_fee_rate
-    funding_usdc: float  # ∫|inv|·mid dt / 8h * config.funding_rate_per_8h
+    funding_usdc: Optional[float]  # None si funding_mode='unknown' (no certificable)
     slippage_usdc: float  # 0.0: ya en los precios maker ejecutados
     cash_usdc: float  # flujo de caja acumulado (= FinalResult.cash)
     final_inventory_xrp: float
@@ -444,6 +448,7 @@ class ReconstructionMetrics:
     max_short_lots: int  # exposición máxima corta, <= 0 (incluye 0 inicial)
     unquoted_ms: int  # ms sin órdenes vivas en [primer book, observed_end]
     coverage_ms: int  # observed_end - primer book (0 si no hubo books)
+    funding_mode: str = 'unknown'  # 'unknown' | 'zero' | 'complete' (veredicto F2.5 V4)
 
 
 @dataclass(frozen=True)
@@ -499,6 +504,7 @@ class ExecutionReconstructor:
         self._sequence: int = 0
         self._last_public_ts: int = -1  # último ts de evento externo (book/trade) procesado
         self._funding_usdc: float = 0.0  # funding acumulado con signo (F2.5): positivo = costo del holder
+        self._funding_ts_seen: set = set()  # dedup funding por ts_ms (F2.5 V4)
         
     def _log(self, ts_ms: int, event: str, order_id: Optional[str] = None, **fields) -> None:
         self.journal.append({'ts_ms': ts_ms, 'event': event, 'order_id': order_id, **fields})
@@ -730,13 +736,22 @@ class ExecutionReconstructor:
     def _process_funding_event(self, event: Dict[str, Any], ts_ms: int) -> None:
         """Liquidación puntual de funding (Binance): se aplica al inventario
         con su signo. costo = inv_xrp * mark_usdc * rate (largo paga con
-        tasa positiva; corto recibe). Se registra en cash_units equivalente
-        (redondeado a tick) y se acumula en _funding_usdc para métricas.
+        tasa positiva; corto recibe). Se acumula en _funding_usdc para métricas.
+
+        Validación previa a mutar estado (veredicto F2.5 V4): tasa finita,
+        mark > 0 y sin liquidación duplicada en el mismo ts_ms.
         """
         rate = float(event['rate'])
-        mark_ticks = int(event['mark_price_ticks'])
-        if mark_ticks <= 0:
+        mark_ticks = event['mark_price_ticks']
+        if not isinstance(mark_ticks, int) or mark_ticks <= 0:
             raise ValueError('Invalid funding mark price')
+        if not math.isfinite(rate):
+            raise ValueError('Invalid funding rate (must be finite)')
+        if not math.isfinite(mark_ticks):
+            raise ValueError('Invalid funding mark (must be finite)')
+        if ts_ms in self._funding_ts_seen:
+            raise ValueError(f'Duplicate funding liquidation at ts_ms={ts_ms}')
+        self._funding_ts_seen.add(ts_ms)
         tick_size = float(self.config.tick_size)
         qty_step = float(self.config.qty_step)
         inv_xrp = float(self.inventory_lots) * qty_step
@@ -893,11 +908,15 @@ class ExecutionReconstructor:
                 transitions = self._process_trade_event(e, ts_ms)
                 all_transitions.extend(transitions)
                 new_fills.extend([f for f in self.fills if f.ts_ms == ts_ms and f not in new_fills])
+                self._last_public_ts = max(self._last_public_ts, ts_ms)
             elif e['kind'] == 'book':
                 self._process_book_event(e, ts_ms)
+                self._last_public_ts = max(self._last_public_ts, ts_ms)
             elif e['kind'] == 'funding':
                 self._process_funding_event(e, ts_ms)
-            self._last_public_ts = max(self._last_public_ts, ts_ms)
+                # Funding NO extiende cobertura pública: es un evento de
+                # liquidación, no mercado. finish() no puede usarlo para
+                # prolongar observed_end_ms ni drenar timers más allá.
         
         # After all market events at this timestamp, process remaining timers at this timestamp
         # with priority < submit/cancel (4) - i.e., arrival(2), cancel_effective(1)
@@ -1014,7 +1033,17 @@ class ExecutionReconstructor:
         fees = turnover * float(self.config.maker_fee_rate)
         funding = self._funding_usdc
         gross = None if inv_usdc is None else cash_usdc + inv_usdc
-        equity = None if gross is None else gross - fees - funding
+        # Sin datos de funding (funding_mode='unknown'): equity neta NO
+        # certificable -> None. funding=None también alecciona al caller.
+        # Con 'zero' o 'complete', gross - fees - funding es computable.
+        mode = getattr(self.config, 'funding_mode', 'unknown')
+        if gross is None:
+            equity = None
+        elif mode == 'unknown':
+            equity = None
+        else:
+            equity = gross - fees - funding
+        funding_field: Optional[float] = None if mode == 'unknown' else funding
         # Ventana de observación y cobertura
         if self.books:
             first_book_ts = self.books[0]['ts_ms']
@@ -1048,7 +1077,7 @@ class ExecutionReconstructor:
         return ReconstructionMetrics(
             turnover_usdc=turnover,
             fees_usdc=fees,
-            funding_usdc=funding,
+            funding_usdc=funding_field,
             slippage_usdc=0.0,
             cash_usdc=cash_usdc,
             final_inventory_xrp=float(self.inventory_lots) * step,
@@ -1064,6 +1093,7 @@ class ExecutionReconstructor:
             max_short_lots=int(max_short),
             unquoted_ms=int(unquoted),
             coverage_ms=int(coverage),
+            funding_mode=mode,
         )
 
     def finish(self, observed_end_ms: int) -> FinalResult:

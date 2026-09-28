@@ -34,9 +34,12 @@ def _trade(ts_ms, trade_id, price, qty, buyer_maker):
 class TestReconstructionMetrics(unittest.TestCase):
     """Métricas integradas por finish(): F2.5."""
 
-    def _rec(self, **kw):
+    def _rec(self, **kw) -> ExecutionReconstructor:
         kw.setdefault("max_gap_ms", 60000)
         kw.setdefault("max_book_age_ms", 60000)
+        # Escenario de funding explícito: por defecto 'zero' declarado
+        # (sin liquidaciones se modelan), no 'unknown' del config crudo.
+        kw.setdefault("funding_mode", "zero")
         return ExecutionReconstructor(ReconstructionConfig(**kw))
 
     def _filled_buy_rec(self) -> ExecutionReconstructor:
@@ -371,6 +374,132 @@ class TestReconstructionMetrics(unittest.TestCase):
         m = rec.finish(2000).metrics
         assert m is not None
         self.assertEqual(m.funding_usdc, 0.0)
+
+    # ── V4: integración del funding con cobertura/modo/dedup ───────────
+
+    def test_funding_after_last_public_does_not_extend_coverage(self):
+        """V4 #1: un funding posterior al último book/trade NO prolonga
+        cobertura ni desbloquea timers fuera de ella."""
+        rec = self._rec(cancel_latency_ms=500)
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "b1", "BUY", 10000, 5)])
+        rec.advance_to(1040, [])  # live
+        rec.apply_commands(1040, [_cancel(1040, "b1")])  # efectiva 1540
+        # Último evento público: 1500 (book). Funding 1700 es posterior.
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 2, 1)])
+        # finish en last_public=1500 (los timers internos sí drenan) —
+        # 1750 queda RECHAZADO incluso si hay funding posterior en 1700.
+        with self.assertRaises(ValueError):
+            rec.finish(1750)
+        # Pero finish con funding posterior no era el problema: a 1500,
+        # el timer cancel_effective 1540 NO drena (va más allá del fin) —
+        # la orden queda live y finish() la censura, NO drena fuera del fin.
+        res = rec.finish(1500)
+        m = res.metrics
+        assert m is not None
+        self.assertEqual(rec.orders["b1"]["status"], "live")
+        self.assertEqual(res.censored_orders[0]["order_id"], "b1")
+        self.assertEqual(m.coverage_ms, 500)  # 1000->1500
+        # hueco sin cotizar: 1000->1040 (40ms)
+        self.assertEqual(m.unquoted_ms, 40)
+
+    def test_funding_mode_unknown_does_not_certify_net_equity(self):
+        """V4 #2: mode='unknown' -> funding_usdc=None y net_equity=None,
+        aunque el acumulado interno sea 0 (no certifica equity neta)."""
+        rec = ExecutionReconstructor(ReconstructionConfig(
+            max_gap_ms=60000, max_book_age_ms=60000,
+            funding_mode="unknown"))  # explícito
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "b1", "BUY", 10000, 5)])
+        rec.advance_to(1040, [])
+        rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
+                              _trade(1100, "t1", 10000, 20, True)])
+        rec.advance_to(2000, [_book(2000, 9990, 9991, 3, 2)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertIsNone(m.funding_usdc)
+        self.assertIsNone(m.net_equity_usdc)
+        # gross sí se computa
+        assert m.gross_equity_usdc is not None
+        self.assertAlmostEqual(m.gross_equity_usdc, -5.0 + 5 * 0.99905, places=9)
+
+    def test_funding_mode_complete_accepts_events(self):
+        """V4 #2: mode='complete' -> funding reportado y neta certificable."""
+        rec = ExecutionReconstructor(ReconstructionConfig(
+            max_gap_ms=60000, max_book_age_ms=60000,
+            funding_mode="complete"))
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "b1", "BUY", 10000, 5)])
+        rec.advance_to(1040, [])
+        rec.advance_to(1100, [_book(1100, 10000, 10001, 2, 1),
+                              _trade(1100, "t1", 10000, 20, True)])
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": 0.0001, "mark_price_ticks": 10000}])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 4, 3)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        assert m.funding_usdc is not None
+        self.assertAlmostEqual(m.funding_usdc, 5.0 * 1.0 * 0.0001, places=12)
+        assert m.net_equity_usdc is not None and m.gross_equity_usdc is not None
+        self.assertAlmostEqual(
+            m.net_equity_usdc,
+            m.gross_equity_usdc - m.fees_usdc - m.funding_usdc,
+            places=12)
+
+    def test_funding_nan_rate_rejected(self):
+        """V4 #3: tasa NaN rechazada; la métrica no se contamina."""
+        rec = self._setup_buy_5()
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2)])
+        with self.assertRaises(ValueError) as cm:
+            rec.advance_to(1600, [{"ts_ms": 1600, "kind": "funding",
+                                   "rate": float("nan"), "mark_price_ticks": 10000}])
+        self.assertIn("finite", str(cm.exception))
+        # métricas previas no contaminadas: funding 0 (mode zero)
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 4, 3)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertEqual(m.funding_usdc, 0.0)
+
+    def test_funding_invalid_mark_rejected(self):
+        """V4 #3: mark <= 0 rechazado."""
+        rec = self._setup_buy_5()
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2)])
+        with self.assertRaises(ValueError) as cm:
+            rec.advance_to(1600, [{"ts_ms": 1600, "kind": "funding",
+                                   "rate": 0.0001, "mark_price_ticks": 0}])
+        self.assertIn("mark", str(cm.exception))
+
+    def test_funding_duplicate_ts_rejected(self):
+        """V4 #3: dos liquidaciones al mismo ts se cobran una vez."""
+        rec = self._setup_buy_5()
+        rec.advance_to(1500, [_book(1500, 10000, 10001, 3, 2),
+                              {"ts_ms": 1500, "kind": "funding",
+                               "rate": 0.0001, "mark_price_ticks": 10000}])
+        with self.assertRaises(ValueError) as cm:
+            rec.advance_to(1500, [{"ts_ms": 1500, "kind": "funding",
+                                   "rate": 0.0002, "mark_price_ticks": 10000}])
+        self.assertIn("Duplicate", str(cm.exception))
+
+    def test_funding_after_fill_same_ts_order_fill_then_funding(self):
+        """Orden en el mismo ts: el fill se procesa primero, el funding
+        se aplica al inventario POST-fill (convención)."""
+        rec = self._rec()
+        rec.advance_to(1000, [_book(1000, 10000, 10001, 1, 0)])
+        rec.apply_commands(1000, [_submit(1000, "b1", "BUY", 10000, 5)])
+        rec.advance_to(1040, [])  # live con inv=0
+        # trade y funding al mismo ts: b1 llena (+5) y funding cobra sobre +5
+        rec.advance_to(1100, [
+            _trade(1100, "t1", 10000, 20, True),   # +5
+            {"ts_ms": 1100, "kind": "funding",
+             "rate": 0.0001, "mark_price_ticks": 10000},
+        ])
+        rec.advance_to(2000, [_book(2000, 10000, 10001, 2, 1)])
+        m = rec.finish(2000).metrics
+        assert m is not None
+        self.assertEqual(m.n_fills, 1)
+        # funding sobre inventario posterior al fill (5 XRP), no sobre 0
+        self.assertAlmostEqual(m.funding_usdc, 5.0 * 1.0 * 0.0001, places=12)
 
 
 if __name__ == "__main__":
