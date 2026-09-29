@@ -25,13 +25,12 @@ import pathlib
 # Símbolo como parámetro de config, nunca hardcodeado en otro módulo (§3).
 SYMBOL: str = "XRPUSDC"
 
-# MAINNET autorizada por humano §0.2 (2026-08-10). No llamar
+# Gate REAL/testnet (§0.1): default TESTNET. Mainnet SOLO con autorización
+# humana explícita §0.2 — para operar mainnet hay que poner REAL=True a mano
+# (override consciente) Y tener EXPOSURE_LEVEL>=1. No llamar
 # init_client(real=True) ni set_testnet(False) en ningun modulo sin esa
 # autorizacion explicita (§0.1).
-# DEFAULT = False (TESTNET): por §0.1 el entorno seguro por defecto es
-# testnet/dry-run. Para operar en mainnet hay que optar explícitamente
-# (REAL=True Y EXPOSURE_LEVEL>=1, ambos requieren autorización humana §0.2).
-REAL: bool = False  # Restablecido a testnet después de pruebas controladas
+REAL: bool = False
 
 # ---------------------------------------------------------------------------
 # Presupuesto de riesgo (§0.4) — PROPUESTA pendiente de confirmacion

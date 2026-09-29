@@ -927,3 +927,112 @@ class MarketMaker:
             1.0, int(self.risk.get_state().get("error_count", 0)) / float(MAX_ERROR_COUNT)
         )
         return round(0.4 * daily_usage + 0.4 * dd_usage + 0.2 * err_usage, 4)
+import argparse
+import sys
+
+    # ── 11. Kill switch invocable desde fuera (§13) ─────────────────────
+    def check_kill_switch_now(self, snapshot: dict | None = None) -> tuple:
+        """Invoca el kill switch fuera del loop (para el runner CLI, §13).
+
+        Usa el último snapshot si no se pasa uno. Devuelve (triggered, reasons).
+        Efectos si dispara: cancel_all + reduce/close + bloqueo de nuevas
+        entradas + stop (los mismos que en el ciclo de run()).
+        """
+        snap = snapshot if snapshot is not None else (self._last_snapshot or {})
+        return self._kill_switch_check(snap), self.disable_new_entries
+
+
+# ── 12. CLI mínima del runner (solo testnet, §0.1) ──────────────────────
+def main(argv=None) -> int:
+    """Runner con CLI real del MarketMaker (testnet, §0.1/§0.5).
+
+    Flags (los únicos tres; no hay más):
+
+    - ``--testnet``: QUÉ HACE: fuerza el path testnet en memoria para esta
+      corrida (``config.REAL=False`` sin persistir a disco), de modo que
+      ``run()`` toma la rama ``init_client(real=False)``. Sin este flag y con
+      el default ``REAL=False``, el path ya es testnet; el flag es la
+      afirmación explícita. QUÉ NO HACE: no modifica ``config.py`` en disco,
+      no autoriza mainnet, no toca credenciales, no envía órdenes por sí solo.
+    - ``--max-orders N``: QUÉ HACE: override en memoria de
+      ``RiskEngine.max_open_orders`` (default ``config.MAX_OPEN_ORDERS=4``);
+      con ``--max-orders 1`` el Risk Engine rechaza toda orden adicional
+      cuando ya hay 1 abierta ("una orden a la vez"). QUÉ NO HACE: no modifica
+      ``config.py``, no desactiva el resto de validaciones del Risk Engine.
+    - ``--exposure-level N``: QUÉ HACE: override en memoria de
+      ``config.EXPOSURE_LEVEL`` para esta corrida (solo se aceptan 0 o 1).
+      QUÉ NO HACE: no persiste el nivel, no autoriza subir a niveles reales
+      (>=2 → el runner aborta, §0.2).
+
+    Lo que esta CLI NO puede (reportado, no inventado):
+    - No hay flag ``--live``/``--real``: el runner construye SIEMPRE
+      ``MarketMaker(dry_run=True)``, así que las órdenes son SIMULATED
+      (``place_maker_order`` short-circuit, sin API). Enviar órdenes testnet
+      reales requeriría ``dry_run=False``, fuera del alcance de estos 3 flags.
+    - No hay ``set_testnet``: esa función no existe en el codebase (solo
+      ``init_client(real=...)`` vía ``ExecutionEngine``), así que no hay nada
+      que invocar; el path testnet se verifica por ``init_client(real=False)``.
+    - No hay flag de duración: la corrida corre hasta kill switch / Ctrl-C;
+      acotarla por fuera (timeout) o detener con el kill switch.
+    - El kill switch vive en ``MarketMaker._kill_switch_check`` (invocado cada
+      ciclo por ``run()``) y es invocable desde el runner vía
+      ``mm.check_kill_switch_now(snapshot)``; al terminar se reporta si quedó
+      disparado (``mm.disable_new_entries``).
+
+    Exit codes: 0 = fin limpio; 2 = bloqueo de seguridad (REAL=True sin
+    --testnet, exposure-level >= 2, o --max-orders < 1).
+    """
+    parser = argparse.ArgumentParser(
+        description="Runner MarketMaker — solo testnet/simulación (§0.1). "
+                    "JAMÁS mainnet."
+    )
+    parser.add_argument("--testnet", action="store_true",
+                        help="Afirma path testnet (config.REAL=False en memoria).")
+    parser.add_argument("--max-orders", type=int, default=None,
+                        help="Override en memoria de RiskEngine.max_open_orders "
+                             "(ej. 1 = una orden a la vez). Default: config.")
+    parser.add_argument("--exposure-level", type=int, default=None,
+                        help="Override en memoria de config.EXPOSURE_LEVEL "
+                             "(solo 0 o 1). Default: config.")
+    args = parser.parse_args(argv)
+
+    if args.testnet:
+        config.REAL = False  # en memoria; no persiste a disco
+    if config.REAL:
+        # Gate §0.1: sin --testnet efectivo y con REAL=True, abortar.
+        print("BLOQUEO §0.1: config.REAL=True (mainnet). Este runner es solo "
+              "testnet: ponga REAL=False o pase --testnet. Abortando.",
+              file=sys.stderr)
+        return 2
+    if args.exposure_level is not None:
+        if int(args.exposure_level) not in (0, 1):
+            print("BLOQUEO §0.2: --exposure-level >= 2 requiere autorización "
+                  "humana explícita. Abortando.", file=sys.stderr)
+            return 2
+        config.EXPOSURE_LEVEL = int(args.exposure_level)  # en memoria
+    if args.max_orders is not None and int(args.max_orders) < 1:
+        print("BLOQUEO: --max-orders debe ser >= 1. Abortando.", file=sys.stderr)
+        return 2
+
+    mm = MarketMaker(dry_run=True)  # SIEMPRE simulado; jamás órdenes reales
+    if args.max_orders is not None:
+        mm.risk.max_open_orders = int(args.max_orders)
+    logger.info(
+        "Runner: inicio (testnet, dry_run=True, real=%s, exposure_level=%s, "
+        "max_open_orders=%s)",
+        config.REAL, config.EXPOSURE_LEVEL, mm.risk.max_open_orders,
+    )
+    try:
+        mm.run()  # el kill switch se evalúa cada ciclo vía _kill_switch_check
+    except KeyboardInterrupt:
+        logger.warning("Runner: interrupción manual; deteniendo...")
+    finally:
+        mm.stop()  # idempotente: cierra WS + cancela simuladas
+        logger.info("Runner: fin. kill_switch_disparado=%s "
+                    "(invocable vía mm.check_kill_switch_now)",
+                    mm.disable_new_entries)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
