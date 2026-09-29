@@ -1,0 +1,297 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "build": {
+      "mode": "primary",
+      "model": "opencode/hy3-free",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "code-reviewer": {
+      "description": "Revisor independiente de código (modelo opencode/nemotron-3-ultra-free, mejor reviewer disponible en OpenCode Zen). Reemplaza a opencode/deepseek-v4-flash, que ya no está en el proveedor Zen.",
+      "mode": "subagent",
+      "model": "opencode/nemotron-3-ultra-free",
+      "hidden": false,
+      "prompt": "Eres el revisor independiente del proyecto alpha-driven (modelo opencode/nemotron-3-ultra-free de Zen), según AI_ORCHESTRATOR_RULES_ZEN.md.\n\nHY3 te invoca mediante un SOBRE de petición. SIEMPRE debes leerlo primero: ahí viene QUÉ analizar (TARGET) y DESDE QUÉ PUNTO DE VISTA (LENS). No inventes el objetivo; respeta lo que el sobre indique.\n\nFormato del sobre que te envía HY3:\n\nREVIEW_REQUEST:\n  MODE: review | consulta | analisis\n  TARGET: <archivo / función / código concreto a analizar>\n  LENS: trading | seguridad | rendimiento | general\n  CONTEXT: <estado, cambios hechos, evidencia, restricciones>\n  QUESTION: <qué necesita HY3>\n\nMODOS:\n\nA) review (MODE=review): HY3 te entrega un cambio ya implementado y verificado. Rol adversarial constructivo: NO asumas que es correcto. Valida requisitos, cambios, tests, regresiones y evidencia; cuestiona supuestos no demostrados; detecta parches de síntomas. Revisa: solicitud original, cambios, tests y resultados, errores/warnings, restricciones (AGENTS.md, market_making_xrpusdc_futures.md), regresiones.\n\nB) consulta (MODE=consulta): HY3 tiene dudas y DEBES contestarlas. Directo, separa confirmado de hipótesis. Resuelve ambigüedades, valida enfoques, interpreta errores/logs, cuestiona diseño o da segunda opinión. Si la duda es de seguridad/riesgo/autorización humana (§0 de AGENTS.md), señálalo y recomienda escalar; no autorices nada irreversible.\n\nC) analisis (MODE=analisis): analiza TARGET desde la LENS indicada. TARGET es obligatorio. Si LENS=trading, analiza DESDE EL PUNTO DE VISTA DEL TRADING (market making sobre XRPUSDC):\n  - corrección de la lógica de la estrategia y del flujo maker (GTX, post-only, §2);\n  - respeto a los límites de riesgo de config.py (MAX_DAILY_LOSS_USDC, MAX_POSITION_NOTIONAL_USDC, MAX_DRAWDOWN_PCT, MAX_LEVERAGE_USED);\n  - spread mínimo (MIN_SPREAD_TICKS), inventario y tamaño de órdenes (SIMULATION_QUOTE_MULTIPLIER en Nivel 0);\n  - priorización de órdenes MAKER y la promo de 0 fees (no degradar a taker, §0);\n  - latencia de envío/fills, race conditions en IDs de órdenes, reconciliación de posición (§13);\n  - kill switch, gestión de errores de API (BinanceAPIException como retorno, no excepción);\n  - impacto en NetPnL = GrossPnL − fees − funding − slippage (debe ser > 0 para ganar, §18).\n  Señala riesgos de pérdida, desvíos de la especificación y efectos en el PnL real.\n\nEn MODE=review responde SIEMPRE:\n\nREVIEW_STATUS: PASS | FAIL | BLOCKED\n\nCRITICAL:\n- ...\n\nHIGH:\n- ...\n\nMEDIUM:\n- ...\n\nLOW:\n- ...\n\nROOT_CAUSE:\n- ...\n\nREQUIRED_ACTIONS:\n- ...\n\nVERIFICATION:\n- ...\n\nREGRESSIONS:\n- ...\n\nOPEN_QUESTIONS:\n- ...\n\nCONFIDENCE:\nHIGH | MEDIUM | LOW\n\nNo devuelvas PASS si hay CRITICAL o HIGH sin resolver. En MODE=consulta responde claro y accionable con tu confianza. En MODE=analisis entrega secciones por el TARGET y la LENS (p.ej. ANÁLISIS_DE_TRADING con los puntos arriba). En todos los modos distingue confirmado / probable / hipótesis y declara explícitamente si no puedes ejecutar algo. Al final de cada respuesta incluye una línea fija de trazabilidad: REVIEWER_AGENT: code-reviewer (OpenCode Zen, modelo opencode/nemotron-3-ultra-free).",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny"
+      }
+    },
+    "alpha-brain": {
+      "description": "Cerebro: diseña, delega y revisa F2.5 hasta la barrera humana.",
+      "mode": "primary",
+      "model": "opencode/muse-spark-1.3-contributor-free",
+      "prompt": "{file:./.opencode/prompts/alpha-brain.md}",
+      "permission": {
+        "read": {
+          "*": "deny",
+          "AGENTS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/AGENTS.md": "allow",
+          "STATUS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/STATUS.md": "allow",
+          "market_making_xrpusdc_futures.md": "allow",
+          "C:/programas/proyectos/alpha-driven/market_making_xrpusdc_futures.md": "allow",
+          "strategy/*": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/*": "allow",
+          "research/*": "allow",
+          "C:/programas/proyectos/alpha-driven/research/*": "allow",
+          "tests/*": "allow",
+          "C:/programas/proyectos/alpha-driven/tests/*": "allow",
+          "md/*": "allow",
+          "C:/programas/proyectos/alpha-driven/md/*": "allow",
+          ".opencode/prompts/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/prompts/*": "allow",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow",
+          "config/agent_models.json": "allow",
+          "C:/programas/proyectos/alpha-driven/config/agent_models.json": "allow",
+          "scripts/alpha_checks.py": "allow",
+          "C:/programas/proyectos/alpha-driven/scripts/alpha_checks.py": "allow"
+        },
+        "glob": "allow",
+        "edit": {
+          "*": "deny",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow"
+        },
+        "task": {
+          "*": "deny",
+          "alpha-worker": "allow",
+          "alpha-reviewer": "allow",
+          "alpha-tester": "allow",
+          "alpha-runner": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "python scripts/alpha_checks.py snapshot": "allow",
+          "*alpha_checks.py snapshot*": "allow",
+          "python scripts/alpha_checks.py tests": "allow",
+          "*alpha_checks.py tests*": "allow"
+        },
+        "external_directory": "deny",
+        "question": "deny",
+        "todowrite": "allow"
+      }
+    },
+    "alpha-worker": {
+      "description": "Implementador acotado de F2.5; puede subdelegar tareas Nemotron.",
+      "mode": "subagent",
+      "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+      "prompt": "{file:./.opencode/prompts/alpha-worker.md}",
+      "permission": {
+        "read": {
+          "*": "deny",
+          "AGENTS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/AGENTS.md": "allow",
+          "STATUS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/STATUS.md": "allow",
+          "market_making_xrpusdc_futures.md": "allow",
+          "C:/programas/proyectos/alpha-driven/market_making_xrpusdc_futures.md": "allow",
+          "strategy/*": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/*": "allow",
+          "research/*": "allow",
+          "C:/programas/proyectos/alpha-driven/research/*": "allow",
+          "tests/*": "allow",
+          "C:/programas/proyectos/alpha-driven/tests/*": "allow",
+          "md/*": "allow",
+          "C:/programas/proyectos/alpha-driven/md/*": "allow",
+          ".opencode/prompts/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/prompts/*": "allow",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow",
+          "config/agent_models.json": "allow",
+          "C:/programas/proyectos/alpha-driven/config/agent_models.json": "allow",
+          "scripts/alpha_checks.py": "allow",
+          "C:/programas/proyectos/alpha-driven/scripts/alpha_checks.py": "allow"
+        },
+        "glob": "allow",
+        "edit": {
+          "*": "deny",
+          "strategy/as_coordinator.py": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/as_coordinator.py": "allow",
+          "strategy/execution_reconstruction.py": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/execution_reconstruction.py": "allow",
+          "strategy/tests/test_reconstruction_metrics.py": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/tests/test_reconstruction_metrics.py": "allow",
+          "strategy/tests/test_as_funding.py": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/tests/test_as_funding.py": "allow",
+          "tests/test_funding_atomicity.py": "allow",
+          "C:/programas/proyectos/alpha-driven/tests/test_funding_atomicity.py": "allow",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow"
+        },
+        "task": {
+          "*": "deny",
+          "alpha-worker": "allow",
+          "alpha-tester": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "python scripts/alpha_checks.py snapshot": "allow",
+          "*alpha_checks.py snapshot*": "allow",
+          "python scripts/alpha_checks.py tests": "allow",
+          "*alpha_checks.py tests*": "allow"
+        },
+        "external_directory": "deny",
+        "question": "deny",
+        "todowrite": "allow"
+      },
+      "temperature": 0.2,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "alpha-reviewer": {
+      "description": "Auditor independiente de archivos, sin edición ni delegación.",
+      "mode": "subagent",
+      "model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+      "prompt": "{file:./.opencode/prompts/alpha-reviewer.md}",
+      "permission": {
+        "read": {
+          "*": "deny",
+          "AGENTS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/AGENTS.md": "allow",
+          "STATUS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/STATUS.md": "allow",
+          "market_making_xrpusdc_futures.md": "allow",
+          "C:/programas/proyectos/alpha-driven/market_making_xrpusdc_futures.md": "allow",
+          "strategy/*": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/*": "allow",
+          "research/*": "allow",
+          "C:/programas/proyectos/alpha-driven/research/*": "allow",
+          "tests/*": "allow",
+          "C:/programas/proyectos/alpha-driven/tests/*": "allow",
+          "md/*": "allow",
+          "C:/programas/proyectos/alpha-driven/md/*": "allow",
+          ".opencode/prompts/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/prompts/*": "allow",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow",
+          "config/agent_models.json": "allow",
+          "C:/programas/proyectos/alpha-driven/config/agent_models.json": "allow",
+          "scripts/alpha_checks.py": "allow",
+          "C:/programas/proyectos/alpha-driven/scripts/alpha_checks.py": "allow"
+        },
+        "glob": "allow",
+        "edit": "deny",
+        "task": "deny",
+        "bash": {
+          "*": "deny",
+          "python scripts/alpha_checks.py snapshot": "allow",
+          "*alpha_checks.py snapshot*": "allow"
+        },
+        "external_directory": "deny",
+        "question": "deny",
+        "todowrite": "allow"
+      },
+      "temperature": 0.2,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "alpha-runner": {
+      "description": "Ejecutor puro de comandos bash (permiso completo). No escribe ni edita archivos: el que escribe no ejecuta, el que ejecuta no escribe. Activar para corridas/tests; desactivar con disable:true al terminar.",
+      "mode": "subagent",
+      "model": "opencode/muse-spark-1.3-contributor-free",
+      "prompt": "{file:./.opencode/prompts/alpha-runner.md}",
+      "permission": {
+        "read": {
+          "*": "deny",
+          "AGENTS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/AGENTS.md": "allow",
+          "STATUS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/STATUS.md": "allow",
+          "market_making_xrpusdc_futures.md": "allow",
+          "C:/programas/proyectos/alpha-driven/market_making_xrpusdc_futures.md": "allow",
+          "strategy/*": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/*": "allow",
+          "research/*": "allow",
+          "C:/programas/proyectos/alpha-driven/research/*": "allow",
+          "tests/*": "allow",
+          "C:/programas/proyectos/alpha-driven/tests/*": "allow",
+          "md/*": "allow",
+          "C:/programas/proyectos/alpha-driven/md/*": "allow",
+          "logs/*": "allow",
+          "C:/programas/proyectos/alpha-driven/logs/*": "allow",
+          "reports/*": "allow",
+          "C:/programas/proyectos/alpha-driven/reports/*": "allow",
+          ".opencode/prompts/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/prompts/*": "allow",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow",
+          "config/agent_models.json": "allow",
+          "C:/programas/proyectos/alpha-driven/config/agent_models.json": "allow",
+          "scripts/alpha_checks.py": "allow",
+          "C:/programas/proyectos/alpha-driven/scripts/alpha_checks.py": "allow"
+        },
+        "glob": "allow",
+        "edit": "deny",
+        "task": "deny",
+        "bash": "allow",
+        "external_directory": "deny",
+        "question": "deny",
+        "todowrite": "allow"
+      }
+    },
+    "alpha-tester": {
+      "description": "Verifica únicamente el área sintética autorizada de F2.5.",
+      "mode": "subagent",
+      "model": "moonshotai/kimi-k3",
+      "prompt": "{file:./.opencode/prompts/alpha-tester.md}",
+      "permission": {
+        "read": {
+          "*": "deny",
+          "AGENTS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/AGENTS.md": "allow",
+          "STATUS.md": "allow",
+          "C:/programas/proyectos/alpha-driven/STATUS.md": "allow",
+          "market_making_xrpusdc_futures.md": "allow",
+          "C:/programas/proyectos/alpha-driven/market_making_xrpusdc_futures.md": "allow",
+          "strategy/*": "allow",
+          "C:/programas/proyectos/alpha-driven/strategy/*": "allow",
+          "research/*": "allow",
+          "C:/programas/proyectos/alpha-driven/research/*": "allow",
+          "tests/*": "allow",
+          "C:/programas/proyectos/alpha-driven/tests/*": "allow",
+          "md/*": "allow",
+          "C:/programas/proyectos/alpha-driven/md/*": "allow",
+          ".opencode/prompts/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/prompts/*": "allow",
+          ".opencode/state/*": "allow",
+          "C:/programas/proyectos/alpha-driven/.opencode/state/*": "allow",
+          "config/agent_models.json": "allow",
+          "C:/programas/proyectos/alpha-driven/config/agent_models.json": "allow",
+          "scripts/alpha_checks.py": "allow",
+          "C:/programas/proyectos/alpha-driven/scripts/alpha_checks.py": "allow"
+        },
+        "glob": "allow",
+        "edit": "deny",
+        "task": "deny",
+        "bash": {
+          "*": "deny",
+          "python scripts/alpha_checks.py snapshot": "allow",
+          "*alpha_checks.py snapshot*": "allow",
+          "python scripts/alpha_checks.py tests": "allow",
+          "*alpha_checks.py tests*": "allow"
+        },
+        "external_directory": "deny",
+        "question": "deny",
+        "todowrite": "allow"
+      }
+    }
+  },
+  "default_agent": "alpha-brain",
+  "subagent_depth": 2,
+  "provider": {
+    "nvidia": {
+      "options": {
+        "timeout": 180000,
+        "headerTimeout": 90000,
+        "chunkTimeout": 60000
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "brain_model": "opencode/muse-spark-1.3-contributor-free",
+  "worker_model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "reviewer_model": "nvidia/nemotron-3.5-lightning-30b-a3b",
+  "tester_model": "moonshotai/kimi-k3",
+  "runner_model": "opencode/muse-spark-1.3-contributor-free"
+}

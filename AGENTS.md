@@ -53,5 +53,32 @@ URLs: real `wss://fstream.binance.com/public/ws`, testnet `wss://stream.binancef
 - No hay framework de tests configurado. Se exigen tests unitarios para el **Risk Engine** (§12) y una prueba explícita del **kill switch** (§13) antes de confiar en ellos.
 - Rentabilidad = **`NetPnL > 0`** donde `NetPnL = GrossPnL − fees − funding − slippage` (§18). Una operación ganadora NO es evidencia (§19). No usar RL directamente sobre leverage/posición/pérdida/kill switch (§17).
 
+## Fórmulas matemáticas (LaTeX — regla anti-rotura de render)
+- Siempre `$$...$$` en bloque en líneas propias, `$...$` inline. Nunca Unicode plano.
+- Variables multi-letra con `\mathrm{}`: `$\mathrm{NetPnL}$`, `$\mathrm{InventoryRisk}$`. Sin esto Markdown rompe el render.
+- Sub/superscripts siempre con llaves: `\lambda_{1}`, no `\lambda_1`.
+- Ejemplo canónico §18:
+$$
+\mathrm{Reward} = \mathrm{NetPnL} - \lambda_{1} \cdot \mathrm{InventoryRisk} - \lambda_{2} \cdot \mathrm{AdverseSelection} - \lambda_{3} \cdot \mathrm{Drawdown} - \lambda_{4} \cdot \mathrm{VolatilityRisk}
+$$
+
 ## Operaciones
 - En la misma VPS corren otros bots en producción (grid bot, bot A-S en BTC/USDC). **No tocar ni reiniciar esos procesos.** El proceso nuevo debe correr aislado: venv propio, logs propios, sin compartir puertos, archivos ni el límite de rate-limit (§0.3).
+
+## Revisión del diseñador — estática por archivos, sin git
+Ámbito: todas las revisiones del diseñador sobre el trabajo de OpenCode.
+- El diseñador no usa git como criterio de verificación. No evalúa commits, HEAD, ramas, worktrees, stashes, reflog ni push.
+- El diseñador revisa el estado real de los archivos en la carpeta canónica del proyecto.
+- Para cada hallazgo, cita archivo y línea y transcribe el fragmento relevante.
+- Para validar que su revisión no fue alterada durante el proceso, compara huellas de los archivos (hash o equivalente) al inicio y al final. Si cambian, lo declara y reinicia.
+- Un reporte de OpenCode es una afirmación a auditar, nunca un hecho. Solo se acepta si el archivo correspondiente lo respalda.
+- Si un archivo citado por OpenCode no existe o no contiene lo reportado, el veredicto es REQUIERE AJUSTES, sin importar lo que diga git.
+- El diseñador no programa, no modifica archivos, no ejecuta simulaciones. Solo lee, audita, indica y dictamina.
+- Consecuencia: la validez del cierre depende del contenido del proyecto, no del historial de versiones.
+
+## Lección model registry (2026-09-29)
+- `config/agent_models.json` es única fuente de verdad; `opencode.json` es derivado vía `python scripts/render_alpha_agents.py --write` (ROLES + L73 `model=models[role+'_model']`, L101 `json.load` con `utf-8-sig`).
+- `.opencode/prompts/*.md` NO llevan frontmatter `model` (0 hits verificado) — no copiar patrón `agente.md` con frontmatter de otro proyecto.
+- Errores reales vistos: doble prefijo `nvidia/nvidia/...` → `Model not found` con `Did you mean` mismo string; L6 sin comilla de apertura → `JSONDecodeError line 6 col 19` y runner diverge (registry `muse-spark` vs opencode `kimi-k3`).
+- Flujo obligatorio: editar `agent_models.json` → `--write` → `--check` OK → `pytest scripts/tests/test_render_alpha_agents.py -q` (7 passed) → reiniciar OpenCode (cache) → smoke post-restart (snapshot 5 huellas F2.5 intactas).
+- Prohibido: edición manual de `opencode.json`, usar JSON sin validar con `json.load`.
